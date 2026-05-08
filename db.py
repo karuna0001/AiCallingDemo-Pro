@@ -210,6 +210,42 @@ async def clear_errors() -> None:
     await db.table("error_logs").delete().neq("id", "").execute()
 
 
+async def _clear_table(table_name: str) -> int:
+    db = await _adb()
+    result = await db.table(table_name).delete().neq("id", "").execute()
+    return len(result.data or [])
+
+
+async def clear_call_logs() -> int:
+    return await _clear_table("call_logs")
+
+
+async def clear_error_logs() -> int:
+    return await _clear_table("error_logs")
+
+
+async def clear_contact_memory() -> int:
+    return await _clear_table("contact_memory")
+
+
+async def clear_appointments() -> int:
+    return await _clear_table("appointments")
+
+
+async def clear_campaigns() -> int:
+    return await _clear_table("campaigns")
+
+
+async def clear_all_test_data() -> dict:
+    return {
+        "call_logs": await clear_call_logs(),
+        "error_logs": await clear_error_logs(),
+        "contact_memory": await clear_contact_memory(),
+        "appointments": await clear_appointments(),
+        "campaigns": await clear_campaigns(),
+    }
+
+
 async def insert_appointment(name: str, phone: str, date: str, time: str, service: str) -> str:
     full_id = str(uuid.uuid4())
     db = await _adb()

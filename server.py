@@ -28,8 +28,10 @@ def _certifi_ssl(purpose=ssl.Purpose.SERVER_AUTH, **kwargs):
 ssl.create_default_context = _certifi_ssl
 
 from db import (
-    ConfigError, cancel_appointment, clear_errors, create_agent_profile,
-    create_campaign, delete_agent_profile, delete_campaign, get_agent_profile,
+    ConfigError, cancel_appointment, clear_all_test_data, clear_appointments,
+    clear_call_logs, clear_campaigns, clear_contact_memory, clear_error_logs,
+    clear_errors, create_agent_profile, create_campaign, delete_agent_profile,
+    delete_campaign, get_agent_profile,
     get_all_agent_profiles, get_all_appointments, get_all_calls,
     get_all_campaigns, get_all_settings, get_calls_by_phone, get_campaign,
     get_call_logs_for_export, get_contacts, get_logs, get_setting, get_stats, init_db, log_error,
@@ -134,6 +136,10 @@ class CampaignRequest(BaseModel):
 
 class StatusRequest(BaseModel):
     status: str
+
+
+class ClearRecordsRequest(BaseModel):
+    confirm: Optional[str] = None
 
 
 @app.get("/api/health")
@@ -427,6 +433,64 @@ async def api_get_logs(limit: int = 200, level: Optional[str] = None, source: Op
 async def api_clear_logs():
     await clear_errors()
     return {"status": "cleared"}
+
+
+def _clear_confirmation_error(req: Optional[ClearRecordsRequest]):
+    if not req or req.confirm != "CLEAR_RECORDS":
+        return JSONResponse(status_code=400, content={"success": False, "error": "Confirmation required"})
+    return None
+
+
+async def _admin_clear_response(req: Optional[ClearRecordsRequest], label: str, clear_fn):
+    confirmation_error = _clear_confirmation_error(req)
+    if confirmation_error:
+        return confirmation_error
+    deleted = await clear_fn()
+    message = f"Cleared {deleted} {label}."
+    logger.warning("Admin clear action: %s deleted=%s", label, deleted)
+    if label != "error logs":
+        await log_error("server", f"Admin clear action: {label}", f"deleted={deleted}", "warning")
+    return {"success": True, "deleted": deleted, "message": message}
+
+
+@app.delete("/api/admin/clear/call-logs")
+async def api_admin_clear_call_logs(req: Optional[ClearRecordsRequest] = None):
+    return await _admin_clear_response(req, "call logs", clear_call_logs)
+
+
+@app.delete("/api/admin/clear/error-logs")
+async def api_admin_clear_error_logs(req: Optional[ClearRecordsRequest] = None):
+    return await _admin_clear_response(req, "error logs", clear_error_logs)
+
+
+@app.delete("/api/admin/clear/contact-memory")
+async def api_admin_clear_contact_memory(req: Optional[ClearRecordsRequest] = None):
+    return await _admin_clear_response(req, "CRM memory records", clear_contact_memory)
+
+
+@app.delete("/api/admin/clear/appointments")
+async def api_admin_clear_appointments(req: Optional[ClearRecordsRequest] = None):
+    return await _admin_clear_response(req, "appointments", clear_appointments)
+
+
+@app.delete("/api/admin/clear/campaigns")
+async def api_admin_clear_campaigns(req: Optional[ClearRecordsRequest] = None):
+    return await _admin_clear_response(req, "campaigns", clear_campaigns)
+
+
+@app.delete("/api/admin/clear/all-test-data")
+async def api_admin_clear_all_test_data(req: Optional[ClearRecordsRequest] = None):
+    confirmation_error = _clear_confirmation_error(req)
+    if confirmation_error:
+        return confirmation_error
+    deleted_by_table = await clear_all_test_data()
+    deleted = sum(deleted_by_table.values())
+    logger.warning("Admin clear action: all test data deleted=%s details=%s", deleted, deleted_by_table)
+    return {
+        "success": True,
+        "deleted": deleted,
+        "message": "Cleared all test data. Settings and agent profiles were not changed.",
+    }
 
 
 @app.get("/api/crm")
