@@ -1,0 +1,33 @@
+# Never bake local secrets or dev cruft into the image.
+.env
+.env.*
+*.env
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# VCS
+.git/
+.gitignore
+
+# Logs / dbs
+*.log
+*.sqlite
+*.db
+
+# The LiveKit reference project is reused for ideas only — do not ship it
+LIvekitAIVoice/
+
+# CI / docs only
+README.md

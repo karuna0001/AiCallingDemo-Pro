@@ -1,0 +1,11 @@
+# Force LF line endings on files that run inside Linux containers,
+# regardless of the host OS that committed them.
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+.dockerignore text eol=lf
+
+# Python source — LF in repo, normalized on checkout
+*.py        text eol=lf
+
+# Default for everything else: let git handle it
+*           text=auto
