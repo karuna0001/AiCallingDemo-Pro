@@ -41,6 +41,24 @@ DEFAULTS = {
     "DEEPGRAM_API_KEY":        os.getenv("DEEPGRAM_API_KEY", ""),
 }
 
+DEFAULT_LEAD_STATUSES = [
+    ("New", "#64748b"),
+    ("Hot Lead", "#ef4444"),
+    ("Quote Given", "#f59e0b"),
+    ("Measurement Taken", "#06b6d4"),
+    ("Home Visit Booked", "#3b82f6"),
+    ("Site Visit Booked", "#2563eb"),
+    ("Home Visit Done", "#8b5cf6"),
+    ("Site Visit Done", "#7c3aed"),
+    ("Follow-up Later", "#eab308"),
+    ("Payment Pending", "#f97316"),
+    ("Closed Won", "#22c55e"),
+    ("Closed Lost", "#6b7280"),
+    ("Not Interested", "#dc2626"),
+    ("Wrong Number", "#9ca3af"),
+    ("No Response", "#94a3b8"),
+]
+
 
 def _default(key: str) -> str:
     return os.getenv(key, DEFAULTS.get(key, ""))
@@ -300,6 +318,7 @@ async def log_call(phone_number: str, lead_name: Optional[str], outcome: str, re
     if notes:
         row["notes"] = notes
     await db.table("call_logs").insert(row).execute()
+    await upsert_crm_contact_from_call(row)
 
 
 async def get_all_calls(page: int = 1, limit: int = 20) -> list:
@@ -356,6 +375,146 @@ async def get_contacts() -> list:
         if row.get("outcome") == "booked":
             contacts[phone]["booked"] += 1
     return sorted(contacts.values(), key=lambda c: c["last_call"], reverse=True)
+
+
+async def get_lead_statuses() -> list:
+    db = await _adb()
+    try:
+        result = await db.table("lead_statuses").select("*").order("created_at").execute()
+        rows = result.data or []
+        if rows:
+            return rows
+        seed_rows = [{"name": name, "color": color} for name, color in DEFAULT_LEAD_STATUSES]
+        await db.table("lead_statuses").insert(seed_rows).execute()
+        result = await db.table("lead_statuses").select("*").order("created_at").execute()
+        return result.data or []
+    except Exception as exc:
+        await log_error("server", "Lead statuses unavailable", str(exc), "warning")
+        return [{"id": name, "name": name, "color": color} for name, color in DEFAULT_LEAD_STATUSES]
+
+
+async def add_lead_status(name: str, color: Optional[str] = None) -> Optional[dict]:
+    db = await _adb()
+    row = {"name": name.strip(), "color": (color or "").strip() or None}
+    result = await db.table("lead_statuses").upsert(row, on_conflict="name").execute()
+    return (result.data or [None])[0]
+
+
+async def delete_lead_status(status_id: str) -> bool:
+    db = await _adb()
+    result = await db.table("lead_statuses").delete().eq("id", status_id).execute()
+    return len(result.data or []) > 0
+
+
+async def upsert_crm_contact_from_call(call_log: dict) -> None:
+    phone = call_log.get("phone_number")
+    if not phone:
+        return
+    try:
+        db = await _adb()
+        current = await db.table("crm_contacts").select("total_calls, crm_status").eq("phone_number", phone).maybe_single().execute()
+        total_calls = int((current.data or {}).get("total_calls") or 0) + 1
+        row = {
+            "phone_number": phone,
+            "lead_name": call_log.get("lead_name"),
+            "last_call_outcome": call_log.get("outcome"),
+            "last_call_at": call_log.get("timestamp") or datetime.now().isoformat(),
+            "total_calls": total_calls,
+            "updated_at": datetime.now().isoformat(),
+        }
+        if not current.data:
+            row["crm_status"] = "New"
+        await db.table("crm_contacts").upsert(row, on_conflict="phone_number").execute()
+    except Exception as exc:
+        await log_error("server", "CRM contact upsert skipped", str(exc), "warning")
+
+
+def _crm_fallback_contact(row: dict) -> dict:
+    return {
+        "phone_number": row.get("phone_number"),
+        "lead_name": row.get("lead_name"),
+        "crm_status": row.get("crm_status") or "New",
+        "custom_status": row.get("custom_status"),
+        "next_followup_at": row.get("next_followup_at"),
+        "assigned_to": row.get("assigned_to"),
+        "crm_notes": row.get("crm_notes"),
+        "last_call_outcome": row.get("last_call_outcome") or row.get("last_outcome"),
+        "last_call_at": row.get("last_call_at") or row.get("last_call"),
+        "total_calls": row.get("total_calls") or 0,
+    }
+
+
+async def get_crm_contacts(status: Optional[str] = None, outcome: Optional[str] = None, q: Optional[str] = None, due_today: bool = False) -> list:
+    try:
+        db = await _adb()
+        query = db.table("crm_contacts").select("*").order("updated_at", desc=True)
+        if status:
+            query = query.eq("crm_status", status)
+        if outcome:
+            query = query.eq("last_call_outcome", outcome)
+        result = await query.execute()
+        rows = result.data or []
+    except Exception as exc:
+        await log_error("server", "CRM contacts unavailable, falling back to call logs", str(exc), "warning")
+        rows = []
+
+    if not rows:
+        rows = [_crm_fallback_contact(c) for c in await get_contacts()]
+    else:
+        rows = [_crm_fallback_contact(c) for c in rows]
+
+    needle = (q or "").strip().lower()
+    today = datetime.now().date().isoformat()
+    filtered = []
+    for row in rows:
+        if needle and needle not in (row.get("phone_number") or "").lower() and needle not in (row.get("lead_name") or "").lower():
+            continue
+        if status and row.get("crm_status") != status:
+            continue
+        if outcome and row.get("last_call_outcome") != outcome:
+            continue
+        if due_today and not (row.get("next_followup_at") or "").startswith(today):
+            continue
+        filtered.append(row)
+    return filtered
+
+
+async def _ensure_crm_contact(phone: str) -> None:
+    db = await _adb()
+    current = await db.table("crm_contacts").select("phone_number").eq("phone_number", phone).maybe_single().execute()
+    if current.data:
+        return
+    calls = (await db.table("call_logs").select("*").eq("phone_number", phone).order("timestamp", desc=True).execute()).data or []
+    row = {"phone_number": phone, "crm_status": "New", "updated_at": datetime.now().isoformat()}
+    if calls:
+        row.update({
+            "lead_name": calls[0].get("lead_name"),
+            "last_call_outcome": calls[0].get("outcome"),
+            "last_call_at": calls[0].get("timestamp"),
+            "total_calls": len(calls),
+        })
+    await db.table("crm_contacts").upsert(row, on_conflict="phone_number").execute()
+
+
+async def update_crm_contact_status(phone: str, crm_status: str, custom_status: Optional[str] = None) -> bool:
+    db = await _adb()
+    await _ensure_crm_contact(phone)
+    result = await db.table("crm_contacts").update({"crm_status": crm_status, "custom_status": custom_status, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
+    return len(result.data or []) > 0
+
+
+async def update_crm_contact_followup(phone: str, next_followup_at: Optional[str]) -> bool:
+    db = await _adb()
+    await _ensure_crm_contact(phone)
+    result = await db.table("crm_contacts").update({"next_followup_at": next_followup_at, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
+    return len(result.data or []) > 0
+
+
+async def update_crm_contact_notes(phone: str, crm_notes: str) -> bool:
+    db = await _adb()
+    await _ensure_crm_contact(phone)
+    result = await db.table("crm_contacts").update({"crm_notes": crm_notes, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
+    return len(result.data or []) > 0
 
 
 async def get_stats() -> dict:

@@ -34,10 +34,12 @@ from db import (
     delete_campaign, get_agent_profile,
     get_all_agent_profiles, get_all_appointments, get_all_calls,
     get_all_campaigns, get_all_settings, get_calls_by_phone, get_campaign,
-    get_call_logs_for_export, get_contacts, get_logs, get_setting, get_stats, init_db, log_error,
+    get_call_logs_for_export, get_contacts, get_crm_contacts, get_lead_statuses,
+    get_logs, get_setting, get_stats, init_db, log_error,
     save_settings, set_default_agent_profile, set_setting,
-    update_agent_profile, update_call_notes, update_campaign_run_stats,
-    update_campaign_status,
+    add_lead_status, delete_lead_status, update_agent_profile, update_call_notes,
+    update_campaign_run_stats, update_campaign_status, update_crm_contact_followup,
+    update_crm_contact_notes, update_crm_contact_status,
 )
 from prompts import DEFAULT_SYSTEM_PROMPT
 
@@ -140,6 +142,24 @@ class StatusRequest(BaseModel):
 
 class ClearRecordsRequest(BaseModel):
     confirm: Optional[str] = None
+
+
+class LeadStatusRequest(BaseModel):
+    name: str
+    color: Optional[str] = None
+
+
+class CrmStatusRequest(BaseModel):
+    crm_status: str
+    custom_status: Optional[str] = None
+
+
+class CrmFollowupRequest(BaseModel):
+    next_followup_at: Optional[str] = None
+
+
+class CrmNotesRequest(BaseModel):
+    crm_notes: str = ""
 
 
 @app.get("/api/health")
@@ -501,6 +521,61 @@ async def api_get_contacts():
 @app.get("/api/crm/calls")
 async def api_get_contact_calls(phone: str = Query(...)):
     return {"data": await get_calls_by_phone(phone)}
+
+
+@app.get("/api/lead-statuses")
+async def api_get_lead_statuses():
+    return {"data": await get_lead_statuses()}
+
+
+@app.post("/api/lead-statuses")
+async def api_add_lead_status(req: LeadStatusRequest):
+    if not req.name.strip():
+        raise HTTPException(400, "Status name is required")
+    status = await add_lead_status(req.name, req.color)
+    return {"success": True, "data": status}
+
+
+@app.delete("/api/lead-statuses/{status_id}")
+async def api_delete_lead_status(status_id: str):
+    ok = await delete_lead_status(status_id)
+    if not ok:
+        raise HTTPException(404, "Status not found")
+    return {"success": True, "message": "Status deleted"}
+
+
+@app.get("/api/crm/contacts")
+async def api_get_crm_contacts(
+    status: Optional[str] = None,
+    outcome: Optional[str] = None,
+    q: Optional[str] = None,
+    due_today: bool = False,
+):
+    return {"data": await get_crm_contacts(status=status, outcome=outcome, q=q, due_today=due_today)}
+
+
+@app.patch("/api/crm/contacts/{phone}/status")
+async def api_update_crm_status(phone: str, req: CrmStatusRequest):
+    ok = await update_crm_contact_status(phone, req.crm_status, req.custom_status)
+    if not ok:
+        raise HTTPException(404, "CRM contact not found")
+    return {"success": True, "message": "CRM status updated"}
+
+
+@app.patch("/api/crm/contacts/{phone}/followup")
+async def api_update_crm_followup(phone: str, req: CrmFollowupRequest):
+    ok = await update_crm_contact_followup(phone, req.next_followup_at)
+    if not ok:
+        raise HTTPException(404, "CRM contact not found")
+    return {"success": True, "message": "Follow-up updated"}
+
+
+@app.patch("/api/crm/contacts/{phone}/notes")
+async def api_update_crm_notes(phone: str, req: CrmNotesRequest):
+    ok = await update_crm_contact_notes(phone, req.crm_notes)
+    if not ok:
+        raise HTTPException(404, "CRM contact not found")
+    return {"success": True, "message": "CRM notes updated"}
 
 
 @app.get("/api/agent-profiles")

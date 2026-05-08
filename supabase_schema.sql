@@ -86,3 +86,32 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     created_at TEXT NOT NULL
 );
 ALTER TABLE agent_profiles DISABLE ROW LEVEL SECURITY;
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE TABLE IF NOT EXISTS lead_statuses (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name text UNIQUE NOT NULL,
+    color text,
+    created_at timestamptz DEFAULT now()
+);
+ALTER TABLE lead_statuses DISABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS crm_contacts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    phone_number text UNIQUE NOT NULL,
+    lead_name text,
+    crm_status text DEFAULT 'New',
+    custom_status text,
+    next_followup_at timestamptz,
+    assigned_to text,
+    crm_notes text,
+    last_call_outcome text,
+    last_call_at timestamptz,
+    total_calls int DEFAULT 0,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+);
+ALTER TABLE crm_contacts DISABLE ROW LEVEL SECURITY;
+CREATE INDEX IF NOT EXISTS idx_crm_contacts_status ON crm_contacts (crm_status);
+CREATE INDEX IF NOT EXISTS idx_crm_contacts_followup ON crm_contacts (next_followup_at);
