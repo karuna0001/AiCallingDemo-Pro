@@ -1,6 +1,8 @@
 """FastAPI backend for the OutboundAI dashboard."""
 
 import asyncio
+import csv
+from io import BytesIO, StringIO
 import json
 import logging
 import os
@@ -13,7 +15,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 _orig_ssl = ssl.create_default_context
@@ -30,7 +32,7 @@ from db import (
     create_campaign, delete_agent_profile, delete_campaign, get_agent_profile,
     get_all_agent_profiles, get_all_appointments, get_all_calls,
     get_all_campaigns, get_all_settings, get_calls_by_phone, get_campaign,
-    get_contacts, get_logs, get_setting, get_stats, init_db, log_error,
+    get_call_logs_for_export, get_contacts, get_logs, get_setting, get_stats, init_db, log_error,
     save_settings, set_default_agent_profile, set_setting,
     update_agent_profile, update_call_notes, update_campaign_run_stats,
     update_campaign_status,
@@ -224,6 +226,113 @@ async def api_update_notes(call_id: str, req: NotesRequest):
     if not ok:
         raise HTTPException(404, "Call not found")
     return {"status": "updated"}
+
+
+EXPORT_COLUMNS = [
+    ("Call Date/Time", "timestamp"),
+    ("Lead Name", "lead_name"),
+    ("Phone Number", "phone_number"),
+    ("Business Name", "business_name"),
+    ("Service Type", "service_type"),
+    ("Outcome", "outcome"),
+    ("Reason", "reason"),
+    ("Duration Seconds", "duration_seconds"),
+    ("Notes", "notes"),
+    ("Recording URL", "recording_url"),
+    ("Recording Download Link", "recording_url"),
+    ("Created/Timestamp", "timestamp"),
+]
+
+
+def _export_filters(date_from: Optional[str], date_to: Optional[str], outcome: Optional[str], phone: Optional[str]) -> dict:
+    return {
+        "date_from": date_from or "",
+        "date_to": date_to or "",
+        "outcome": outcome or "",
+        "phone": phone or "",
+    }
+
+
+def _export_value(row: dict, key: str) -> str:
+    value = row.get(key)
+    return "" if value is None else str(value)
+
+
+@app.get("/api/export/calls.csv")
+async def api_export_calls_csv(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    outcome: Optional[str] = None,
+    phone: Optional[str] = None,
+):
+    try:
+        rows = await get_call_logs_for_export(_export_filters(date_from, date_to, outcome, phone))
+        out = StringIO()
+        writer = csv.writer(out)
+        writer.writerow([label for label, _ in EXPORT_COLUMNS])
+        for row in rows:
+            writer.writerow([
+                _export_value(row, key)
+                for label, key in EXPORT_COLUMNS
+            ])
+        out.seek(0)
+        return StreamingResponse(
+            iter([out.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="call_logs_export.csv"'},
+        )
+    except Exception as exc:
+        await log_error("server", "CSV export failed", str(exc), "error")
+        return JSONResponse(status_code=500, content={"error": f"CSV export failed: {exc}"})
+
+
+@app.get("/api/export/calls.xlsx")
+async def api_export_calls_xlsx(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    outcome: Optional[str] = None,
+    phone: Optional[str] = None,
+):
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+
+        rows = await get_call_logs_for_export(_export_filters(date_from, date_to, outcome, phone))
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Call Logs"
+        headers = [label for label, _ in EXPORT_COLUMNS]
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+
+        download_col = headers.index("Recording Download Link") + 1
+        for row in rows:
+            ws.append([
+                "Download Recording" if label == "Recording Download Link" and row.get("recording_url") else _export_value(row, key)
+                for label, key in EXPORT_COLUMNS
+            ])
+            recording_url = row.get("recording_url")
+            if recording_url:
+                cell = ws.cell(row=ws.max_row, column=download_col)
+                cell.hyperlink = recording_url
+                cell.style = "Hyperlink"
+
+        for column in ws.columns:
+            width = max(len(str(cell.value or "")) for cell in column)
+            ws.column_dimensions[column[0].column_letter].width = min(max(width + 2, 14), 60)
+
+        stream = BytesIO()
+        wb.save(stream)
+        stream.seek(0)
+        return StreamingResponse(
+            stream,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": 'attachment; filename="call_logs_export.xlsx"'},
+        )
+    except Exception as exc:
+        await log_error("server", "Excel export failed", str(exc), "error")
+        return JSONResponse(status_code=500, content={"error": f"Excel export failed: {exc}"})
 
 
 @app.get("/api/stats")

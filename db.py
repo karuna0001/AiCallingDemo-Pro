@@ -273,6 +273,30 @@ async def get_all_calls(page: int = 1, limit: int = 20) -> list:
     return result.data or []
 
 
+async def get_call_logs_for_export(filters: Optional[dict] = None) -> list:
+    db = await _adb()
+    filters = filters or {}
+    query = db.table("call_logs").select("*").order("timestamp", desc=True)
+
+    date_from = (filters.get("date_from") or "").strip()
+    date_to = (filters.get("date_to") or "").strip()
+    outcome = (filters.get("outcome") or "").strip()
+    phone = (filters.get("phone") or "").strip()
+
+    if date_from:
+        query = query.gte("timestamp", date_from)
+    if date_to:
+        end_value = f"{date_to}T23:59:59.999999" if len(date_to) == 10 else date_to
+        query = query.lte("timestamp", end_value)
+    if outcome:
+        query = query.eq("outcome", outcome)
+    if phone:
+        query = query.eq("phone_number", phone)
+
+    result = await query.execute()
+    return result.data or []
+
+
 async def get_calls_by_phone(phone: str) -> list:
     db = await _adb()
     result = await db.table("call_logs").select("*").eq("phone_number", phone).order("timestamp", desc=True).execute()
