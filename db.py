@@ -1,4 +1,5 @@
 ﻿import os
+import re
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -62,9 +63,47 @@ DEFAULT_LEAD_STATUSES = [
     ("No Response", "#94a3b8"),
 ]
 
+CRM_LEAD_FIELDS = [
+    "phone_number", "lead_name", "email", "city", "location", "requirement",
+    "budget", "source", "business_name", "campaign_name", "service_type",
+    "crm_status", "custom_status", "crm_notes", "next_followup_at", "assigned_to",
+    "upload_batch_id", "import_source", "last_synced_at",
+]
+
 
 def _default(key: str) -> str:
     return os.getenv(key, DEFAULTS.get(key, ""))
+
+
+def normalize_phone(phone: str) -> str:
+    raw = str(phone or "").strip()
+    if raw.endswith(".0"):
+        raw = raw[:-2]
+    if not raw:
+        raise ValueError("Invalid phone number")
+    if raw.startswith("+"):
+        digits = "+" + re.sub(r"\D", "", raw)
+    else:
+        digits = re.sub(r"\D", "", raw)
+        if len(digits) == 10:
+            digits = "+91" + digits
+        elif len(digits) == 12 and digits.startswith("91"):
+            digits = "+" + digits
+        else:
+            digits = "+" + digits if raw.strip().startswith("+") else digits
+    if not digits.startswith("+"):
+        raise ValueError("Invalid phone number")
+    body = digits[1:]
+    if not body.isdigit() or len(body) < 8 or len(body) > 15:
+        raise ValueError("Invalid phone number")
+    return digits
+
+
+def _clean_value(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
 
 
 SUPABASE_URL = _default("SUPABASE_URL")
@@ -486,6 +525,15 @@ def _crm_fallback_contact(row: dict) -> dict:
     return {
         "phone_number": row.get("phone_number"),
         "lead_name": row.get("lead_name"),
+        "email": row.get("email"),
+        "city": row.get("city"),
+        "location": row.get("location"),
+        "requirement": row.get("requirement"),
+        "budget": row.get("budget"),
+        "source": row.get("source"),
+        "business_name": row.get("business_name"),
+        "campaign_name": row.get("campaign_name"),
+        "service_type": row.get("service_type"),
         "crm_status": row.get("crm_status") or "New",
         "custom_status": row.get("custom_status"),
         "next_followup_at": row.get("next_followup_at"),
@@ -494,10 +542,12 @@ def _crm_fallback_contact(row: dict) -> dict:
         "last_call_outcome": row.get("last_call_outcome") or row.get("last_outcome"),
         "last_call_at": row.get("last_call_at") or row.get("last_call"),
         "total_calls": row.get("total_calls") or 0,
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
     }
 
 
-async def get_crm_contacts(status: Optional[str] = None, outcome: Optional[str] = None, q: Optional[str] = None, due_today: bool = False) -> list:
+async def get_crm_contacts(status: Optional[str] = None, outcome: Optional[str] = None, q: Optional[str] = None, due_today: bool = False, source: Optional[str] = None, business_name: Optional[str] = None, campaign_name: Optional[str] = None, city: Optional[str] = None, date_from: Optional[str] = None, date_to: Optional[str] = None, assigned_to: Optional[str] = None, recording_available: Optional[bool] = None, has_followup: Optional[bool] = None) -> list:
     try:
         db = await _adb()
         query = db.table("crm_contacts").select("*").order("updated_at", desc=True)
@@ -528,12 +578,87 @@ async def get_crm_contacts(status: Optional[str] = None, outcome: Optional[str] 
             continue
         if due_today and not (row.get("next_followup_at") or "").startswith(today):
             continue
+        if source and (row.get("source") or "") != source:
+            continue
+        if business_name and (row.get("business_name") or "") != business_name:
+            continue
+        if campaign_name and (row.get("campaign_name") or "") != campaign_name:
+            continue
+        if city and (row.get("city") or "") != city:
+            continue
+        if assigned_to and (row.get("assigned_to") or "") != assigned_to:
+            continue
+        created = row.get("created_at") or ""
+        if date_from and created < date_from:
+            continue
+        if date_to and created[:10] > date_to:
+            continue
+        if has_followup is True and not row.get("next_followup_at"):
+            continue
+        if has_followup is False and row.get("next_followup_at"):
+            continue
+        if recording_available is not None:
+            calls = await get_calls_by_phone(row.get("phone_number") or "")
+            has_recording = any(c.get("recording_url") and not c.get("recording_deleted") for c in calls)
+            if recording_available != has_recording:
+                continue
         filtered.append(row)
     return filtered
 
 
+async def upsert_crm_lead(lead: dict, import_source: Optional[str] = None, upload_batch_id: Optional[str] = None) -> dict:
+    db = await _adb()
+    phone = normalize_phone(lead.get("phone_number") or lead.get("phone") or "")
+    lead_name = _clean_value(lead.get("lead_name") or lead.get("name"))
+    if not lead_name:
+        raise ValueError("lead_name is required")
+    now = datetime.now().isoformat()
+    current = await db.table("crm_contacts").select("*").eq("phone_number", phone).maybe_single().execute()
+    incoming = {}
+    for field in CRM_LEAD_FIELDS:
+        if field == "phone_number":
+            incoming[field] = phone
+            continue
+        value = _clean_value(lead.get(field))
+        if value is not None:
+            incoming[field] = value
+    incoming.setdefault("lead_name", lead_name)
+    incoming.setdefault("source", "manual")
+    if import_source:
+        incoming["import_source"] = import_source
+    if upload_batch_id:
+        incoming["upload_batch_id"] = upload_batch_id
+    incoming["last_synced_at"] = now
+    incoming["updated_at"] = now
+
+    if current.data:
+        existing = current.data
+        updates = {"updated_at": now, "last_synced_at": now}
+        fill_if_blank = [
+            "lead_name", "email", "city", "location", "requirement", "budget", "source",
+            "business_name", "campaign_name", "service_type", "custom_status",
+            "next_followup_at", "assigned_to", "upload_batch_id", "import_source",
+        ]
+        for field in fill_if_blank:
+            if incoming.get(field) and not existing.get(field):
+                updates[field] = incoming[field]
+        if incoming.get("crm_status"):
+            updates["crm_status"] = incoming["crm_status"]
+        if incoming.get("crm_notes"):
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            updates["crm_notes"] = f"{existing.get('crm_notes')}\n[{stamp}] {incoming['crm_notes']}" if existing.get("crm_notes") else incoming["crm_notes"]
+        await db.table("crm_contacts").update(updates).eq("phone_number", phone).execute()
+        return {"status": "updated", "phone_number": phone}
+
+    incoming.setdefault("crm_status", "New")
+    incoming["created_at"] = now
+    await db.table("crm_contacts").insert(incoming).execute()
+    return {"status": "inserted", "phone_number": phone}
+
+
 async def _ensure_crm_contact(phone: str) -> None:
     db = await _adb()
+    phone = normalize_phone(phone)
     current = await db.table("crm_contacts").select("phone_number").eq("phone_number", phone).maybe_single().execute()
     if current.data:
         return
@@ -551,6 +676,7 @@ async def _ensure_crm_contact(phone: str) -> None:
 
 async def update_crm_contact_status(phone: str, crm_status: str, custom_status: Optional[str] = None) -> bool:
     db = await _adb()
+    phone = normalize_phone(phone)
     await _ensure_crm_contact(phone)
     result = await db.table("crm_contacts").update({"crm_status": crm_status, "custom_status": custom_status, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
     return len(result.data or []) > 0
@@ -558,6 +684,7 @@ async def update_crm_contact_status(phone: str, crm_status: str, custom_status: 
 
 async def update_crm_contact_followup(phone: str, next_followup_at: Optional[str]) -> bool:
     db = await _adb()
+    phone = normalize_phone(phone)
     await _ensure_crm_contact(phone)
     result = await db.table("crm_contacts").update({"next_followup_at": next_followup_at, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
     return len(result.data or []) > 0
@@ -565,9 +692,61 @@ async def update_crm_contact_followup(phone: str, next_followup_at: Optional[str
 
 async def update_crm_contact_notes(phone: str, crm_notes: str) -> bool:
     db = await _adb()
+    phone = normalize_phone(phone)
     await _ensure_crm_contact(phone)
     result = await db.table("crm_contacts").update({"crm_notes": crm_notes, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
     return len(result.data or []) > 0
+
+
+async def get_crm_contact_by_phone(phone: str) -> Optional[dict]:
+    db = await _adb()
+    clean = normalize_phone(phone)
+    result = await db.table("crm_contacts").select("*").eq("phone_number", clean).maybe_single().execute()
+    if result.data:
+        return _crm_fallback_contact(result.data)
+    for row in await get_contacts():
+        if row.get("phone_number") == clean:
+            return _crm_fallback_contact(row)
+    return None
+
+
+async def get_crm_contact_detail(phone: str) -> dict:
+    clean = normalize_phone(phone)
+    contact = await get_crm_contact_by_phone(clean)
+    calls = await get_calls_by_phone(clean)
+    appointments = await get_appointments_by_phone(clean)
+    latest_recording_url = ""
+    for call in calls:
+        if call.get("recording_url") and not call.get("recording_deleted"):
+            latest_recording_url = call["recording_url"]
+            break
+    return {
+        "contact": contact,
+        "calls": calls,
+        "appointments": appointments,
+        "latest_recording_url": latest_recording_url,
+        "summary": {
+            "total_calls": len(calls),
+            "last_outcome": calls[0].get("outcome") if calls else None,
+            "last_call_at": calls[0].get("timestamp") if calls else None,
+            "has_active_recording": bool(latest_recording_url),
+        },
+    }
+
+
+async def get_crm_summary() -> dict:
+    rows = await get_crm_contacts()
+    today = datetime.now().date().isoformat()
+    return {
+        "total_leads": len(rows),
+        "new_leads": sum(1 for r in rows if r.get("crm_status") == "New"),
+        "hot_leads": sum(1 for r in rows if r.get("crm_status") == "Hot Lead"),
+        "due_today": sum(1 for r in rows if (r.get("next_followup_at") or "").startswith(today)),
+        "no_answer": sum(1 for r in rows if r.get("last_call_outcome") == "no_answer"),
+        "booked": sum(1 for r in rows if r.get("last_call_outcome") == "booked"),
+        "closed_won": sum(1 for r in rows if r.get("crm_status") == "Closed Won"),
+        "closed_lost": sum(1 for r in rows if r.get("crm_status") == "Closed Lost"),
+    }
 
 
 async def get_stats() -> dict:

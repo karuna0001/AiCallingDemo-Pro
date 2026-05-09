@@ -8,6 +8,7 @@ import logging
 import os
 import random
 import ssl
+import uuid
 import certifi
 import aiohttp
 from pathlib import Path
@@ -16,7 +17,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -36,9 +37,11 @@ from db import (
     delete_campaign, get_agent_profile,
     get_all_agent_profiles, get_all_appointments, get_all_calls,
     get_all_campaigns, get_all_settings, get_calls_by_phone, get_campaign,
-    get_call_logs_for_export, get_contacts, get_crm_contacts, get_lead_statuses,
+    get_call_logs_for_export, get_contacts, get_crm_contact_detail, get_crm_contacts,
+    get_crm_summary, get_lead_statuses, get_crm_contact_by_phone,
     get_logs, get_recording_storage_stats, get_recordings_for_cleanup,
     get_setting, get_stats, init_db, log_error, mark_recording_deleted,
+    normalize_phone, upsert_crm_lead,
     save_settings, set_default_agent_profile, set_setting,
     add_lead_status, delete_lead_status, update_agent_profile, update_call_notes,
     update_campaign_run_stats, update_campaign_status, update_crm_contact_followup,
@@ -164,6 +167,40 @@ class CrmFollowupRequest(BaseModel):
 
 class CrmNotesRequest(BaseModel):
     crm_notes: str = ""
+
+
+class CrmLeadRequest(BaseModel):
+    phone_number: str
+    lead_name: str
+    email: Optional[str] = None
+    city: Optional[str] = None
+    location: Optional[str] = None
+    requirement: Optional[str] = None
+    budget: Optional[str] = None
+    source: Optional[str] = "manual"
+    business_name: Optional[str] = None
+    campaign_name: Optional[str] = None
+    service_type: Optional[str] = None
+    crm_status: Optional[str] = None
+    custom_status: Optional[str] = None
+    crm_notes: Optional[str] = None
+    next_followup_at: Optional[str] = None
+    assigned_to: Optional[str] = None
+
+
+class CrmBulkImportRequest(BaseModel):
+    leads: list
+    import_source: Optional[str] = "api"
+
+
+class CrmCallSelectedRequest(BaseModel):
+    phones: list
+    business_name: str = "our company"
+    service_type: str = "our service"
+    campaign_name: str = "Selected CRM Leads"
+    call_delay_seconds: int = 15
+    agent_profile_id: Optional[str] = None
+    system_prompt: Optional[str] = None
 
 
 class RecordingCleanupRequest(BaseModel):
@@ -633,6 +670,67 @@ async def api_get_contact_calls(phone: str = Query(...)):
     return {"data": await get_calls_by_phone(phone)}
 
 
+CRM_EXPORT_COLUMNS = [
+    "lead_name", "phone_number", "email", "city", "location", "requirement", "budget",
+    "source", "business_name", "campaign_name", "service_type", "crm_status",
+    "custom_status", "next_followup_at", "assigned_to", "crm_notes",
+    "last_call_outcome", "last_call_at", "total_calls", "created_at", "updated_at",
+]
+
+
+def _bool_query(value: Optional[str]):
+    if value is None or value == "":
+        return None
+    return str(value).lower() in ("1", "true", "yes", "on")
+
+
+def _crm_filter_dict(**kwargs) -> dict:
+    return {k: v for k, v in kwargs.items() if v not in (None, "")}
+
+
+async def _crm_contacts_from_filters(filters: dict) -> list:
+    return await get_crm_contacts(
+        status=filters.get("status"),
+        outcome=filters.get("outcome"),
+        q=filters.get("q"),
+        due_today=_bool_query(filters.get("due_today")) is True,
+        source=filters.get("source"),
+        business_name=filters.get("business_name"),
+        campaign_name=filters.get("campaign_name"),
+        city=filters.get("city"),
+        date_from=filters.get("date_from"),
+        date_to=filters.get("date_to"),
+        assigned_to=filters.get("assigned_to"),
+        recording_available=_bool_query(filters.get("recording_available")),
+        has_followup=_bool_query(filters.get("has_followup")),
+    )
+
+
+async def _import_leads(leads: list, import_source: str = "api", upload_batch_id: Optional[str] = None) -> dict:
+    inserted = updated = failed = 0
+    errors = []
+    for idx, lead in enumerate(leads, start=1):
+        try:
+            result = await upsert_crm_lead(lead, import_source=import_source, upload_batch_id=upload_batch_id)
+            if result["status"] == "inserted":
+                inserted += 1
+            else:
+                updated += 1
+        except Exception as exc:
+            failed += 1
+            errors.append({"row": idx, "phone": lead.get("phone_number") or lead.get("phone") or "", "error": str(exc)})
+    return {"success": True, "inserted": inserted, "updated": updated, "failed": failed, "errors": errors}
+
+
+def _normalize_upload_row(row: dict) -> dict:
+    aliases = {"phone": "phone_number", "name": "lead_name"}
+    out = {}
+    for key, value in row.items():
+        clean_key = (key or "").strip().lower()
+        out[aliases.get(clean_key, clean_key)] = value
+    return out
+
+
 @app.get("/api/lead-statuses")
 async def api_get_lead_statuses():
     return {"data": await get_lead_statuses()}
@@ -654,14 +752,175 @@ async def api_delete_lead_status(status_id: str):
     return {"success": True, "message": "Status deleted"}
 
 
+@app.post("/api/crm/contacts")
+async def api_add_crm_contact(req: CrmLeadRequest):
+    try:
+        result = await upsert_crm_lead(req.dict(), import_source=req.source or "manual")
+        return {"success": True, **result, "message": "Lead added" if result["status"] == "inserted" else "Lead updated"}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/crm/import-leads")
+async def api_import_crm_leads(req: CrmBulkImportRequest):
+    return await _import_leads(req.leads or [], import_source=req.import_source or "api")
+
+
+@app.post("/api/crm/upload-leads")
+async def api_upload_crm_leads(file: UploadFile = File(...)):
+    name = file.filename or ""
+    content = await file.read()
+    upload_batch_id = str(uuid.uuid4())
+    rows = []
+    try:
+        if name.lower().endswith(".csv"):
+            text = content.decode("utf-8-sig")
+            rows = [_normalize_upload_row(r) for r in csv.DictReader(StringIO(text))]
+        elif name.lower().endswith(".xlsx"):
+            from openpyxl import load_workbook
+            wb = load_workbook(BytesIO(content), read_only=True, data_only=True)
+            ws = wb.active
+            values = list(ws.iter_rows(values_only=True))
+            if values:
+                headers = [str(h or "").strip() for h in values[0]]
+                rows = [_normalize_upload_row(dict(zip(headers, row))) for row in values[1:] if any(v is not None and str(v).strip() for v in row)]
+        else:
+            raise HTTPException(400, "Only .csv and .xlsx files are supported")
+        if rows and not (("phone_number" in rows[0] or "phone" in rows[0]) and ("lead_name" in rows[0] or "name" in rows[0])):
+            raise HTTPException(400, "Required columns: phone_number/phone and lead_name/name")
+        result = await _import_leads(rows, import_source="file_upload", upload_batch_id=upload_batch_id)
+        return {**result, "upload_batch_id": upload_batch_id}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"Upload failed: {exc}")
+
+
+@app.get("/api/crm/sample-leads.csv")
+async def api_sample_leads_csv():
+    rows = [
+        ["lead_name","phone_number","email","city","location","requirement","budget","source","business_name","campaign_name","service_type","crm_status","crm_notes","next_followup_at","assigned_to"],
+        ["Ramesh","+919876543210","ramesh@gmail.com","Chennai","Tambaram","Villa plot","2500000","Facebook","Abhi Properties","Tambaram Villa Plot","Home visit","New","Interested in site visit","",""],
+        ["Suresh","9876543211","suresh@gmail.com","Chennai","Velachery","Apartment","5000000","Website","Abhi Properties","Website Leads","Property consultation","New","Call after 5 PM","",""],
+    ]
+    out = StringIO()
+    csv.writer(out).writerows(rows)
+    out.seek(0)
+    return StreamingResponse(iter([out.getvalue()]), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="sample_leads.csv"'})
+
+
 @app.get("/api/crm/contacts")
 async def api_get_crm_contacts(
     status: Optional[str] = None,
     outcome: Optional[str] = None,
     q: Optional[str] = None,
     due_today: bool = False,
+    source: Optional[str] = None,
+    business_name: Optional[str] = None,
+    campaign_name: Optional[str] = None,
+    city: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+    recording_available: Optional[str] = None,
+    has_followup: Optional[str] = None,
 ):
-    return {"data": await get_crm_contacts(status=status, outcome=outcome, q=q, due_today=due_today)}
+    filters = _crm_filter_dict(status=status, outcome=outcome, q=q, due_today=str(due_today).lower() if due_today else "", source=source, business_name=business_name, campaign_name=campaign_name, city=city, date_from=date_from, date_to=date_to, assigned_to=assigned_to, recording_available=recording_available, has_followup=has_followup)
+    data = await _crm_contacts_from_filters(filters)
+    return {"data": data, "total": len(data), "filters": filters}
+
+
+@app.get("/api/crm/summary")
+async def api_crm_summary():
+    return await get_crm_summary()
+
+
+@app.get("/api/crm/export/leads.csv")
+async def api_export_crm_leads_csv(
+    status: Optional[str] = None, outcome: Optional[str] = None, q: Optional[str] = None, due_today: Optional[str] = None,
+    source: Optional[str] = None, business_name: Optional[str] = None, campaign_name: Optional[str] = None, city: Optional[str] = None,
+    date_from: Optional[str] = None, date_to: Optional[str] = None, assigned_to: Optional[str] = None,
+    recording_available: Optional[str] = None, has_followup: Optional[str] = None,
+):
+    filters = _crm_filter_dict(status=status, outcome=outcome, q=q, due_today=due_today, source=source, business_name=business_name, campaign_name=campaign_name, city=city, date_from=date_from, date_to=date_to, assigned_to=assigned_to, recording_available=recording_available, has_followup=has_followup)
+    rows = await _crm_contacts_from_filters(filters)
+    out = StringIO()
+    writer = csv.writer(out)
+    writer.writerow(CRM_EXPORT_COLUMNS)
+    for row in rows:
+        writer.writerow([row.get(c, "") for c in CRM_EXPORT_COLUMNS])
+    out.seek(0)
+    return StreamingResponse(iter([out.getvalue()]), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="crm_leads_export.csv"'})
+
+
+@app.get("/api/crm/export/leads.xlsx")
+async def api_export_crm_leads_xlsx(
+    status: Optional[str] = None, outcome: Optional[str] = None, q: Optional[str] = None, due_today: Optional[str] = None,
+    source: Optional[str] = None, business_name: Optional[str] = None, campaign_name: Optional[str] = None, city: Optional[str] = None,
+    date_from: Optional[str] = None, date_to: Optional[str] = None, assigned_to: Optional[str] = None,
+    recording_available: Optional[str] = None, has_followup: Optional[str] = None,
+):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    filters = _crm_filter_dict(status=status, outcome=outcome, q=q, due_today=due_today, source=source, business_name=business_name, campaign_name=campaign_name, city=city, date_from=date_from, date_to=date_to, assigned_to=assigned_to, recording_available=recording_available, has_followup=has_followup)
+    rows = await _crm_contacts_from_filters(filters)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "CRM Leads"
+    ws.append(CRM_EXPORT_COLUMNS)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for row in rows:
+        ws.append([row.get(c, "") for c in CRM_EXPORT_COLUMNS])
+    for column in ws.columns:
+        width = max(len(str(cell.value or "")) for cell in column)
+        ws.column_dimensions[column[0].column_letter].width = min(max(width + 2, 12), 50)
+    stream = BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    return StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": 'attachment; filename="crm_leads_export.xlsx"'})
+
+
+@app.get("/api/crm/contacts/{phone}")
+async def api_get_crm_contact_detail(phone: str):
+    detail = await get_crm_contact_detail(phone)
+    if not detail.get("contact"):
+        raise HTTPException(404, "CRM contact not found")
+    return detail
+
+
+@app.post("/api/crm/call-selected")
+async def api_call_selected(req: CrmCallSelectedRequest):
+    contacts = []
+    failed = 0
+    for phone in req.phones or []:
+        try:
+            clean = normalize_phone(phone)
+            contact = await get_crm_contact_by_phone(clean)
+            if not contact:
+                failed += 1
+                continue
+            contacts.append({
+                "phone": clean,
+                "lead_name": contact.get("lead_name") or "there",
+                "business_name": req.business_name or contact.get("business_name") or "our company",
+                "service_type": req.service_type or contact.get("service_type") or "our service",
+            })
+        except Exception:
+            failed += 1
+    if not contacts:
+        raise HTTPException(400, "No valid leads selected")
+    campaign_id = await create_campaign(
+        req.campaign_name or "Selected CRM Leads",
+        json.dumps(contacts),
+        "once",
+        "09:00",
+        req.call_delay_seconds or 15,
+        req.system_prompt,
+        req.agent_profile_id,
+    )
+    asyncio.create_task(_run_campaign(campaign_id))
+    return {"success": True, "dispatched": len(contacts), "failed": failed, "message": "Selected lead calling started"}
 
 
 @app.patch("/api/crm/contacts/{phone}/status")

@@ -119,3 +119,22 @@ CREATE TABLE IF NOT EXISTS crm_contacts (
 ALTER TABLE crm_contacts DISABLE ROW LEVEL SECURITY;
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_status ON crm_contacts (crm_status);
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_followup ON crm_contacts (next_followup_at);
+
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS email text;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS city text;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS location text;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS requirement text;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS budget text;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS source text DEFAULT 'manual';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS business_name text;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS campaign_name text;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS service_type text;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS upload_batch_id text;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS import_source text;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS last_synced_at timestamptz;
+
+CREATE INDEX IF NOT EXISTS idx_crm_contacts_source ON crm_contacts(source);
+CREATE INDEX IF NOT EXISTS idx_crm_contacts_business_name ON crm_contacts(business_name);
+CREATE INDEX IF NOT EXISTS idx_crm_contacts_campaign_name ON crm_contacts(campaign_name);
+CREATE INDEX IF NOT EXISTS idx_crm_contacts_city ON crm_contacts(city);
+CREATE INDEX IF NOT EXISTS idx_crm_contacts_created_at ON crm_contacts(created_at);
