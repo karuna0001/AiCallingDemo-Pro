@@ -214,21 +214,32 @@ async def api_health():
             val = os.getenv(env_key, "")
             if val:
                 return val
-        if os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_KEY"):
-            try:
-                return await get_setting(key, "")
-            except Exception:
-                return ""
         return ""
+
+    async def supabase_status(url: str, key: str) -> tuple[bool, Optional[str]]:
+        if not (url and key):
+            return False, None
+        try:
+            timeout = aiohttp.ClientTimeout(total=3)
+            headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"{url.rstrip('/')}/rest/v1/", headers=headers) as resp:
+                    if resp.status in (401, 403):
+                        return False, "Invalid API key"
+                    return True, None
+        except Exception:
+            return True, None
 
     livekit_url = await status_value("LIVEKIT_URL")
     livekit_key = await status_value("LIVEKIT_API_KEY")
     livekit_secret = await status_value("LIVEKIT_API_SECRET")
     google_key = await status_value("GOOGLE_API_KEY")
+    supabase_url = await status_value("SUPABASE_URL")
+    supabase_key = await status_value("SUPABASE_SERVICE_KEY")
     trunk_id = await status_value("OUTBOUND_TRUNK_ID")
     gemini_model = await status_value("GEMINI_MODEL")
     gemini_voice = await status_value("GEMINI_TTS_VOICE")
-    prompt_saved = await status_value("system_prompt")
+    prompt_saved = await status_value("SYSTEM_PROMPT", "system_prompt")
     s3_key = await status_value("S3_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")
     s3_secret = await status_value("S3_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY")
     s3_bucket = await status_value("S3_BUCKET", "AWS_BUCKET_NAME")
@@ -237,20 +248,24 @@ async def api_health():
         recording_retention_days = max(int(await status_value("RECORDING_RETENTION_DAYS") or "7"), 1)
     except ValueError:
         recording_retention_days = 7
-    return {
+    supabase_configured, supabase_error = await supabase_status(supabase_url, supabase_key)
+    response = {
         "status": "ok",
         "livekit_configured": bool(livekit_url and livekit_key and livekit_secret),
         "gemini_configured": bool(google_key),
-        "supabase_configured": bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_KEY")),
+        "supabase_configured": supabase_configured,
         "trunk_configured": bool(trunk_id),
         "gemini_model_configured": bool(gemini_model),
         "gemini_tts_voice_configured": bool(gemini_voice),
         "prompt_configured": bool(prompt_saved),
-        "prompt_mode": "custom" if prompt_saved else "default",
+        "prompt_mode": "custom" if prompt_saved else "unknown",
         "s3_configured": bool(s3_key and s3_secret and s3_bucket),
         "recording_auto_delete_enabled": recording_auto_delete,
         "recording_retention_days": recording_retention_days,
     }
+    if supabase_error:
+        response["supabase_error"] = supabase_error
+    return response
 
 
 @app.get("/", response_class=HTMLResponse)
