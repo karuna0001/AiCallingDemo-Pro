@@ -209,13 +209,47 @@ class RecordingCleanupRequest(BaseModel):
 
 @app.get("/api/health")
 async def api_health():
-    """Lightweight healthcheck — does NOT touch Supabase so it stays green during DB blips."""
+    async def status_value(key: str, *fallback_envs: str) -> str:
+        for env_key in (key, *fallback_envs):
+            val = os.getenv(env_key, "")
+            if val:
+                return val
+        if os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_KEY"):
+            try:
+                return await get_setting(key, "")
+            except Exception:
+                return ""
+        return ""
+
+    livekit_url = await status_value("LIVEKIT_URL")
+    livekit_key = await status_value("LIVEKIT_API_KEY")
+    livekit_secret = await status_value("LIVEKIT_API_SECRET")
+    google_key = await status_value("GOOGLE_API_KEY")
+    trunk_id = await status_value("OUTBOUND_TRUNK_ID")
+    gemini_model = await status_value("GEMINI_MODEL")
+    gemini_voice = await status_value("GEMINI_TTS_VOICE")
+    prompt_saved = await status_value("system_prompt")
+    s3_key = await status_value("S3_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")
+    s3_secret = await status_value("S3_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY")
+    s3_bucket = await status_value("S3_BUCKET", "AWS_BUCKET_NAME")
+    recording_auto_delete = (await status_value("RECORDING_AUTO_DELETE_ENABLED") or "false").strip().lower() in ("1", "true", "yes", "on")
+    try:
+        recording_retention_days = max(int(await status_value("RECORDING_RETENTION_DAYS") or "7"), 1)
+    except ValueError:
+        recording_retention_days = 7
     return {
         "status": "ok",
-        "livekit_configured": bool(os.getenv("LIVEKIT_URL") and os.getenv("LIVEKIT_API_KEY") and os.getenv("LIVEKIT_API_SECRET")),
-        "gemini_configured": bool(os.getenv("GOOGLE_API_KEY")),
+        "livekit_configured": bool(livekit_url and livekit_key and livekit_secret),
+        "gemini_configured": bool(google_key),
         "supabase_configured": bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_KEY")),
-        "trunk_configured": bool(os.getenv("OUTBOUND_TRUNK_ID")),
+        "trunk_configured": bool(trunk_id),
+        "gemini_model_configured": bool(gemini_model),
+        "gemini_tts_voice_configured": bool(gemini_voice),
+        "prompt_configured": bool(prompt_saved),
+        "prompt_mode": "custom" if prompt_saved else "default",
+        "s3_configured": bool(s3_key and s3_secret and s3_bucket),
+        "recording_auto_delete_enabled": recording_auto_delete,
+        "recording_retention_days": recording_retention_days,
     }
 
 
