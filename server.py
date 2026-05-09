@@ -11,7 +11,9 @@ import ssl
 import certifi
 import aiohttp
 from pathlib import Path
+from urllib.parse import urlparse, unquote
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -35,7 +37,8 @@ from db import (
     get_all_agent_profiles, get_all_appointments, get_all_calls,
     get_all_campaigns, get_all_settings, get_calls_by_phone, get_campaign,
     get_call_logs_for_export, get_contacts, get_crm_contacts, get_lead_statuses,
-    get_logs, get_setting, get_stats, init_db, log_error,
+    get_logs, get_recording_storage_stats, get_recordings_for_cleanup,
+    get_setting, get_stats, init_db, log_error, mark_recording_deleted,
     save_settings, set_default_agent_profile, set_setting,
     add_lead_status, delete_lead_status, update_agent_profile, update_call_notes,
     update_campaign_run_stats, update_campaign_status, update_crm_contact_followup,
@@ -83,6 +86,7 @@ async def _startup():
     if _scheduler:
         _scheduler.start()
         await _reschedule_all_campaigns()
+        await _schedule_recording_cleanup()
 
 
 @app.on_event("shutdown")
@@ -160,6 +164,10 @@ class CrmFollowupRequest(BaseModel):
 
 class CrmNotesRequest(BaseModel):
     crm_notes: str = ""
+
+
+class RecordingCleanupRequest(BaseModel):
+    confirm: Optional[str] = None
 
 
 @app.get("/api/health")
@@ -284,6 +292,15 @@ def _export_value(row: dict, key: str) -> str:
     return "" if value is None else str(value)
 
 
+def _export_cell_value(row: dict, label: str, key: str) -> str:
+    if label == "Recording Download Link":
+        if row.get("recording_deleted"):
+            return "Recording Deleted"
+        if row.get("recording_url"):
+            return "Download Recording"
+    return _export_value(row, key)
+
+
 @app.get("/api/export/calls.csv")
 async def api_export_calls_csv(
     date_from: Optional[str] = None,
@@ -298,7 +315,7 @@ async def api_export_calls_csv(
         writer.writerow([label for label, _ in EXPORT_COLUMNS])
         for row in rows:
             writer.writerow([
-                _export_value(row, key)
+                _export_cell_value(row, label, key)
                 for label, key in EXPORT_COLUMNS
             ])
         out.seek(0)
@@ -335,11 +352,11 @@ async def api_export_calls_xlsx(
         download_col = headers.index("Recording Download Link") + 1
         for row in rows:
             ws.append([
-                "Download Recording" if label == "Recording Download Link" and row.get("recording_url") else _export_value(row, key)
+                _export_cell_value(row, label, key)
                 for label, key in EXPORT_COLUMNS
             ])
             recording_url = row.get("recording_url")
-            if recording_url:
+            if recording_url and not row.get("recording_deleted"):
                 cell = ws.cell(row=ws.max_row, column=download_col)
                 cell.hyperlink = recording_url
                 cell.style = "Hyperlink"
@@ -364,6 +381,97 @@ async def api_export_calls_xlsx(
 @app.get("/api/stats")
 async def api_get_stats():
     return await get_stats()
+
+
+async def _recording_retention_days() -> int:
+    raw = await get_setting("RECORDING_RETENTION_DAYS", "7")
+    try:
+        return max(int(raw), 1)
+    except (TypeError, ValueError):
+        return 7
+
+
+async def _recording_auto_delete_enabled() -> bool:
+    raw = (await get_setting("RECORDING_AUTO_DELETE_ENABLED", "false")).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+async def _recording_cleanup_time() -> str:
+    return await get_setting("RECORDING_CLEANUP_TIME", "02:00") or "02:00"
+
+
+def _derive_recording_key(recording_url: str, bucket: str) -> Optional[str]:
+    if not recording_url:
+        return None
+    parsed = urlparse(recording_url)
+    if parsed.scheme == "s3":
+        key = parsed.path.lstrip("/")
+    else:
+        path = unquote(parsed.path or "").lstrip("/")
+        prefix = f"{bucket}/"
+        key = path[len(prefix):] if bucket and path.startswith(prefix) else path
+    if not key or key.startswith("/") or ".." in key.split("/"):
+        return None
+    return key
+
+
+async def _delete_recording_object(object_key: str) -> None:
+    import boto3
+
+    aws_key = await eff("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
+    aws_secret = await eff("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    bucket = await eff("S3_BUCKET") or os.getenv("AWS_BUCKET_NAME", "")
+    endpoint = await eff("S3_ENDPOINT_URL") or os.getenv("S3_ENDPOINT", "")
+    region = await eff("S3_REGION") or os.getenv("AWS_REGION", "ap-northeast-1")
+    if not (aws_key and aws_secret and bucket):
+        raise RuntimeError("S3/R2 credentials are not configured")
+    client = boto3.client(
+        "s3",
+        aws_access_key_id=aws_key,
+        aws_secret_access_key=aws_secret,
+        endpoint_url=endpoint or None,
+        region_name=region,
+    )
+    client.delete_object(Bucket=bucket, Key=object_key)
+
+
+async def _cleanup_old_recordings() -> dict:
+    retention_days = await _recording_retention_days()
+    rows = await get_recordings_for_cleanup(retention_days)
+    bucket = await eff("S3_BUCKET") or os.getenv("AWS_BUCKET_NAME", "")
+    deleted = failed = 0
+    for row in rows:
+        object_key = row.get("recording_object_key") or _derive_recording_key(row.get("recording_url", ""), bucket)
+        if not object_key:
+            failed += 1
+            continue
+        try:
+            await _delete_recording_object(object_key)
+            if await mark_recording_deleted(row["id"]):
+                deleted += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            failed += 1
+            await log_error("server", "Recording delete failed", f"id={row.get('id')} key={object_key}: {exc}", "error")
+    await log_error("server", "Recording cleanup summary", f"deleted={deleted}, failed={failed}, retention_days={retention_days}", "info")
+    return {"deleted": deleted, "failed": failed}
+
+
+@app.get("/api/recordings/storage")
+async def api_recordings_storage():
+    stats = await get_recording_storage_stats()
+    retention_days = await _recording_retention_days()
+    auto_delete_enabled = await _recording_auto_delete_enabled()
+    return {**stats, "retention_days": retention_days, "auto_delete_enabled": auto_delete_enabled}
+
+
+@app.post("/api/recordings/cleanup")
+async def api_recordings_cleanup(req: Optional[RecordingCleanupRequest] = None):
+    if not req or req.confirm != "DELETE_OLD_RECORDINGS":
+        return JSONResponse(status_code=400, content={"success": False, "error": "Confirmation required"})
+    result = await _cleanup_old_recordings()
+    return {"success": True, **result, "message": "Old recordings cleaned up"}
 
 
 @app.get("/api/appointments")
@@ -411,6 +519,8 @@ async def api_save_settings(req: SettingsRequest):
     for k, v in filtered.items():
         if not os.environ.get(k):
             os.environ[k] = str(v)
+    if any(k.startswith("RECORDING_") for k in filtered):
+        await _schedule_recording_cleanup()
     return {"status": "saved", "count": len(filtered)}
 
 
@@ -691,6 +801,32 @@ async def _reschedule_all_campaigns() -> None:
                 _schedule_campaign(c["id"], c["schedule_type"], c.get("schedule_time", "09:00"))
     except Exception as exc:
         logger.warning("Could not reschedule campaigns: %s", exc)
+
+
+async def _scheduled_recording_cleanup() -> None:
+    try:
+        if await _recording_auto_delete_enabled():
+            await _cleanup_old_recordings()
+    except Exception as exc:
+        logger.exception("Scheduled recording cleanup failed: %s", exc)
+        await log_error("server", "Scheduled recording cleanup failed", str(exc), "error")
+
+
+async def _schedule_recording_cleanup() -> None:
+    if not _scheduler:
+        return
+    job_id = "recording_cleanup"
+    if _scheduler.get_job(job_id):
+        _scheduler.remove_job(job_id)
+    if not await _recording_auto_delete_enabled():
+        return
+    cleanup_time = await _recording_cleanup_time()
+    try:
+        hour, minute = map(int, cleanup_time.split(":"))
+    except (ValueError, AttributeError):
+        hour, minute = 2, 0
+    trigger = CronTrigger(hour=hour, minute=minute, timezone=ZoneInfo("Asia/Kolkata"))
+    _scheduler.add_job(_scheduled_recording_cleanup, trigger=trigger, id=job_id, replace_existing=True)
 
 
 def _schedule_campaign(campaign_id: str, schedule_type: str, schedule_time: str) -> None:

@@ -255,6 +255,8 @@ async def entrypoint(ctx: agents.JobContext):
                 egress = await ctx.api.egress.start_room_composite_egress(req)
                 endpoint = s3_endpoint.rstrip("/")
                 tool_ctx.recording_url = f"{endpoint}/{aws_bucket}/{recording_path}" if endpoint else f"s3://{aws_bucket}/{recording_path}"
+                tool_ctx.recording_object_key = recording_path
+                tool_ctx.recording_size_bytes = 0
                 await _log("info", f"Recording started: egress={egress.egress_id}")
             except Exception as exc:
                 await _log("warning", f"Recording start failed (non-fatal): {exc}")

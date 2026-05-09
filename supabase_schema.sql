@@ -45,6 +45,10 @@ ALTER TABLE error_logs    DISABLE ROW LEVEL SECURITY;
 
 ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_url TEXT;
 ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS notes TEXT;
+ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_object_key text;
+ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_size_bytes bigint DEFAULT 0;
+ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_deleted boolean DEFAULT false;
+ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_deleted_at timestamptz;
 
 CREATE TABLE IF NOT EXISTS campaigns (
     id TEXT PRIMARY KEY,

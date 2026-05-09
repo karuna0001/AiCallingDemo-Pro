@@ -39,6 +39,9 @@ DEFAULTS = {
     "SUPABASE_URL":            os.getenv("SUPABASE_URL", ""),
     "SUPABASE_SERVICE_KEY":    os.getenv("SUPABASE_SERVICE_KEY", ""),
     "DEEPGRAM_API_KEY":        os.getenv("DEEPGRAM_API_KEY", ""),
+    "RECORDING_AUTO_DELETE_ENABLED": os.getenv("RECORDING_AUTO_DELETE_ENABLED", "false"),
+    "RECORDING_RETENTION_DAYS":      os.getenv("RECORDING_RETENTION_DAYS", "7"),
+    "RECORDING_CLEANUP_TIME":        os.getenv("RECORDING_CLEANUP_TIME", "02:00"),
 }
 
 DEFAULT_LEAD_STATUSES = [
@@ -133,6 +136,7 @@ async def get_all_settings() -> dict:
         "DEEPGRAM_API_KEY", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER",
         "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_ENDPOINT_URL", "S3_REGION", "S3_BUCKET",
         "CALCOM_API_KEY", "CALCOM_EVENT_TYPE_ID", "CALCOM_TIMEZONE", "ENABLED_TOOLS",
+        "RECORDING_AUTO_DELETE_ENABLED", "RECORDING_RETENTION_DAYS", "RECORDING_CLEANUP_TIME",
     ]
     out = {}
     for k in known_keys:
@@ -310,14 +314,23 @@ async def get_appointments_by_phone(phone: str) -> list:
     return result.data or []
 
 
-async def log_call(phone_number: str, lead_name: Optional[str], outcome: str, reason: str, duration_seconds: int, recording_url: Optional[str] = None, notes: Optional[str] = None) -> None:
+async def log_call(phone_number: str, lead_name: Optional[str], outcome: str, reason: str, duration_seconds: int, recording_url: Optional[str] = None, notes: Optional[str] = None, recording_object_key: Optional[str] = None, recording_size_bytes: int = 0) -> None:
     db = await _adb()
     row = {"id": str(uuid.uuid4()), "phone_number": phone_number, "lead_name": lead_name, "outcome": outcome, "reason": reason, "duration_seconds": duration_seconds, "timestamp": datetime.now().isoformat()}
     if recording_url:
         row["recording_url"] = recording_url
+        row["recording_deleted"] = False
+        row["recording_size_bytes"] = recording_size_bytes or 0
+    if recording_object_key:
+        row["recording_object_key"] = recording_object_key
     if notes:
         row["notes"] = notes
-    await db.table("call_logs").insert(row).execute()
+    try:
+        await db.table("call_logs").insert(row).execute()
+    except Exception:
+        for key in ("recording_object_key", "recording_size_bytes", "recording_deleted"):
+            row.pop(key, None)
+        await db.table("call_logs").insert(row).execute()
     await upsert_crm_contact_from_call(row)
 
 
@@ -350,6 +363,46 @@ async def get_call_logs_for_export(filters: Optional[dict] = None) -> list:
 
     result = await query.execute()
     return result.data or []
+
+
+async def get_recordings_for_cleanup(retention_days: int) -> list:
+    db = await _adb()
+    cutoff = (datetime.now() - timedelta(days=max(retention_days, 0))).isoformat()
+    result = await db.table("call_logs").select("id, recording_url, recording_object_key, recording_deleted, timestamp").execute()
+    rows = result.data or []
+    return [
+        row for row in rows
+        if row.get("recording_url") and not row.get("recording_deleted") and (row.get("timestamp") or "") < cutoff
+    ]
+
+
+async def mark_recording_deleted(call_id: str) -> bool:
+    db = await _adb()
+    result = await db.table("call_logs").update({
+        "recording_deleted": True,
+        "recording_deleted_at": datetime.now().isoformat(),
+        "recording_url": None,
+    }).eq("id", call_id).execute()
+    return len(result.data or []) > 0
+
+
+async def get_recording_storage_stats() -> dict:
+    db = await _adb()
+    result = await db.table("call_logs").select("recording_url, recording_deleted, recording_size_bytes").execute()
+    rows = result.data or []
+    total_recordings = sum(1 for r in rows if r.get("recording_url") or r.get("recording_deleted"))
+    deleted_recordings = sum(1 for r in rows if r.get("recording_deleted"))
+    active_recordings = sum(1 for r in rows if r.get("recording_url") and not r.get("recording_deleted"))
+    total_size = sum(int(r.get("recording_size_bytes") or 0) for r in rows if not r.get("recording_deleted"))
+    return {
+        "total_recordings": total_recordings,
+        "active_recordings": active_recordings,
+        "deleted_recordings": deleted_recordings,
+        "total_size_bytes": total_size,
+        "total_size_mb": round(total_size / (1024 * 1024), 2),
+        "total_size_gb": round(total_size / (1024 * 1024 * 1024), 2),
+        "size_tracking_note": "Recording size is only tracked for new recordings.",
+    }
 
 
 async def get_calls_by_phone(phone: str) -> list:

@@ -33,6 +33,8 @@ class AppointmentTools(llm.ToolContext):
         self._call_start_time = time.time()
         self._sip_domain = os.getenv("VOBIZ_SIP_DOMAIN", "")
         self.recording_url: Optional[str] = None
+        self.recording_object_key: Optional[str] = None
+        self.recording_size_bytes: int = 0
         super().__init__(tools=[])
 
     def build_tool_list(self, enabled: list) -> list:
@@ -72,7 +74,16 @@ class AppointmentTools(llm.ToolContext):
         """End the call and log the outcome."""
         duration = int(time.time() - self._call_start_time)
         try:
-            await log_call(self.phone_number or "unknown", self.lead_name, outcome, reason, duration, self.recording_url)
+            await log_call(
+                self.phone_number or "unknown",
+                self.lead_name,
+                outcome,
+                reason,
+                duration,
+                self.recording_url,
+                recording_object_key=self.recording_object_key,
+                recording_size_bytes=self.recording_size_bytes,
+            )
         except Exception as exc:
             logger.error("Failed to log call: %s", exc)
         # Give Gemini ~1.5s to finish speaking the goodbye line before we tear down.
