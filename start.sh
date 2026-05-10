@@ -30,32 +30,39 @@ echo "   Gemini:   ${GEMINI_MODEL:-gemini-3.1-flash-live-preview}"
 echo "   Supabase: ${SUPABASE_URL:-<missing>}"
 
 SERVER_PID=""
-AGENT_PID=""
+OUTBOUND_AGENT_PID=""
+INBOUND_AGENT_PID=""
 
 echo "🌐 Starting FastAPI on port ${PORT:-8000}..."
 uvicorn server:app --host 0.0.0.0 --port "${PORT:-8000}" &
 SERVER_PID=$!
 
-# Propagate shutdown signals to both the web server and the agent worker
-trap 'kill -TERM "$SERVER_PID" 2>/dev/null || true; kill -TERM "$AGENT_PID" 2>/dev/null || true; wait' INT TERM
+# Propagate shutdown signals to the web server and agent workers
+trap 'kill -TERM "$SERVER_PID" 2>/dev/null || true; kill -TERM "$OUTBOUND_AGENT_PID" 2>/dev/null || true; kill -TERM "$INBOUND_AGENT_PID" 2>/dev/null || true; wait' INT TERM
 
 sleep 2
 
 echo "🤖 Starting LiveKit agent worker..."
-python agent.py start &
-AGENT_PID=$!
+AGENT_NAME=outbound-caller python agent.py start &
+OUTBOUND_AGENT_PID=$!
+
+echo "Starting inbound LiveKit agent worker..."
+AGENT_NAME=inbound-agent python agent.py start &
+INBOUND_AGENT_PID=$!
 
 # Portable watchdog: exit as soon as either child dies so the
 # container orchestrator (Coolify / Docker) can restart us.
-while kill -0 "$SERVER_PID" 2>/dev/null && kill -0 "$AGENT_PID" 2>/dev/null; do
+while kill -0 "$SERVER_PID" 2>/dev/null && kill -0 "$OUTBOUND_AGENT_PID" 2>/dev/null && kill -0 "$INBOUND_AGENT_PID" 2>/dev/null; do
     sleep 2
 done
 
 # Reap whichever child is still alive
 kill -TERM "$SERVER_PID" 2>/dev/null || true
-kill -TERM "$AGENT_PID" 2>/dev/null || true
+kill -TERM "$OUTBOUND_AGENT_PID" 2>/dev/null || true
+kill -TERM "$INBOUND_AGENT_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
-wait "$AGENT_PID"  2>/dev/null || true
+wait "$OUTBOUND_AGENT_PID"  2>/dev/null || true
+wait "$INBOUND_AGENT_PID"  2>/dev/null || true
 
 echo "❌ One of the processes exited — stopping container so the orchestrator can restart it."
 exit 1

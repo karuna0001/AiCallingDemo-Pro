@@ -3,7 +3,9 @@ import json
 import logging
 import os
 import ssl
+import time
 import certifi
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -25,8 +27,11 @@ except ImportError:
     _HAS_ROOM_OPTIONS = False
 from livekit.plugins import noise_cancellation, silero
 
-from db import init_db, log_error, get_enabled_tools
-from prompts import build_prompt
+from db import (
+    get_crm_contact_detail, get_enabled_tools, init_db, log_call, log_error,
+    normalize_phone, upsert_crm_lead,
+)
+from prompts import build_inbound_prompt, build_prompt
 from tools import AppointmentTools
 
 load_dotenv(".env", override=False)
@@ -35,6 +40,11 @@ logger = logging.getLogger("outbound-agent")
 
 
 class OutboundAssistant(Agent):
+    def __init__(self, instructions: str) -> None:
+        super().__init__(instructions=instructions, tools=[])
+
+
+class VoiceAssistant(Agent):
     def __init__(self, instructions: str) -> None:
         super().__init__(instructions=instructions, tools=[])
 
@@ -155,6 +165,144 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
     )
 
 
+def _is_inbound_job(metadata: dict, room_name: str) -> bool:
+    markers = [
+        metadata.get("call_type"),
+        metadata.get("direction"),
+        metadata.get("mode"),
+    ]
+    return any(str(v).lower() == "inbound" for v in markers if v) or room_name.startswith("inbound")
+
+
+def _participant_sip_attrs(participant: rtc.RemoteParticipant) -> dict:
+    attrs = getattr(participant, "attributes", None) or {}
+    return attrs if isinstance(attrs, dict) else {}
+
+
+def _has_sip_attrs(participant: rtc.RemoteParticipant) -> bool:
+    attrs = _participant_sip_attrs(participant)
+    return any(k.startswith("sip.") for k in attrs) or str(participant.identity or "").startswith("sip_")
+
+
+async def _wait_for_sip_participant(ctx: agents.JobContext, timeout: int = 60) -> Optional[rtc.RemoteParticipant]:
+    for participant in ctx.room.remote_participants.values():
+        if _has_sip_attrs(participant):
+            return participant
+
+    found: asyncio.Future = asyncio.get_event_loop().create_future()
+
+    def on_participant_connected(participant: rtc.RemoteParticipant):
+        if not found.done() and _has_sip_attrs(participant):
+            found.set_result(participant)
+
+    ctx.room.on("participant_connected", on_participant_connected)
+    try:
+        return await asyncio.wait_for(found, timeout=timeout)
+    except asyncio.TimeoutError:
+        return None
+
+
+def _safe_normalize_phone(phone: str) -> str:
+    try:
+        return normalize_phone(phone)
+    except Exception:
+        return str(phone or "").strip() or "unknown"
+
+
+def _crm_context_text(detail: dict) -> str:
+    contact = detail.get("contact") or {}
+    calls = detail.get("calls") or []
+    appointments = detail.get("appointments") or []
+    if not contact:
+        return "New inbound caller. No CRM contact existed before this call."
+    lines = [
+        f"Name: {contact.get('lead_name') or 'Unknown Caller'}",
+        f"CRM status: {contact.get('crm_status') or 'New'}",
+    ]
+    for key in ("custom_status", "crm_notes", "next_followup_at", "requirement", "city", "location", "budget"):
+        if contact.get(key):
+            lines.append(f"{key}: {contact[key]}")
+    if calls:
+        lines.append("Recent calls:")
+        for call in calls[:5]:
+            lines.append(f"- {(call.get('timestamp') or '')[:16]} {call.get('call_type') or 'outbound'} {call.get('outcome') or 'unknown'}: {call.get('reason') or ''}")
+    if appointments:
+        lines.append("Appointments:")
+        for appt in appointments[:5]:
+            lines.append(f"- {appt.get('date')} {appt.get('time')} {appt.get('service')} [{appt.get('status')}]")
+    return "\n".join(lines)
+
+
+async def _ensure_inbound_crm_contact(phone: str) -> dict:
+    if not phone or phone == "unknown":
+        return {"contact": None, "calls": [], "appointments": []}
+    detail = await get_crm_contact_detail(phone)
+    if detail.get("contact"):
+        return detail
+    try:
+        await upsert_crm_lead({
+            "phone_number": phone,
+            "lead_name": "Unknown Caller",
+            "source": "inbound_call",
+            "crm_status": "New",
+        }, import_source="inbound_call")
+    except Exception as exc:
+        await _log("warning", "Could not create inbound CRM contact", str(exc))
+    return await get_crm_contact_detail(phone)
+
+
+async def _start_recording(ctx: agents.JobContext, tool_ctx: AppointmentTools) -> None:
+    aws_key = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
+    aws_secret = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    aws_bucket = os.getenv("S3_BUCKET") or os.getenv("AWS_BUCKET_NAME", "")
+    s3_endpoint = os.getenv("S3_ENDPOINT_URL") or os.getenv("S3_ENDPOINT", "")
+    s3_region = os.getenv("S3_REGION") or os.getenv("AWS_REGION", "ap-northeast-1")
+    if not (aws_key and aws_secret and aws_bucket):
+        return
+    try:
+        recording_path = f"recordings/{ctx.room.name}.ogg"
+        req = api.RoomCompositeEgressRequest(
+            room_name=ctx.room.name,
+            audio_only=True,
+            file_outputs=[api.EncodedFileOutput(
+                file_type=api.EncodedFileType.OGG,
+                filepath=recording_path,
+                s3=api.S3Upload(access_key=aws_key, secret=aws_secret, bucket=aws_bucket, region=s3_region, endpoint=s3_endpoint),
+            )],
+        )
+        egress = await ctx.api.egress.start_room_composite_egress(req)
+        endpoint = s3_endpoint.rstrip("/")
+        tool_ctx.recording_url = f"{endpoint}/{aws_bucket}/{recording_path}" if endpoint else f"s3://{aws_bucket}/{recording_path}"
+        tool_ctx.recording_object_key = recording_path
+        tool_ctx.recording_size_bytes = 0
+        await _log("info", f"Recording started: egress={egress.egress_id}")
+    except Exception as exc:
+        await _log("warning", f"Recording start failed (non-fatal): {exc}")
+
+
+async def _run_session(ctx: agents.JobContext, system_prompt: str, tool_ctx: AppointmentTools, enabled_tools: list) -> AgentSession:
+    active_tools = tool_ctx.build_tool_list(enabled_tools)
+    session = _build_session(tools=active_tools, system_prompt=system_prompt)
+
+    if _HAS_ROOM_OPTIONS:
+        from livekit.agents import RoomOptions as _RO
+        session_kwargs = dict(
+            room=ctx.room,
+            agent=VoiceAssistant(instructions=system_prompt),
+            room_options=_RO(input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony())),
+        )
+    else:
+        session_kwargs = dict(
+            room=ctx.room,
+            agent=VoiceAssistant(instructions=system_prompt),
+            room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony()),
+        )
+
+    await session.start(**session_kwargs)
+    await _log("info", "Agent session started")
+    return session
+
+
 async def entrypoint(ctx: agents.JobContext):
     metadata = {}
     try:
@@ -168,6 +316,7 @@ async def entrypoint(ctx: agents.JobContext):
     except Exception:
         pass
 
+    is_inbound = _is_inbound_job(metadata, ctx.room.name)
     phone_number = metadata.get("phone_number")
     lead_name = metadata.get("lead_name", "there")
     business_name = metadata.get("business_name", "our company")
@@ -185,13 +334,55 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception:
             pass
 
-    system_prompt = build_prompt(lead_name, business_name, service_type, metadata.get("system_prompt"))
-    tool_ctx = AppointmentTools(ctx, phone_number=phone_number, lead_name=lead_name)
-
     await ctx.connect()
     await _log("info", f"Connected to LiveKit room: {ctx.room.name}")
 
-    if phone_number:
+    preconnected_sip_participant = None
+    if not is_inbound and not phone_number:
+        preconnected_sip_participant = await _wait_for_sip_participant(ctx, timeout=5)
+        is_inbound = preconnected_sip_participant is not None
+
+    if is_inbound:
+        participant = preconnected_sip_participant or await _wait_for_sip_participant(ctx)
+        attrs = _participant_sip_attrs(participant) if participant else {}
+        caller_phone = _safe_normalize_phone(
+            attrs.get("sip.phoneNumber") or attrs.get("sip.phone_number") or metadata.get("phone_number") or ""
+        )
+        trunk_phone_number = attrs.get("sip.trunkPhoneNumber") or attrs.get("sip.trunk_phone_number")
+        sip_trunk_id = attrs.get("sip.trunkID") or attrs.get("sip.trunk_id")
+        sip_dispatch_rule_id = attrs.get("sip.ruleID") or attrs.get("sip.rule_id")
+        livekit_call_id = attrs.get("sip.callID") or attrs.get("sip.call_id")
+        detail = await _ensure_inbound_crm_contact(caller_phone)
+        contact = detail.get("contact") or {}
+        lead_name = contact.get("lead_name") or "Unknown Caller"
+        business_name = os.getenv("INBOUND_BUSINESS_NAME") or metadata.get("business_name") or "our company"
+        service_type = os.getenv("INBOUND_SERVICE_TYPE") or metadata.get("service_type") or "our service"
+        system_prompt = build_inbound_prompt(
+            business_name=business_name,
+            service_type=service_type,
+            greeting_message=os.getenv("INBOUND_GREETING_MESSAGE", ""),
+            faq_text=os.getenv("INBOUND_FAQ_TEXT", ""),
+            crm_context=_crm_context_text(detail),
+        )
+        tool_ctx = AppointmentTools(
+            ctx,
+            phone_number=caller_phone,
+            lead_name=lead_name,
+            call_type="inbound",
+            include_inbound_tools=True,
+            room_name=ctx.room.name,
+            livekit_call_id=livekit_call_id,
+            sip_trunk_id=sip_trunk_id,
+            sip_dispatch_rule_id=sip_dispatch_rule_id,
+            trunk_phone_number=trunk_phone_number,
+            participant_identity=getattr(participant, "identity", None) if participant else None,
+        )
+        await _log("info", f"Inbound caller connected: {caller_phone}", json.dumps(attrs))
+    else:
+        system_prompt = build_prompt(lead_name, business_name, service_type, metadata.get("system_prompt"))
+        tool_ctx = AppointmentTools(ctx, phone_number=phone_number, lead_name=lead_name, call_type="outbound", room_name=ctx.room.name)
+
+    if phone_number and not is_inbound:
         trunk_id = os.getenv("OUTBOUND_TRUNK_ID")
         if not trunk_id:
             await _log("error", "OUTBOUND_TRUNK_ID not set — cannot place outbound call")
@@ -214,63 +405,25 @@ async def entrypoint(ctx: agents.JobContext):
             return
         await _log("info", f"Call ANSWERED — {phone_number} picked up, starting AI session now")
 
-    active_tools = tool_ctx.build_tool_list(enabled_tools)
-    session = _build_session(tools=active_tools, system_prompt=system_prompt)
+    session = await _run_session(ctx, system_prompt, tool_ctx, enabled_tools)
 
-    if _HAS_ROOM_OPTIONS:
-        from livekit.agents import RoomOptions as _RO
-        session_kwargs = dict(
-            room=ctx.room,
-            agent=OutboundAssistant(instructions=system_prompt),
-            room_options=_RO(input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony())),
-        )
-    else:
-        session_kwargs = dict(
-            room=ctx.room,
-            agent=OutboundAssistant(instructions=system_prompt),
-            room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony()),
-        )
-
-    await session.start(**session_kwargs)
-    await _log("info", "Agent session started")
-
-    if phone_number:
-        aws_key = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
-        aws_secret = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
-        aws_bucket = os.getenv("S3_BUCKET") or os.getenv("AWS_BUCKET_NAME", "")
-        s3_endpoint = os.getenv("S3_ENDPOINT_URL") or os.getenv("S3_ENDPOINT", "")
-        s3_region = os.getenv("S3_REGION") or os.getenv("AWS_REGION", "ap-northeast-1")
-        if aws_key and aws_secret and aws_bucket:
-            try:
-                recording_path = f"recordings/{ctx.room.name}.ogg"
-                req = api.RoomCompositeEgressRequest(
-                    room_name=ctx.room.name,
-                    audio_only=True,
-                    file_outputs=[api.EncodedFileOutput(
-                        file_type=api.EncodedFileType.OGG,
-                        filepath=recording_path,
-                        s3=api.S3Upload(access_key=aws_key, secret=aws_secret, bucket=aws_bucket, region=s3_region, endpoint=s3_endpoint),
-                    )],
-                )
-                egress = await ctx.api.egress.start_room_composite_egress(req)
-                endpoint = s3_endpoint.rstrip("/")
-                tool_ctx.recording_url = f"{endpoint}/{aws_bucket}/{recording_path}" if endpoint else f"s3://{aws_bucket}/{recording_path}"
-                tool_ctx.recording_object_key = recording_path
-                tool_ctx.recording_size_bytes = 0
-                await _log("info", f"Recording started: egress={egress.egress_id}")
-            except Exception as exc:
-                await _log("warning", f"Recording start failed (non-fatal): {exc}")
+    if phone_number or is_inbound:
+        await _start_recording(ctx, tool_ctx)
 
     active_model = os.getenv("GEMINI_MODEL", "")
     if "3.1" in active_model or "2.5" in active_model:
         await _log("info", "Gemini native-audio: model will greet autonomously from system prompt")
     else:
         try:
-            await session.generate_reply(instructions=f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}.")
+            if is_inbound:
+                greeting = os.getenv("INBOUND_GREETING_MESSAGE") or f"Hi, thank you for calling {business_name}. How can I help you today?"
+                await session.generate_reply(instructions=f"The inbound call just connected. Say exactly this greeting: {greeting}")
+            else:
+                await session.generate_reply(instructions=f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}.")
         except Exception as exc:
             await _log("warning", f"generate_reply failed: {exc}")
 
-    if phone_number:
+    if phone_number and not is_inbound:
         sip_identity = f"sip_{phone_number}"
         disconnect_event = asyncio.Event()
 
@@ -287,14 +440,44 @@ async def entrypoint(ctx: agents.JobContext):
         await session.aclose()
     else:
         done = asyncio.Event()
+        if is_inbound and tool_ctx.participant_identity:
+            def on_inbound_participant_disconnected(participant: rtc.RemoteParticipant):
+                if participant.identity == tool_ctx.participant_identity:
+                    done.set()
+
+            ctx.room.on("participant_disconnected", on_inbound_participant_disconnected)
         ctx.room.on("disconnected", lambda: done.set())
         try:
             await asyncio.wait_for(done.wait(), timeout=3600)
         except asyncio.TimeoutError:
             pass
+        await session.aclose()
+        if is_inbound and not tool_ctx.call_logged:
+            duration = int(time.time() - tool_ctx._call_start_time)
+            try:
+                await log_call(
+                    tool_ctx.phone_number or "unknown",
+                    tool_ctx.lead_name,
+                    tool_ctx.marked_outcome or "completed",
+                    tool_ctx.marked_reason or "caller disconnected",
+                    duration,
+                    tool_ctx.recording_url,
+                    recording_object_key=tool_ctx.recording_object_key,
+                    recording_size_bytes=tool_ctx.recording_size_bytes,
+                    call_type="inbound",
+                    room_name=tool_ctx.room_name or ctx.room.name,
+                    livekit_call_id=tool_ctx.livekit_call_id,
+                    sip_trunk_id=tool_ctx.sip_trunk_id,
+                    sip_dispatch_rule_id=tool_ctx.sip_dispatch_rule_id,
+                    trunk_phone_number=tool_ctx.trunk_phone_number,
+                    transferred_to=tool_ctx.transferred_to,
+                    transfer_reason=tool_ctx.transfer_reason,
+                )
+            except Exception as exc:
+                await _log("warning", f"Inbound fallback log failed: {exc}")
 
 
 if __name__ == "__main__":
     init_db()
     load_db_settings_to_env()
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name="outbound-caller"))
+    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name=os.getenv("AGENT_NAME", "outbound-caller")))

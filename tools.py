@@ -9,8 +9,9 @@ from livekit.agents import llm
 
 from db import (
     add_contact_memory, check_slot, compress_contact_memory, get_appointments_by_phone,
-    get_calls_by_phone, get_contact_memory, get_next_available, insert_appointment,
-    log_call, log_error,
+    get_calls_by_phone, get_contact_memory, get_crm_contact_by_phone, get_next_available,
+    insert_appointment, log_call, log_error, update_crm_contact_followup,
+    update_crm_contact_notes,
 )
 
 logger = logging.getLogger("appointment-tools")
@@ -26,10 +27,36 @@ async def _log(msg: str, detail: str = "", level: str = "info") -> None:
 class AppointmentTools(llm.ToolContext):
     """All function tools available to the appointment-booking agent."""
 
-    def __init__(self, ctx: agents.JobContext, phone_number: Optional[str] = None, lead_name: Optional[str] = None):
+    def __init__(
+        self,
+        ctx: agents.JobContext,
+        phone_number: Optional[str] = None,
+        lead_name: Optional[str] = None,
+        call_type: str = "outbound",
+        include_inbound_tools: bool = False,
+        room_name: Optional[str] = None,
+        livekit_call_id: Optional[str] = None,
+        sip_trunk_id: Optional[str] = None,
+        sip_dispatch_rule_id: Optional[str] = None,
+        trunk_phone_number: Optional[str] = None,
+        participant_identity: Optional[str] = None,
+    ):
         self.ctx = ctx
         self.phone_number = phone_number
         self.lead_name = lead_name
+        self.call_type = call_type or "outbound"
+        self.include_inbound_tools = include_inbound_tools
+        self.room_name = room_name
+        self.livekit_call_id = livekit_call_id
+        self.sip_trunk_id = sip_trunk_id
+        self.sip_dispatch_rule_id = sip_dispatch_rule_id
+        self.trunk_phone_number = trunk_phone_number
+        self.participant_identity = participant_identity
+        self.transferred_to: Optional[str] = None
+        self.transfer_reason: Optional[str] = None
+        self.marked_outcome: Optional[str] = None
+        self.marked_reason: Optional[str] = None
+        self.call_logged = False
         self._call_start_time = time.time()
         self._sip_domain = os.getenv("VOBIZ_SIP_DOMAIN", "")
         self.recording_url: Optional[str] = None
@@ -44,10 +71,17 @@ class AppointmentTools(llm.ToolContext):
             self.transfer_to_human, self.send_sms_confirmation, self.lookup_contact,
             self.remember_details, self.book_calcom, self.cancel_calcom,
         ]
+        if self.include_inbound_tools:
+            all_methods.extend([self.update_crm_notes, self.request_callback, self.mark_call_outcome])
         if not enabled:
             return all_methods
         name_map = {m.__name__: m for m in all_methods}
-        return [name_map[n] for n in enabled if n in name_map]
+        selected = [name_map[n] for n in enabled if n in name_map]
+        if self.include_inbound_tools:
+            for method in (self.update_crm_notes, self.request_callback, self.mark_call_outcome):
+                if method not in selected:
+                    selected.append(method)
+        return selected
 
     @llm.function_tool
     async def check_availability(self, date: str, time: str) -> str:
@@ -73,17 +107,28 @@ class AppointmentTools(llm.ToolContext):
     async def end_call(self, outcome: str, reason: str = "") -> str:
         """End the call and log the outcome."""
         duration = int(time.time() - self._call_start_time)
+        final_outcome = outcome or self.marked_outcome or "completed"
+        final_reason = reason or self.marked_reason or ""
         try:
             await log_call(
                 self.phone_number or "unknown",
                 self.lead_name,
-                outcome,
-                reason,
+                final_outcome,
+                final_reason,
                 duration,
                 self.recording_url,
                 recording_object_key=self.recording_object_key,
                 recording_size_bytes=self.recording_size_bytes,
+                call_type=self.call_type,
+                room_name=self.room_name or self.ctx.room.name,
+                livekit_call_id=self.livekit_call_id,
+                sip_trunk_id=self.sip_trunk_id,
+                sip_dispatch_rule_id=self.sip_dispatch_rule_id,
+                trunk_phone_number=self.trunk_phone_number,
+                transferred_to=self.transferred_to,
+                transfer_reason=self.transfer_reason,
             )
+            self.call_logged = True
         except Exception as exc:
             logger.error("Failed to log call: %s", exc)
         # Give Gemini ~1.5s to finish speaking the goodbye line before we tear down.
@@ -117,7 +162,7 @@ class AppointmentTools(llm.ToolContext):
             destination = f"sip:{clean}@{self._sip_domain}" if self._sip_domain else f"tel:{clean}"
         elif not destination.startswith("sip:"):
             destination = f"sip:{destination}"
-        participant_identity = f"sip_{self.phone_number}" if self.phone_number else None
+        participant_identity = self.participant_identity or (f"sip_{self.phone_number}" if self.phone_number else None)
         if not participant_identity:
             for p in self.ctx.room.remote_participants.values():
                 participant_identity = p.identity
@@ -133,6 +178,10 @@ class AppointmentTools(llm.ToolContext):
                     play_dialtone=False,
                 )
             )
+            self.transferred_to = destination
+            self.transfer_reason = reason
+            self.marked_outcome = "transferred"
+            self.marked_reason = reason
             return "Transferring you to a human agent now. Please hold."
         except Exception:
             return "Transfer failed. Please call us back directly."
@@ -180,6 +229,45 @@ class AppointmentTools(llm.ToolContext):
             return "\n".join(lines)
         except Exception:
             return "Unable to retrieve contact history."
+
+    @llm.function_tool
+    async def update_crm_notes(self, note: str) -> str:
+        """Save or append an inbound caller note in CRM."""
+        if not self.phone_number:
+            return "Cannot update CRM notes without a caller phone number."
+        try:
+            contact = await get_crm_contact_by_phone(self.phone_number)
+            existing = (contact or {}).get("crm_notes") or ""
+            stamp = time.strftime("%Y-%m-%d %H:%M")
+            updated = f"{existing}\n[{stamp}] {note}" if existing else f"[{stamp}] {note}"
+            await update_crm_contact_notes(self.phone_number, updated)
+            return "CRM note saved."
+        except Exception:
+            return "Unable to save CRM note right now."
+
+    @llm.function_tool
+    async def request_callback(self, date_time: str, reason: str = "") -> str:
+        """Save a callback request for the inbound caller."""
+        if not self.phone_number:
+            return "Cannot save callback without a caller phone number."
+        try:
+            await update_crm_contact_followup(self.phone_number, date_time)
+            detail = f"Requested callback at {date_time}"
+            if reason:
+                detail += f": {reason}"
+            await self.remember_details(detail)
+            self.marked_outcome = "callback_requested"
+            self.marked_reason = reason or date_time
+            return "Callback request saved."
+        except Exception:
+            return "Unable to save callback request right now."
+
+    @llm.function_tool
+    async def mark_call_outcome(self, outcome: str, reason: str = "") -> str:
+        """Mark the intended inbound call outcome before ending the call."""
+        self.marked_outcome = outcome
+        self.marked_reason = reason
+        return "Call outcome noted."
 
     @llm.function_tool
     async def remember_details(self, insight: str) -> str:
