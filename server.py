@@ -1,13 +1,17 @@
 """FastAPI backend for the OutboundAI dashboard."""
 
 import asyncio
+import base64
 import csv
+import hashlib
+import hmac
 from io import BytesIO, StringIO
 import json
 import logging
 import os
 import random
 import ssl
+import time
 import uuid
 import certifi
 import aiohttp
@@ -64,6 +68,83 @@ except ImportError:
     logger.warning("APScheduler not installed — campaign scheduling disabled")
 
 app = FastAPI(title="OutboundAI Dashboard", version="1.0.0")
+
+SESSION_COOKIE_NAME = "aicalling_admin_session"
+SESSION_TTL_SECONDS = 12 * 60 * 60
+PUBLIC_API_ROUTES = {
+    ("GET", "/api/health"),
+    ("POST", "/api/auth/login"),
+    ("GET", "/api/auth/me"),
+    ("POST", "/api/auth/logout"),
+}
+
+
+def _admin_username() -> str:
+    return os.getenv("ADMIN_USERNAME", "")
+
+
+def _admin_password() -> str:
+    return os.getenv("ADMIN_PASSWORD", "")
+
+
+def _session_secret() -> str:
+    return os.getenv("SESSION_SECRET", "")
+
+
+def _admin_config_error() -> Optional[str]:
+    if not (_admin_username() and _admin_password()):
+        return "Admin login is not configured. Set ADMIN_USERNAME and ADMIN_PASSWORD."
+    if not _session_secret():
+        return "Admin login is not configured. Set SESSION_SECRET."
+    return None
+
+
+def _b64encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64decode(data: str) -> bytes:
+    padded = data + "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def _sign_session(payload: str) -> str:
+    return hmac.new(_session_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _make_session_token(username: str) -> str:
+    payload = _b64encode(json.dumps({"u": username, "exp": int(time.time()) + SESSION_TTL_SECONDS}, separators=(",", ":")).encode("utf-8"))
+    return f"{payload}.{_sign_session(payload)}"
+
+
+def _read_session(request: Request) -> Optional[str]:
+    token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    if not token or "." not in token or not _session_secret():
+        return None
+    payload, signature = token.rsplit(".", 1)
+    if not hmac.compare_digest(signature, _sign_session(payload)):
+        return None
+    try:
+        data = json.loads(_b64decode(payload).decode("utf-8"))
+    except Exception:
+        return None
+    if int(data.get("exp", 0)) < int(time.time()):
+        return None
+    username = data.get("u")
+    return username if username and hmac.compare_digest(username, _admin_username()) else None
+
+
+def _request_is_https(request: Request) -> bool:
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return request.url.scheme == "https" or proto == "https"
+
+
+@app.middleware("http")
+async def _admin_auth_middleware(request: Request, call_next):
+    if request.url.path.startswith("/api/") and (request.method, request.url.path) not in PUBLIC_API_ROUTES:
+        if not _read_session(request):
+            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    return await call_next(request)
 
 
 @app.exception_handler(ConfigError)
@@ -127,6 +208,11 @@ class PromptRequest(BaseModel):
 
 class SettingsRequest(BaseModel):
     settings: dict
+
+
+class AuthRequest(BaseModel):
+    username: str
+    password: str
 
 
 class NotesRequest(BaseModel):
@@ -205,6 +291,46 @@ class CrmCallSelectedRequest(BaseModel):
 
 class RecordingCleanupRequest(BaseModel):
     confirm: Optional[str] = None
+
+
+@app.post("/api/auth/login")
+async def api_auth_login(req: AuthRequest, request: Request):
+    config_error = _admin_config_error()
+    if config_error:
+        return JSONResponse(status_code=503, content={"error": config_error})
+    if not (hmac.compare_digest(req.username, _admin_username()) and hmac.compare_digest(req.password, _admin_password())):
+        return JSONResponse(status_code=401, content={"error": "Invalid username or password"})
+    response = JSONResponse(content={"success": True})
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        _make_session_token(req.username),
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=_request_is_https(request),
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
+@app.get("/api/auth/me")
+async def api_auth_me(request: Request):
+    config_error = _admin_config_error()
+    username = _read_session(request)
+    payload = {"authenticated": bool(username), "username": username if username else None}
+    if config_error:
+        payload["configured"] = False
+        payload["error"] = config_error
+    else:
+        payload["configured"] = True
+    return payload
+
+
+@app.post("/api/auth/logout")
+async def api_auth_logout(request: Request):
+    response = JSONResponse(content={"success": True})
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/", samesite="lax", secure=_request_is_https(request))
+    return response
 
 
 @app.get("/api/health")
