@@ -42,12 +42,12 @@ trap 'kill -TERM "$SERVER_PID" 2>/dev/null || true; kill -TERM "$OUTBOUND_AGENT_
 
 sleep 2
 
-echo "🤖 Starting LiveKit agent worker..."
-AGENT_NAME=outbound-caller python agent.py start &
+echo "🤖 Starting LiveKit outbound agent worker on port ${OUTBOUND_AGENT_PORT:-8081}..."
+AGENT_NAME=outbound-caller LIVEKIT_AGENT_PORT="${OUTBOUND_AGENT_PORT:-8081}" python agent.py start &
 OUTBOUND_AGENT_PID=$!
 
-echo "Starting inbound LiveKit agent worker..."
-AGENT_NAME=inbound-agent python agent.py start &
+echo "Starting inbound LiveKit agent worker on port ${INBOUND_AGENT_PORT:-8082}..."
+AGENT_NAME=inbound-agent LIVEKIT_AGENT_PORT="${INBOUND_AGENT_PORT:-8082}" python agent.py start &
 INBOUND_AGENT_PID=$!
 
 # Portable watchdog: exit as soon as either child dies so the

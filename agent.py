@@ -480,4 +480,14 @@ async def entrypoint(ctx: agents.JobContext):
 if __name__ == "__main__":
     init_db()
     load_db_settings_to_env()
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name=os.getenv("AGENT_NAME", "outbound-caller")))
+    _agent_port_str = os.getenv("LIVEKIT_AGENT_PORT") or os.getenv("AGENT_PORT")
+    _worker_kwargs = {
+        "entrypoint_fnc": entrypoint,
+        "agent_name": os.getenv("AGENT_NAME", "outbound-caller"),
+    }
+    if _agent_port_str:
+        try:
+            _worker_kwargs["port"] = int(_agent_port_str)
+        except ValueError:
+            logger.warning("Invalid LIVEKIT_AGENT_PORT/AGENT_PORT value: %s", _agent_port_str)
+    agents.cli.run_app(agents.WorkerOptions(**_worker_kwargs))
