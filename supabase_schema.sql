@@ -49,6 +49,18 @@ ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_object_key text;
 ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_size_bytes bigint DEFAULT 0;
 ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_deleted boolean DEFAULT false;
 ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_deleted_at timestamptz;
+ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS call_type text DEFAULT 'outbound';
+ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS room_name text;
+ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS livekit_call_id text;
+ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS sip_trunk_id text;
+ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS sip_dispatch_rule_id text;
+ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS trunk_phone_number text;
+ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS transferred_to text;
+ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS transfer_reason text;
+
+CREATE INDEX IF NOT EXISTS idx_call_logs_call_type ON call_logs(call_type);
+CREATE INDEX IF NOT EXISTS idx_call_logs_phone_type ON call_logs(phone_number, call_type);
+CREATE INDEX IF NOT EXISTS idx_call_logs_timestamp_type ON call_logs(timestamp, call_type);
 
 CREATE TABLE IF NOT EXISTS campaigns (
     id TEXT PRIMARY KEY,

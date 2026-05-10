@@ -353,9 +353,36 @@ async def get_appointments_by_phone(phone: str) -> list:
     return result.data or []
 
 
-async def log_call(phone_number: str, lead_name: Optional[str], outcome: str, reason: str, duration_seconds: int, recording_url: Optional[str] = None, notes: Optional[str] = None, recording_object_key: Optional[str] = None, recording_size_bytes: int = 0) -> None:
+async def log_call(
+    phone_number: str,
+    lead_name: Optional[str],
+    outcome: str,
+    reason: str,
+    duration_seconds: int,
+    recording_url: Optional[str] = None,
+    notes: Optional[str] = None,
+    recording_object_key: Optional[str] = None,
+    recording_size_bytes: int = 0,
+    call_type: str = "outbound",
+    room_name: Optional[str] = None,
+    livekit_call_id: Optional[str] = None,
+    sip_trunk_id: Optional[str] = None,
+    sip_dispatch_rule_id: Optional[str] = None,
+    trunk_phone_number: Optional[str] = None,
+    transferred_to: Optional[str] = None,
+    transfer_reason: Optional[str] = None,
+) -> None:
     db = await _adb()
-    row = {"id": str(uuid.uuid4()), "phone_number": phone_number, "lead_name": lead_name, "outcome": outcome, "reason": reason, "duration_seconds": duration_seconds, "timestamp": datetime.now().isoformat()}
+    row = {
+        "id": str(uuid.uuid4()),
+        "phone_number": phone_number,
+        "lead_name": lead_name,
+        "outcome": outcome,
+        "reason": reason,
+        "duration_seconds": duration_seconds,
+        "timestamp": datetime.now().isoformat(),
+        "call_type": call_type or "outbound",
+    }
     if recording_url:
         row["recording_url"] = recording_url
         row["recording_deleted"] = False
@@ -364,10 +391,27 @@ async def log_call(phone_number: str, lead_name: Optional[str], outcome: str, re
         row["recording_object_key"] = recording_object_key
     if notes:
         row["notes"] = notes
+    optional_fields = {
+        "room_name": room_name,
+        "livekit_call_id": livekit_call_id,
+        "sip_trunk_id": sip_trunk_id,
+        "sip_dispatch_rule_id": sip_dispatch_rule_id,
+        "trunk_phone_number": trunk_phone_number,
+        "transferred_to": transferred_to,
+        "transfer_reason": transfer_reason,
+    }
+    for key, value in optional_fields.items():
+        if value:
+            row[key] = value
     try:
         await db.table("call_logs").insert(row).execute()
     except Exception:
-        for key in ("recording_object_key", "recording_size_bytes", "recording_deleted"):
+        for key in (
+            "recording_object_key", "recording_size_bytes", "recording_deleted",
+            "call_type", "room_name", "livekit_call_id", "sip_trunk_id",
+            "sip_dispatch_rule_id", "trunk_phone_number", "transferred_to",
+            "transfer_reason",
+        ):
             row.pop(key, None)
         await db.table("call_logs").insert(row).execute()
     await upsert_crm_contact_from_call(row)
@@ -378,6 +422,36 @@ async def get_all_calls(page: int = 1, limit: int = 20) -> list:
     offset = (page - 1) * limit
     result = await db.table("call_logs").select("*").order("timestamp", desc=True).range(offset, offset + limit - 1).execute()
     return result.data or []
+
+
+async def get_calls_by_type(call_type: str, page: int = 1, limit: int = 20) -> list:
+    db = await _adb()
+    offset = (page - 1) * limit
+    clean_type = (call_type or "outbound").strip().lower()
+    result = await db.table("call_logs").select("*").eq("call_type", clean_type).order("timestamp", desc=True).range(offset, offset + limit - 1).execute()
+    return result.data or []
+
+
+async def get_inbound_calls(page: int = 1, limit: int = 20) -> list:
+    return await get_calls_by_type("inbound", page=page, limit=limit)
+
+
+async def get_outbound_calls(page: int = 1, limit: int = 20) -> list:
+    return await get_calls_by_type("outbound", page=page, limit=limit)
+
+
+async def get_call_type_stats() -> dict:
+    db = await _adb()
+    rows = (await db.table("call_logs").select("outcome, call_type").execute()).data or []
+    inbound = [r for r in rows if (r.get("call_type") or "outbound") == "inbound"]
+    outbound = [r for r in rows if (r.get("call_type") or "outbound") == "outbound"]
+    return {
+        "total_calls": len(rows),
+        "inbound_calls": len(inbound),
+        "outbound_calls": len(outbound),
+        "booked_inbound": sum(1 for r in inbound if r.get("outcome") == "booked"),
+        "booked_outbound": sum(1 for r in outbound if r.get("outcome") == "booked"),
+    }
 
 
 async def get_call_logs_for_export(filters: Optional[dict] = None) -> list:

@@ -476,6 +476,7 @@ async def api_update_notes(call_id: str, req: NotesRequest):
 
 EXPORT_COLUMNS = [
     ("Call Date/Time", "timestamp"),
+    ("Call Type", "call_type"),
     ("Lead Name", "lead_name"),
     ("Phone Number", "phone_number"),
     ("Business Name", "business_name"),
@@ -500,6 +501,8 @@ def _export_filters(date_from: Optional[str], date_to: Optional[str], outcome: O
 
 
 def _export_value(row: dict, key: str) -> str:
+    if key == "call_type":
+        return str(row.get(key) or "outbound")
     value = row.get(key)
     return "" if value is None else str(value)
 
