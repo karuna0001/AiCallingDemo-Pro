@@ -43,7 +43,8 @@ from db import (
     get_all_campaigns, get_all_settings, get_calls_by_phone, get_campaign,
     get_call_logs_for_export, get_contacts, get_crm_contact_detail, get_crm_contacts,
     get_crm_summary, get_lead_statuses, get_crm_contact_by_phone,
-    get_logs, get_recording_storage_stats, get_recordings_for_cleanup,
+    get_inbound_call_stats, get_inbound_calls, get_logs,
+    get_recording_storage_stats, get_recordings_for_cleanup,
     get_setting, get_stats, init_db, log_error, mark_recording_deleted,
     normalize_phone, upsert_crm_lead,
     save_settings, set_default_agent_profile, set_setting,
@@ -208,6 +209,20 @@ class PromptRequest(BaseModel):
 
 class SettingsRequest(BaseModel):
     settings: dict
+
+
+class InboundSettingsRequest(BaseModel):
+    INBOUND_ENABLED: Optional[str] = None
+    INBOUND_PHONE_NUMBER: Optional[str] = None
+    INBOUND_TRUNK_ID: Optional[str] = None
+    INBOUND_DISPATCH_RULE_ID: Optional[str] = None
+    INBOUND_AGENT_PROFILE_ID: Optional[str] = None
+    INBOUND_BUSINESS_NAME: Optional[str] = None
+    INBOUND_SERVICE_TYPE: Optional[str] = None
+    INBOUND_GREETING_MESSAGE: Optional[str] = None
+    INBOUND_FAQ_TEXT: Optional[str] = None
+    INBOUND_AFTER_HOURS_MODE: Optional[str] = None
+    DEFAULT_TRANSFER_NUMBER: Optional[str] = None
 
 
 class AuthRequest(BaseModel):
@@ -596,6 +611,75 @@ async def api_export_calls_xlsx(
 @app.get("/api/stats")
 async def api_get_stats():
     return await get_stats()
+
+
+INBOUND_SETTINGS_KEYS = [
+    "INBOUND_ENABLED",
+    "INBOUND_PHONE_NUMBER",
+    "INBOUND_TRUNK_ID",
+    "INBOUND_DISPATCH_RULE_ID",
+    "INBOUND_AGENT_PROFILE_ID",
+    "INBOUND_BUSINESS_NAME",
+    "INBOUND_SERVICE_TYPE",
+    "INBOUND_GREETING_MESSAGE",
+    "INBOUND_FAQ_TEXT",
+    "INBOUND_AFTER_HOURS_MODE",
+    "DEFAULT_TRANSFER_NUMBER",
+]
+
+
+def _enabled(value: str) -> bool:
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+@app.get("/api/inbound/health")
+async def api_inbound_health():
+    inbound_enabled = await get_setting("INBOUND_ENABLED", "false")
+    inbound_trunk_id = await get_setting("INBOUND_TRUNK_ID", "")
+    inbound_dispatch_rule_id = await get_setting("INBOUND_DISPATCH_RULE_ID", "")
+    inbound_phone_number = await get_setting("INBOUND_PHONE_NUMBER", "")
+    inbound_agent_profile_id = await get_setting("INBOUND_AGENT_PROFILE_ID", "")
+    inbound_business_name = await get_setting("INBOUND_BUSINESS_NAME", "")
+    default_transfer_number = await get_setting("DEFAULT_TRANSFER_NUMBER", "")
+    return {
+        "inbound_enabled": _enabled(inbound_enabled),
+        "inbound_trunk_configured": bool(inbound_trunk_id),
+        "inbound_dispatch_rule_configured": bool(inbound_dispatch_rule_id),
+        "inbound_phone_number_configured": bool(inbound_phone_number),
+        "inbound_agent_profile_configured": bool(inbound_agent_profile_id),
+        "inbound_business_name_configured": bool(inbound_business_name),
+        "default_transfer_number_configured": bool(default_transfer_number),
+    }
+
+
+@app.get("/api/inbound/calls")
+async def api_inbound_calls(page: int = 1, limit: int = 20):
+    return await get_inbound_calls(page=page, limit=limit)
+
+
+@app.get("/api/inbound/stats")
+async def api_inbound_stats():
+    return await get_inbound_call_stats()
+
+
+@app.get("/api/inbound/settings")
+async def api_get_inbound_settings():
+    return {key: await get_setting(key, "") for key in INBOUND_SETTINGS_KEYS}
+
+
+@app.post("/api/inbound/settings")
+async def api_save_inbound_settings(req: InboundSettingsRequest):
+    incoming = req.dict()
+    filtered = {
+        key: value
+        for key, value in incoming.items()
+        if key in INBOUND_SETTINGS_KEYS and value is not None and value != ""
+    }
+    await save_settings(filtered)
+    for key, value in filtered.items():
+        if not os.environ.get(key):
+            os.environ[key] = str(value)
+    return {"status": "saved", "count": len(filtered)}
 
 
 async def _recording_retention_days() -> int:

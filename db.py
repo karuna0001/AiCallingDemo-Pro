@@ -454,6 +454,24 @@ async def get_call_type_stats() -> dict:
     }
 
 
+async def get_inbound_call_stats() -> dict:
+    db = await _adb()
+    rows = (await db.table("call_logs").select("outcome, duration_seconds, transferred_to").eq("call_type", "inbound").execute()).data or []
+    durations = [
+        int(r.get("duration_seconds") or 0)
+        for r in rows
+        if r.get("duration_seconds") is not None
+    ]
+    return {
+        "total_inbound_calls": len(rows),
+        "booked_inbound": sum(1 for r in rows if r.get("outcome") == "booked"),
+        "callback_requested": sum(1 for r in rows if r.get("outcome") == "callback_requested"),
+        "transferred": sum(1 for r in rows if r.get("outcome") == "transferred" or r.get("transferred_to")),
+        "faq_only": sum(1 for r in rows if r.get("outcome") == "faq_only"),
+        "average_duration_seconds": round(sum(durations) / len(durations), 1) if durations else 0,
+    }
+
+
 async def get_call_logs_for_export(filters: Optional[dict] = None) -> list:
     db = await _adb()
     filters = filters or {}
