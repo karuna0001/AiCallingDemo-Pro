@@ -233,12 +233,45 @@ def _crm_context_text(detail: dict) -> str:
     return "\n".join(lines)
 
 
+def _empty_crm_detail() -> dict:
+    return {"contact": None, "calls": [], "appointments": []}
+
+
+def _fallback_inbound_contact(phone: str) -> dict:
+    return {
+        "contact": {
+            "phone_number": phone,
+            "lead_name": "Unknown Caller",
+            "crm_status": "New",
+            "source": "inbound_call",
+        },
+        "calls": [],
+        "appointments": [],
+    }
+
+
+async def _safe_get_crm_contact_detail(phone: str) -> dict:
+    try:
+        detail = await get_crm_contact_detail(phone)
+    except Exception as exc:
+        await _log("warning", "CRM lookup raised; using empty detail", str(exc))
+        return _empty_crm_detail()
+    if not isinstance(detail, dict):
+        return _empty_crm_detail()
+    return detail
+
+
 async def _ensure_inbound_crm_contact(phone: str) -> dict:
     if not phone or phone == "unknown":
-        return {"contact": None, "calls": [], "appointments": []}
-    detail = await get_crm_contact_detail(phone)
+        await _log("info", "Inbound CRM lookup skipped (no phone); using fallback")
+        return _fallback_inbound_contact(phone or "unknown")
+
+    detail = await _safe_get_crm_contact_detail(phone)
     if detail.get("contact"):
+        await _log("info", f"Inbound CRM contact found for {phone}")
         return detail
+
+    await _log("info", f"Inbound CRM contact not found for {phone}; creating new lead")
     try:
         await upsert_crm_lead({
             "phone_number": phone,
@@ -247,8 +280,14 @@ async def _ensure_inbound_crm_contact(phone: str) -> dict:
             "crm_status": "New",
         }, import_source="inbound_call")
     except Exception as exc:
-        await _log("warning", "Could not create inbound CRM contact", str(exc))
-    return await get_crm_contact_detail(phone)
+        await _log("warning", "Could not create inbound CRM contact; continuing with fallback", str(exc))
+        return _fallback_inbound_contact(phone)
+
+    detail = await _safe_get_crm_contact_detail(phone)
+    if not detail.get("contact"):
+        await _log("warning", f"CRM contact still missing after upsert for {phone}; using fallback")
+        return _fallback_inbound_contact(phone)
+    return detail
 
 
 async def _start_recording(ctx: agents.JobContext, tool_ctx: AppointmentTools) -> None:
@@ -348,6 +387,7 @@ async def entrypoint(ctx: agents.JobContext):
         caller_phone = _safe_normalize_phone(
             attrs.get("sip.phoneNumber") or attrs.get("sip.phone_number") or metadata.get("phone_number") or ""
         )
+        await _log("info", f"Inbound caller phone detected: {caller_phone}")
         trunk_phone_number = attrs.get("sip.trunkPhoneNumber") or attrs.get("sip.trunk_phone_number")
         sip_trunk_id = attrs.get("sip.trunkID") or attrs.get("sip.trunk_id")
         sip_dispatch_rule_id = attrs.get("sip.ruleID") or attrs.get("sip.rule_id")
@@ -405,6 +445,8 @@ async def entrypoint(ctx: agents.JobContext):
             return
         await _log("info", f"Call ANSWERED — {phone_number} picked up, starting AI session now")
 
+    if is_inbound:
+        await _log("info", "Starting inbound AI session")
     session = await _run_session(ctx, system_prompt, tool_ctx, enabled_tools)
 
     if phone_number or is_inbound:

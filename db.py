@@ -1,4 +1,5 @@
-﻿import os
+﻿import logging
+import os
 import re
 import uuid
 from datetime import datetime, timedelta
@@ -791,22 +792,68 @@ async def update_crm_contact_notes(phone: str, crm_notes: str) -> bool:
 
 
 async def get_crm_contact_by_phone(phone: str) -> Optional[dict]:
-    db = await _adb()
-    clean = normalize_phone(phone)
-    result = await db.table("crm_contacts").select("*").eq("phone_number", clean).maybe_single().execute()
-    if result.data:
-        return _crm_fallback_contact(result.data)
-    for row in await get_contacts():
-        if row.get("phone_number") == clean:
-            return _crm_fallback_contact(row)
+    if not phone:
+        return None
+    try:
+        clean = normalize_phone(phone)
+    except Exception as exc:
+        logging.warning("get_crm_contact_by_phone: failed to normalize phone %r: %s", phone, exc)
+        return None
+    if not clean:
+        return None
+    try:
+        db = await _adb()
+        result = await db.table("crm_contacts").select("*").eq("phone_number", clean).maybe_single().execute()
+        if result is not None and getattr(result, "data", None):
+            return _crm_fallback_contact(result.data)
+    except Exception as exc:
+        logging.warning("get_crm_contact_by_phone: Supabase lookup failed for %s: %s", clean, exc)
+    try:
+        for row in await get_contacts():
+            if row.get("phone_number") == clean:
+                return _crm_fallback_contact(row)
+    except Exception as exc:
+        logging.warning("get_crm_contact_by_phone: contacts fallback scan failed for %s: %s", clean, exc)
     return None
 
 
 async def get_crm_contact_detail(phone: str) -> dict:
-    clean = normalize_phone(phone)
-    contact = await get_crm_contact_by_phone(clean)
-    calls = await get_calls_by_phone(clean)
-    appointments = await get_appointments_by_phone(clean)
+    empty = {
+        "contact": None,
+        "calls": [],
+        "appointments": [],
+        "latest_recording_url": "",
+        "summary": {
+            "total_calls": 0,
+            "last_outcome": None,
+            "last_call_at": None,
+            "has_active_recording": False,
+        },
+    }
+    if not phone:
+        return empty
+    try:
+        clean = normalize_phone(phone)
+    except Exception as exc:
+        logging.warning("get_crm_contact_detail: normalize_phone failed for %r: %s", phone, exc)
+        return empty
+    if not clean:
+        return empty
+    try:
+        contact = await get_crm_contact_by_phone(clean)
+    except Exception as exc:
+        logging.warning("get_crm_contact_detail: contact lookup failed for %s: %s", clean, exc)
+        contact = None
+    try:
+        calls = await get_calls_by_phone(clean)
+    except Exception as exc:
+        logging.warning("get_crm_contact_detail: calls lookup failed for %s: %s", clean, exc)
+        calls = []
+    try:
+        appointments = await get_appointments_by_phone(clean)
+    except Exception as exc:
+        logging.warning("get_crm_contact_detail: appointments lookup failed for %s: %s", clean, exc)
+        appointments = []
     latest_recording_url = ""
     for call in calls:
         if call.get("recording_url") and not call.get("recording_deleted"):
