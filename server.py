@@ -225,6 +225,18 @@ class InboundSettingsRequest(BaseModel):
     DEFAULT_TRANSFER_NUMBER: Optional[str] = None
 
 
+class InboundTrunkSetupRequest(BaseModel):
+    inbound_phone_number: str = ""
+    allowed_addresses: list = []
+    allowed_numbers: list = []
+
+
+class InboundDispatchRuleSetupRequest(BaseModel):
+    inbound_trunk_id: str = ""
+    room_prefix: str = "inbound"
+    agent_name: str = "inbound-agent"
+
+
 class AuthRequest(BaseModel):
     username: str
     password: str
@@ -680,6 +692,155 @@ async def api_save_inbound_settings(req: InboundSettingsRequest):
         if not os.environ.get(key):
             os.environ[key] = str(value)
     return {"status": "saved", "count": len(filtered)}
+
+
+@app.get("/api/setup/inbound-status")
+async def api_setup_inbound_status():
+    inbound_trunk_id = await get_setting("INBOUND_TRUNK_ID", "")
+    inbound_dispatch_rule_id = await get_setting("INBOUND_DISPATCH_RULE_ID", "")
+    inbound_phone_number = await get_setting("INBOUND_PHONE_NUMBER", "")
+    return {
+        "inbound_trunk_id": inbound_trunk_id,
+        "inbound_dispatch_rule_id": inbound_dispatch_rule_id,
+        "inbound_phone_number": inbound_phone_number,
+        "inbound_trunk_configured": bool(inbound_trunk_id),
+        "inbound_dispatch_rule_configured": bool(inbound_dispatch_rule_id),
+    }
+
+
+def _clean_list(values: list) -> list:
+    return [str(v).strip() for v in (values or []) if str(v).strip()]
+
+
+def _livekit_error(exc: Exception) -> str:
+    return getattr(exc, "message", None) or str(exc) or exc.__class__.__name__
+
+
+@app.post("/api/setup/inbound-trunk")
+async def api_setup_inbound_trunk(req: InboundTrunkSetupRequest):
+    url = await eff("LIVEKIT_URL")
+    key = await eff("LIVEKIT_API_KEY")
+    secret = await eff("LIVEKIT_API_SECRET")
+    if not all([url, key, secret]):
+        return JSONResponse(status_code=400, content={"success": False, "error": "LiveKit credentials not configured."})
+    phone = (req.inbound_phone_number or "").strip()
+    if not phone:
+        phone = (await get_setting("INBOUND_PHONE_NUMBER", "")).strip()
+    if not phone:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Inbound phone number is required."})
+    lk = None
+    session = None
+    try:
+        from livekit import api as lk_api
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ctx))
+        lk = lk_api.LiveKitAPI(url=url, api_key=key, api_secret=secret, session=session)
+        trunk_data = {
+            "name": f"Inbound Trunk {phone}",
+            "numbers": [phone],
+        }
+        allowed_addresses = _clean_list(req.allowed_addresses)
+        allowed_numbers = _clean_list(req.allowed_numbers)
+        if allowed_addresses:
+            trunk_data["allowed_addresses"] = allowed_addresses
+        if allowed_numbers:
+            trunk_data["allowed_numbers"] = allowed_numbers
+        trunk = await lk.sip.create_sip_inbound_trunk(
+            lk_api.CreateSIPInboundTrunkRequest(
+                trunk=lk_api.SIPInboundTrunkInfo(**trunk_data)
+            )
+        )
+        trunk_id = getattr(trunk, "sip_trunk_id", "")
+        await set_setting("INBOUND_TRUNK_ID", trunk_id)
+        await set_setting("INBOUND_PHONE_NUMBER", phone)
+        if not os.environ.get("INBOUND_TRUNK_ID"):
+            os.environ["INBOUND_TRUNK_ID"] = trunk_id
+        if not os.environ.get("INBOUND_PHONE_NUMBER"):
+            os.environ["INBOUND_PHONE_NUMBER"] = phone
+        await lk.aclose()
+        await session.close()
+        return {"success": True, "inbound_trunk_id": trunk_id, "message": "Inbound trunk created"}
+    except Exception as exc:
+        try:
+            if lk:
+                await lk.aclose()
+            if session:
+                await session.close()
+        except Exception:
+            pass
+        return JSONResponse(status_code=500, content={"success": False, "error": _livekit_error(exc)})
+
+
+@app.post("/api/setup/inbound-dispatch-rule")
+async def api_setup_inbound_dispatch_rule(req: InboundDispatchRuleSetupRequest):
+    url = await eff("LIVEKIT_URL")
+    key = await eff("LIVEKIT_API_KEY")
+    secret = await eff("LIVEKIT_API_SECRET")
+    if not all([url, key, secret]):
+        return JSONResponse(status_code=400, content={"success": False, "error": "LiveKit credentials not configured."})
+    trunk_id = (req.inbound_trunk_id or "").strip()
+    if not trunk_id:
+        trunk_id = (await get_setting("INBOUND_TRUNK_ID", "")).strip()
+    if not trunk_id:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Inbound trunk ID is required."})
+    room_prefix = (req.room_prefix or "inbound").strip() or "inbound"
+    if not room_prefix.endswith("-"):
+        room_prefix = f"{room_prefix}-"
+    agent_name = (req.agent_name or "inbound-agent").strip() or "inbound-agent"
+    lk = None
+    session = None
+    try:
+        from livekit import api as lk_api
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ctx))
+        lk = lk_api.LiveKitAPI(url=url, api_key=key, api_secret=secret, session=session)
+        rule = lk_api.SIPDispatchRule(
+            dispatch_rule_individual=lk_api.SIPDispatchRuleIndividual(room_prefix=room_prefix)
+        )
+        rule_info = {
+            "rule": rule,
+            "name": f"Inbound Dispatch Rule {room_prefix}",
+            "trunk_ids": [trunk_id],
+        }
+        try:
+            rule_info["room_config"] = lk_api.RoomConfiguration(
+                agents=[
+                    lk_api.RoomAgentDispatch(
+                        agent_name=agent_name,
+                        metadata=json.dumps({"call_type": "inbound"}),
+                    )
+                ]
+            )
+        except (AttributeError, TypeError):
+            pass
+        try:
+            dispatch_rule_info = lk_api.SIPDispatchRuleInfo(**rule_info)
+        except TypeError:
+            rule_info.pop("room_config", None)
+            dispatch_rule_info = lk_api.SIPDispatchRuleInfo(**rule_info)
+        request = lk_api.CreateSIPDispatchRuleRequest(dispatch_rule=dispatch_rule_info)
+        create_rule = getattr(lk.sip, "create_dispatch_rule", None) or lk.sip.create_sip_dispatch_rule
+        dispatch_rule = await create_rule(request)
+        dispatch_rule_id = getattr(dispatch_rule, "sip_dispatch_rule_id", "")
+        await set_setting("INBOUND_DISPATCH_RULE_ID", dispatch_rule_id)
+        if not os.environ.get("INBOUND_DISPATCH_RULE_ID"):
+            os.environ["INBOUND_DISPATCH_RULE_ID"] = dispatch_rule_id
+        await lk.aclose()
+        await session.close()
+        return {"success": True, "inbound_dispatch_rule_id": dispatch_rule_id, "message": "Inbound dispatch rule created"}
+    except Exception as exc:
+        try:
+            if lk:
+                await lk.aclose()
+            if session:
+                await session.close()
+        except Exception:
+            pass
+        return JSONResponse(status_code=500, content={"success": False, "error": _livekit_error(exc)})
 
 
 async def _recording_retention_days() -> int:
