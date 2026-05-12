@@ -54,7 +54,13 @@ from db import (
     update_crm_contact_followup, update_crm_contact_full, update_crm_contact_notes,
     update_crm_contact_status,
 )
-from prompts import DEFAULT_SYSTEM_PROMPT
+from prompts import (
+    DEFAULT_SYSTEM_PROMPT,
+    PROMPT_TYPES,
+    get_default_prompt,
+    get_prompt_label,
+    build_prompt_for_type,
+)
 
 load_dotenv(".env", override=False)
 logging.basicConfig(level=logging.INFO)
@@ -194,6 +200,7 @@ class CallRequest(BaseModel):
     service_type: str = "our service"
     system_prompt: Optional[str] = None
     agent_profile_id: Optional[str] = None
+    call_type: Optional[str] = None
 
 
 class AgentProfileRequest(BaseModel):
@@ -207,6 +214,11 @@ class AgentProfileRequest(BaseModel):
 
 class PromptRequest(BaseModel):
     prompt: str
+
+
+class AiPromptRequest(BaseModel):
+    prompt: str
+    is_default: bool = False
 
 
 class SettingsRequest(BaseModel):
@@ -473,7 +485,16 @@ async def api_dispatch_call(req: CallRequest):
             effective_model = profile.get("model")
             effective_tools = profile.get("enabled_tools")
     if not effective_prompt:
+        # Try legacy global prompt first, then resolve by call_type
         effective_prompt = await get_setting("system_prompt", "") or None
+    if not effective_prompt:
+        call_type = (req.call_type or "welcome_call").strip()
+        effective_prompt = await resolve_ai_prompt(
+            call_type=call_type,
+            lead_name=req.lead_name,
+            business_name=req.business_name,
+            service_type=req.service_type,
+        )
 
     room_name = f"call-{phone.replace('+', '')}-{random.randint(1000, 9999)}"
     metadata = {"phone_number": phone, "lead_name": req.lead_name, "business_name": req.business_name, "service_type": req.service_type, "system_prompt": effective_prompt}
@@ -754,6 +775,124 @@ async def api_save_prompt(req: PromptRequest):
 async def api_reset_prompt():
     await set_setting("system_prompt", "")
     return {"status": "reset", "prompt": DEFAULT_SYSTEM_PROMPT}
+
+
+# ── AI Prompt Manager helpers ────────────────────────────────────────────────
+
+_AI_PROMPT_KEY = "AI_PROMPT_{}"
+_AI_PROMPT_DEFAULT_TYPE_KEY = "AI_PROMPT_DEFAULT_TYPE"
+_VALID_PROMPT_TYPES = {pt for pt, _, _ in PROMPT_TYPES}
+
+
+async def resolve_ai_prompt(
+    call_type: str = "welcome_call",
+    fallback: str = "welcome_call",
+    lead_name: str = "there",
+    business_name: str = "our company",
+    service_type: str = "our service",
+) -> str:
+    """
+    Resolve final prompt for a call.
+    Priority: saved AI_PROMPT_{type} → built-in default for type → fallback type.
+    Returns an interpolated prompt string ready to pass to Gemini.
+    """
+    resolved_type = call_type if call_type in _VALID_PROMPT_TYPES else fallback
+    saved = await get_setting(_AI_PROMPT_KEY.format(resolved_type), "")
+    return build_prompt_for_type(
+        prompt_type=resolved_type,
+        lead_name=lead_name,
+        business_name=business_name,
+        service_type=service_type,
+        saved_text=saved or None,
+    )
+
+
+def _crm_status_to_call_type(crm_status: str) -> str:
+    """Map a CRM lead status to the appropriate call type prompt."""
+    status = (crm_status or "").strip().lower()
+    if "callback" in status:
+        return "callback_call"
+    if "follow" in status:
+        return "followup_call"
+    if "appointment" in status:
+        return "appointment_confirmation"
+    if "re-enquiry" in status or "re_enquiry" in status or "re enquiry" in status:
+        return "re_enquiry"
+    if "payment" in status:
+        return "payment_followup"
+    if "missed" in status or "no answer" in status:
+        return "missed_call_retry"
+    return "welcome_call"
+
+
+# ── AI Prompt Manager API endpoints ─────────────────────────────────────────
+
+@app.get("/api/ai-prompts")
+async def api_list_ai_prompts():
+    default_type = await get_setting(_AI_PROMPT_DEFAULT_TYPE_KEY, "welcome_call")
+    result = []
+    for pt, label, _ in PROMPT_TYPES:
+        saved = await get_setting(_AI_PROMPT_KEY.format(pt), "")
+        result.append({
+            "type": pt,
+            "label": label,
+            "prompt": saved if saved else get_default_prompt(pt),
+            "is_saved": bool(saved),
+            "is_default": (pt == default_type),
+        })
+    return result
+
+
+@app.get("/api/ai-prompts/resolve")
+async def api_resolve_ai_prompt(call_type: str = "welcome_call"):
+    if call_type not in _VALID_PROMPT_TYPES:
+        raise HTTPException(400, f"Unknown call type: {call_type}. Valid: {sorted(_VALID_PROMPT_TYPES)}")
+    saved = await get_setting(_AI_PROMPT_KEY.format(call_type), "")
+    prompt = saved if saved else get_default_prompt(call_type)
+    return {
+        "type": call_type,
+        "label": get_prompt_label(call_type),
+        "prompt": prompt,
+        "is_saved": bool(saved),
+    }
+
+
+@app.get("/api/ai-prompts/{prompt_type}")
+async def api_get_ai_prompt(prompt_type: str):
+    if prompt_type not in _VALID_PROMPT_TYPES:
+        raise HTTPException(404, f"Unknown prompt type: {prompt_type}")
+    default_type = await get_setting(_AI_PROMPT_DEFAULT_TYPE_KEY, "welcome_call")
+    saved = await get_setting(_AI_PROMPT_KEY.format(prompt_type), "")
+    return {
+        "type": prompt_type,
+        "label": get_prompt_label(prompt_type),
+        "prompt": saved if saved else get_default_prompt(prompt_type),
+        "is_saved": bool(saved),
+        "is_default": (prompt_type == default_type),
+        "default_prompt": get_default_prompt(prompt_type),
+    }
+
+
+@app.post("/api/ai-prompts/{prompt_type}")
+async def api_save_ai_prompt(prompt_type: str, req: AiPromptRequest):
+    if prompt_type not in _VALID_PROMPT_TYPES:
+        raise HTTPException(400, f"Unknown prompt type: {prompt_type}")
+    await set_setting(_AI_PROMPT_KEY.format(prompt_type), req.prompt)
+    if req.is_default:
+        await set_setting(_AI_PROMPT_DEFAULT_TYPE_KEY, prompt_type)
+    return {"status": "saved", "type": prompt_type, "is_default": req.is_default}
+
+
+@app.post("/api/ai-prompts/{prompt_type}/reset")
+async def api_reset_ai_prompt(prompt_type: str):
+    if prompt_type not in _VALID_PROMPT_TYPES:
+        raise HTTPException(400, f"Unknown prompt type: {prompt_type}")
+    await set_setting(_AI_PROMPT_KEY.format(prompt_type), "")
+    return {
+        "status": "reset",
+        "type": prompt_type,
+        "prompt": get_default_prompt(prompt_type),
+    }
 
 
 @app.get("/api/settings")
@@ -1756,17 +1895,31 @@ def _norm_lead_status(value: Optional[str]) -> str:
 
 
 async def _build_dispatch_metadata(contact: dict, prompt: Optional[str], profile: Optional[dict]) -> dict:
+    lead_name = contact.get("lead_name", "there")
+    business_name = contact.get("business_name", "our company")
+    service_type = contact.get("service_type", "our service")
+
+    # Prompt priority: explicit > agent profile > legacy global > call-type resolved
     saved_prompt = prompt or (await get_setting("system_prompt", "")) or None
+    if profile and not saved_prompt and profile.get("system_prompt"):
+        saved_prompt = profile["system_prompt"]
+    if not saved_prompt:
+        call_type = contact.get("call_type") or "welcome_call"
+        saved_prompt = await resolve_ai_prompt(
+            call_type=call_type,
+            lead_name=lead_name,
+            business_name=business_name,
+            service_type=service_type,
+        )
+
     metadata = {
         "phone_number": contact["phone"],
-        "lead_name": contact.get("lead_name", "there"),
-        "business_name": contact.get("business_name", "our company"),
-        "service_type": contact.get("service_type", "our service"),
+        "lead_name": lead_name,
+        "business_name": business_name,
+        "service_type": service_type,
         "system_prompt": saved_prompt,
     }
     if profile:
-        if not metadata["system_prompt"] and profile.get("system_prompt"):
-            metadata["system_prompt"] = profile["system_prompt"]
         if profile.get("voice"):
             metadata["voice_override"] = profile["voice"]
         if profile.get("model"):
@@ -2249,6 +2402,7 @@ async def api_start_due_today(timezone: Optional[str] = Query(None)):
             "lead_name": lead.get("lead_name") or "there",
             "business_name": lead.get("business_name") or "our company",
             "service_type": lead.get("service_type") or "our service",
+            "call_type": _crm_status_to_call_type(lead.get("crm_status") or ""),
         }
         for lead in all_leads
         if lead.get("phone_number")
