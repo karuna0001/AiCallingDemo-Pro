@@ -1,9 +1,41 @@
-﻿import os
+﻿import json as _json_mod
+import logging
+import os
 import re
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 from collections import defaultdict
+
+logger = logging.getLogger("db")
+
+
+def _safe_data(result, default=None):
+    """Return result.data if the Supabase call returned a usable response.
+
+    Supabase's .maybe_single() can return None when no row matches, and any
+    network/auth failure can also yield None — both of which previously caused
+    ``AttributeError: 'NoneType' object has no attribute 'data'``. This helper
+    normalizes all of those into a safe value.
+    """
+    if result is None:
+        return default
+    data = getattr(result, "data", None)
+    return default if data is None else data
+
+
+def _safe_list(result):
+    data = _safe_data(result, default=[])
+    return data if isinstance(data, list) else []
+
+
+def _safe_row(result):
+    data = _safe_data(result, default=None)
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0]
+    return None
 
 # ─── Env var alias normalization ─────────────────────────────────
 # Users commonly set intuitive names like GEMINI_API_KEY / SUPABASE_KEY.
@@ -76,6 +108,16 @@ def _default(key: str) -> str:
 
 
 def normalize_phone(phone: str) -> str:
+    """Normalize Indian/E.164 phone numbers.
+
+    Accepted inputs (all map to ``+918143554346``):
+        8143554346
+        08143554346
+        918143554346
+        +918143554346
+        91 81435 54346
+    Generic E.164 numbers (e.g. ``+14155551234``) are also preserved.
+    """
     raw = str(phone or "").strip()
     if raw.endswith(".0"):
         raw = raw[:-2]
@@ -87,10 +129,14 @@ def normalize_phone(phone: str) -> str:
         digits = re.sub(r"\D", "", raw)
         if len(digits) == 10:
             digits = "+91" + digits
+        elif len(digits) == 11 and digits.startswith("0"):
+            digits = "+91" + digits[1:]
         elif len(digits) == 12 and digits.startswith("91"):
             digits = "+" + digits
+        elif len(digits) == 13 and digits.startswith("910"):
+            digits = "+91" + digits[3:]
         else:
-            digits = "+" + digits if raw.strip().startswith("+") else digits
+            digits = "+" + digits
     if not digits.startswith("+"):
         raise ValueError("Invalid phone number")
     body = digits[1:]
@@ -505,7 +551,8 @@ async def upsert_crm_contact_from_call(call_log: dict) -> None:
     try:
         db = await _adb()
         current = await db.table("crm_contacts").select("total_calls, crm_status").eq("phone_number", phone).maybe_single().execute()
-        total_calls = int((current.data or {}).get("total_calls") or 0) + 1
+        current_row = _safe_row(current) or {}
+        total_calls = int(current_row.get("total_calls") or 0) + 1
         row = {
             "phone_number": phone,
             "lead_name": call_log.get("lead_name"),
@@ -514,7 +561,7 @@ async def upsert_crm_contact_from_call(call_log: dict) -> None:
             "total_calls": total_calls,
             "updated_at": datetime.now().isoformat(),
         }
-        if not current.data:
+        if not current_row:
             row["crm_status"] = "New"
         await db.table("crm_contacts").upsert(row, on_conflict="phone_number").execute()
     except Exception as exc:
@@ -613,7 +660,12 @@ async def upsert_crm_lead(lead: dict, import_source: Optional[str] = None, uploa
     if not lead_name:
         raise ValueError("lead_name is required")
     now = datetime.now().isoformat()
-    current = await db.table("crm_contacts").select("*").eq("phone_number", phone).maybe_single().execute()
+    try:
+        current = await db.table("crm_contacts").select("*").eq("phone_number", phone).maybe_single().execute()
+    except Exception as exc:
+        logger.warning("upsert_crm_lead: lookup failed for %s: %s", phone, exc)
+        current = None
+    existing_row = _safe_row(current)
     incoming = {}
     for field in CRM_LEAD_FIELDS:
         if field == "phone_number":
@@ -631,8 +683,8 @@ async def upsert_crm_lead(lead: dict, import_source: Optional[str] = None, uploa
     incoming["last_synced_at"] = now
     incoming["updated_at"] = now
 
-    if current.data:
-        existing = current.data
+    if existing_row:
+        existing = existing_row
         updates = {"updated_at": now, "last_synced_at": now}
         fill_if_blank = [
             "lead_name", "email", "city", "location", "requirement", "budget", "source",
@@ -656,13 +708,46 @@ async def upsert_crm_lead(lead: dict, import_source: Optional[str] = None, uploa
     return {"status": "inserted", "phone_number": phone}
 
 
+async def update_crm_contact_full(phone: str, updates: dict) -> bool:
+    """Apply an explicit edit to an existing CRM lead (Edit Lead UI).
+
+    Unlike :func:`upsert_crm_lead`, this REPLACES the provided fields exactly
+    (no fill-if-blank semantics, no auto-append of notes) so the UI's Edit
+    dialog behaves predictably.
+    """
+    db = await _adb()
+    clean = normalize_phone(phone)
+    await _ensure_crm_contact(clean)
+    payload = {"updated_at": datetime.now().isoformat()}
+    editable = set(CRM_LEAD_FIELDS) - {"phone_number", "upload_batch_id", "import_source", "last_synced_at"}
+    for key, value in (updates or {}).items():
+        if key in editable:
+            payload[key] = _clean_value(value)
+    try:
+        result = await db.table("crm_contacts").update(payload).eq("phone_number", clean).execute()
+    except Exception as exc:
+        logger.warning("update_crm_contact_full: update failed for %s: %s", clean, exc)
+        return False
+    rows = _safe_list(result)
+    return len(rows) > 0
+
+
 async def _ensure_crm_contact(phone: str) -> None:
     db = await _adb()
     phone = normalize_phone(phone)
-    current = await db.table("crm_contacts").select("phone_number").eq("phone_number", phone).maybe_single().execute()
-    if current.data:
+    try:
+        current = await db.table("crm_contacts").select("phone_number").eq("phone_number", phone).maybe_single().execute()
+    except Exception as exc:
+        logger.warning("_ensure_crm_contact: lookup failed for %s: %s", phone, exc)
+        current = None
+    if _safe_row(current):
         return
-    calls = (await db.table("call_logs").select("*").eq("phone_number", phone).order("timestamp", desc=True).execute()).data or []
+    try:
+        calls_result = await db.table("call_logs").select("*").eq("phone_number", phone).order("timestamp", desc=True).execute()
+        calls = _safe_list(calls_result)
+    except Exception as exc:
+        logger.warning("_ensure_crm_contact: call_logs lookup failed for %s: %s", phone, exc)
+        calls = []
     row = {"phone_number": phone, "crm_status": "New", "updated_at": datetime.now().isoformat()}
     if calls:
         row.update({
@@ -678,43 +763,103 @@ async def update_crm_contact_status(phone: str, crm_status: str, custom_status: 
     db = await _adb()
     phone = normalize_phone(phone)
     await _ensure_crm_contact(phone)
-    result = await db.table("crm_contacts").update({"crm_status": crm_status, "custom_status": custom_status, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
-    return len(result.data or []) > 0
+    try:
+        result = await db.table("crm_contacts").update({"crm_status": crm_status, "custom_status": custom_status, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
+    except Exception as exc:
+        logger.warning("update_crm_contact_status: failed for %s: %s", phone, exc)
+        return False
+    return len(_safe_list(result)) > 0
 
 
 async def update_crm_contact_followup(phone: str, next_followup_at: Optional[str]) -> bool:
     db = await _adb()
     phone = normalize_phone(phone)
     await _ensure_crm_contact(phone)
-    result = await db.table("crm_contacts").update({"next_followup_at": next_followup_at, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
-    return len(result.data or []) > 0
+    try:
+        result = await db.table("crm_contacts").update({"next_followup_at": next_followup_at, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
+    except Exception as exc:
+        logger.warning("update_crm_contact_followup: failed for %s: %s", phone, exc)
+        return False
+    return len(_safe_list(result)) > 0
 
 
 async def update_crm_contact_notes(phone: str, crm_notes: str) -> bool:
     db = await _adb()
     phone = normalize_phone(phone)
     await _ensure_crm_contact(phone)
-    result = await db.table("crm_contacts").update({"crm_notes": crm_notes, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
-    return len(result.data or []) > 0
+    try:
+        result = await db.table("crm_contacts").update({"crm_notes": crm_notes, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
+    except Exception as exc:
+        logger.warning("update_crm_contact_notes: failed for %s: %s", phone, exc)
+        return False
+    return len(_safe_list(result)) > 0
 
 
 async def get_crm_contact_by_phone(phone: str) -> Optional[dict]:
-    db = await _adb()
-    clean = normalize_phone(phone)
-    result = await db.table("crm_contacts").select("*").eq("phone_number", clean).maybe_single().execute()
-    if result.data:
-        return _crm_fallback_contact(result.data)
-    for row in await get_contacts():
-        if row.get("phone_number") == clean:
+    if not phone:
+        return None
+    try:
+        clean = normalize_phone(phone)
+    except Exception as exc:
+        logger.warning("get_crm_contact_by_phone: normalize failed for %r: %s", phone, exc)
+        return None
+    if not clean:
+        return None
+    try:
+        db = await _adb()
+        result = await db.table("crm_contacts").select("*").eq("phone_number", clean).maybe_single().execute()
+        row = _safe_row(result)
+        if row:
             return _crm_fallback_contact(row)
+    except Exception as exc:
+        logger.warning("get_crm_contact_by_phone: Supabase lookup failed for %s: %s", clean, exc)
+    try:
+        for row in await get_contacts():
+            if row.get("phone_number") == clean:
+                return _crm_fallback_contact(row)
+    except Exception as exc:
+        logger.warning("get_crm_contact_by_phone: fallback scan failed for %s: %s", clean, exc)
     return None
 
 
+def _empty_crm_detail() -> dict:
+    return {
+        "contact": None,
+        "calls": [],
+        "appointments": [],
+        "latest_recording_url": "",
+        "summary": {
+            "total_calls": 0,
+            "last_outcome": None,
+            "last_call_at": None,
+            "has_active_recording": False,
+        },
+    }
+
+
 async def get_crm_contact_detail(phone: str) -> dict:
-    clean = normalize_phone(phone)
-    contact = await get_crm_contact_by_phone(clean)
-    calls = await get_calls_by_phone(clean)
-    appointments = await get_appointments_by_phone(clean)
+    if not phone:
+        return _empty_crm_detail()
+    try:
+        clean = normalize_phone(phone)
+    except Exception as exc:
+        logger.warning("get_crm_contact_detail: normalize failed for %r: %s", phone, exc)
+        return _empty_crm_detail()
+    try:
+        contact = await get_crm_contact_by_phone(clean)
+    except Exception as exc:
+        logger.warning("get_crm_contact_detail: contact lookup failed for %s: %s", clean, exc)
+        contact = None
+    try:
+        calls = await get_calls_by_phone(clean)
+    except Exception as exc:
+        logger.warning("get_crm_contact_detail: calls lookup failed for %s: %s", clean, exc)
+        calls = []
+    try:
+        appointments = await get_appointments_by_phone(clean)
+    except Exception as exc:
+        logger.warning("get_crm_contact_detail: appointments lookup failed for %s: %s", clean, exc)
+        appointments = []
     latest_recording_url = ""
     for call in calls:
         if call.get("recording_url") and not call.get("recording_deleted"):
@@ -794,25 +939,60 @@ async def get_all_campaigns() -> list:
 
 async def get_campaign(campaign_id: str) -> Optional[dict]:
     db = await _adb()
-    result = await db.table("campaigns").select("*").eq("id", campaign_id).maybe_single().execute()
-    return result.data if result else None
+    try:
+        result = await db.table("campaigns").select("*").eq("id", campaign_id).maybe_single().execute()
+    except Exception as exc:
+        logger.warning("get_campaign: lookup failed for %s: %s", campaign_id, exc)
+        return None
+    return _safe_row(result)
 
 
 async def update_campaign_status(campaign_id: str, status: str) -> bool:
     db = await _adb()
-    result = await db.table("campaigns").update({"status": status}).eq("id", campaign_id).execute()
-    return len(result.data or []) > 0
+    try:
+        result = await db.table("campaigns").update({"status": status}).eq("id", campaign_id).execute()
+    except Exception as exc:
+        logger.warning("update_campaign_status: failed for %s: %s", campaign_id, exc)
+        return False
+    return len(_safe_list(result)) > 0
 
 
-async def update_campaign_run_stats(campaign_id: str, dispatched: int, failed: int) -> None:
+async def update_campaign_contacts(campaign_id: str, contacts: list) -> bool:
+    """Persist campaign lead-progress (statuses) back to ``contacts_json``.
+
+    This is how sequential calling / pause / resume / stop survives a process
+    restart: every per-lead state transition is written back to the row.
+    """
     db = await _adb()
-    await db.table("campaigns").update({"last_run_at": datetime.now().isoformat(), "total_dispatched": dispatched, "total_failed": failed, "status": "completed"}).eq("id", campaign_id).execute()
+    payload = {"contacts_json": _json_mod.dumps(contacts), "updated_at": datetime.now().isoformat()}
+    try:
+        result = await db.table("campaigns").update(payload).eq("id", campaign_id).execute()
+    except Exception as exc:
+        # ``updated_at`` may not exist in older schemas — retry without it.
+        try:
+            result = await db.table("campaigns").update({"contacts_json": payload["contacts_json"]}).eq("id", campaign_id).execute()
+        except Exception as exc2:
+            logger.warning("update_campaign_contacts: failed for %s: %s / %s", campaign_id, exc, exc2)
+            return False
+    return len(_safe_list(result)) > 0
+
+
+async def update_campaign_run_stats(campaign_id: str, dispatched: int, failed: int, status: str = "completed") -> None:
+    db = await _adb()
+    try:
+        await db.table("campaigns").update({"last_run_at": datetime.now().isoformat(), "total_dispatched": dispatched, "total_failed": failed, "status": status}).eq("id", campaign_id).execute()
+    except Exception as exc:
+        logger.warning("update_campaign_run_stats: failed for %s: %s", campaign_id, exc)
 
 
 async def delete_campaign(campaign_id: str) -> bool:
     db = await _adb()
-    result = await db.table("campaigns").delete().eq("id", campaign_id).execute()
-    return len(result.data or []) > 0
+    try:
+        result = await db.table("campaigns").delete().eq("id", campaign_id).execute()
+    except Exception as exc:
+        logger.warning("delete_campaign: failed for %s: %s", campaign_id, exc)
+        return False
+    return len(_safe_list(result)) > 0
 
 
 async def add_contact_memory(phone: str, insight: str) -> None:
@@ -840,8 +1020,12 @@ async def get_all_agent_profiles() -> list:
 
 async def get_agent_profile(profile_id: str) -> Optional[dict]:
     db = await _adb()
-    result = await db.table("agent_profiles").select("*").eq("id", profile_id).maybe_single().execute()
-    return result.data if result else None
+    try:
+        result = await db.table("agent_profiles").select("*").eq("id", profile_id).maybe_single().execute()
+    except Exception as exc:
+        logger.warning("get_agent_profile: lookup failed for %s: %s", profile_id, exc)
+        return None
+    return _safe_row(result)
 
 
 async def create_agent_profile(name: str, voice: str = "Aoede", model: str = "gemini-3.1-flash-live-preview", system_prompt: Optional[str] = None, enabled_tools: str = "[]", is_default: bool = False) -> str:

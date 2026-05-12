@@ -261,8 +261,27 @@ async def entrypoint(ctx: agents.JobContext):
             except Exception as exc:
                 await _log("warning", f"Recording start failed (non-fatal): {exc}")
 
+    greeting_mode = (os.getenv("OUTBOUND_GREETING_MODE") or "").strip().lower()
+    fixed_greeting = (os.getenv("OUTBOUND_FIXED_GREETING") or "").strip()
     active_model = os.getenv("GEMINI_MODEL", "")
-    if "3.1" in active_model or "2.5" in active_model:
+    spoke_fixed_greeting = False
+    if greeting_mode == "fixed" and fixed_greeting and phone_number:
+        # Speak the fixed greeting the *instant* the callee picks up, instead of
+        # waiting on the realtime model to generate its first turn. Significantly
+        # reduces dead-air at the start of a call.
+        try:
+            if hasattr(session, "say"):
+                await session.say(fixed_greeting, allow_interruptions=True)
+            else:
+                await session.generate_reply(instructions=f"Say exactly this greeting and nothing else: {fixed_greeting}")
+            spoke_fixed_greeting = True
+            await _log("info", f"Spoke fixed outbound greeting: {fixed_greeting!r}")
+        except Exception as exc:
+            await _log("warning", f"Fixed greeting failed, falling back to AI greeting: {exc}")
+
+    if spoke_fixed_greeting:
+        pass  # AI will continue the conversation from here.
+    elif "3.1" in active_model or "2.5" in active_model:
         await _log("info", "Gemini native-audio: model will greet autonomously from system prompt")
     else:
         try:

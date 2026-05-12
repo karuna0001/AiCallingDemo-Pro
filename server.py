@@ -5,6 +5,7 @@ import base64
 import csv
 import hashlib
 import hmac
+from datetime import datetime
 from io import BytesIO, StringIO
 import json
 import logging
@@ -48,8 +49,9 @@ from db import (
     normalize_phone, upsert_crm_lead,
     save_settings, set_default_agent_profile, set_setting,
     add_lead_status, delete_lead_status, update_agent_profile, update_call_notes,
-    update_campaign_run_stats, update_campaign_status, update_crm_contact_followup,
-    update_crm_contact_notes, update_crm_contact_status,
+    update_campaign_contacts, update_campaign_run_stats, update_campaign_status,
+    update_crm_contact_followup, update_crm_contact_full, update_crm_contact_notes,
+    update_crm_contact_status,
 )
 from prompts import DEFAULT_SYSTEM_PROMPT
 
@@ -279,6 +281,24 @@ class CrmBulkImportRequest(BaseModel):
     import_source: Optional[str] = "api"
 
 
+class CrmLeadUpdateRequest(BaseModel):
+    lead_name: Optional[str] = None
+    email: Optional[str] = None
+    city: Optional[str] = None
+    location: Optional[str] = None
+    requirement: Optional[str] = None
+    budget: Optional[str] = None
+    source: Optional[str] = None
+    business_name: Optional[str] = None
+    campaign_name: Optional[str] = None
+    service_type: Optional[str] = None
+    crm_status: Optional[str] = None
+    custom_status: Optional[str] = None
+    crm_notes: Optional[str] = None
+    next_followup_at: Optional[str] = None
+    assigned_to: Optional[str] = None
+
+
 class CrmCallSelectedRequest(BaseModel):
     phones: list
     business_name: str = "our company"
@@ -490,6 +510,14 @@ EXPORT_COLUMNS = [
 ]
 
 
+def _recording_link_value(row: dict) -> str:
+    """Plain value (URL) for CSV cells and unlinked XLSX fallback."""
+    if row.get("recording_deleted"):
+        return "Recording Deleted"
+    url = row.get("recording_url")
+    return url if url else "No Recording"
+
+
 def _export_filters(date_from: Optional[str], date_to: Optional[str], outcome: Optional[str], phone: Optional[str]) -> dict:
     return {
         "date_from": date_from or "",
@@ -505,11 +533,14 @@ def _export_value(row: dict, key: str) -> str:
 
 
 def _export_cell_value(row: dict, label: str, key: str) -> str:
+    # CSV exports MUST contain the real recording URL — not the text
+    # "Download Recording" — so users can open the file directly from a sheet.
     if label == "Recording Download Link":
+        return _recording_link_value(row)
+    if label == "Recording URL":
         if row.get("recording_deleted"):
-            return "Recording Deleted"
-        if row.get("recording_url"):
-            return "Download Recording"
+            return ""
+        return row.get("recording_url") or ""
     return _export_value(row, key)
 
 
@@ -570,6 +601,9 @@ async def api_export_calls_xlsx(
             recording_url = row.get("recording_url")
             if recording_url and not row.get("recording_deleted"):
                 cell = ws.cell(row=ws.max_row, column=download_col)
+                # XLSX gets a clickable hyperlink with friendly text; CSV gets
+                # the raw URL (see _export_cell_value above).
+                cell.value = "Download Recording"
                 cell.hyperlink = recording_url
                 cell.style = "Hyperlink"
 
@@ -882,9 +916,19 @@ async def _crm_contacts_from_filters(filters: dict) -> list:
 
 
 async def _import_leads(leads: list, import_source: str = "api", upload_batch_id: Optional[str] = None) -> dict:
-    inserted = updated = failed = 0
+    """Insert/update many leads, never aborting on a single bad row."""
+    inserted = updated = skipped = failed = 0
     errors = []
     for idx, lead in enumerate(leads, start=1):
+        if not isinstance(lead, dict):
+            skipped += 1
+            errors.append({"row": idx, "phone": "", "error": "row is not an object"})
+            continue
+        # Must have at least a phone before we even try.
+        if not (lead.get("phone_number") or lead.get("phone")):
+            skipped += 1
+            errors.append({"row": idx, "phone": "", "error": "missing phone"})
+            continue
         try:
             result = await upsert_crm_lead(lead, import_source=import_source, upload_batch_id=upload_batch_id)
             if result["status"] == "inserted":
@@ -894,15 +938,80 @@ async def _import_leads(leads: list, import_source: str = "api", upload_batch_id
         except Exception as exc:
             failed += 1
             errors.append({"row": idx, "phone": lead.get("phone_number") or lead.get("phone") or "", "error": str(exc)})
-    return {"success": True, "inserted": inserted, "updated": updated, "failed": failed, "errors": errors}
+    return {
+        "success": True,
+        "total_rows": len(leads),
+        "imported_count": inserted,
+        "updated_count": updated,
+        "skipped_count": skipped,
+        "failed_count": failed,
+        # Back-compat keys (used by older dashboard UI):
+        "inserted": inserted,
+        "updated": updated,
+        "failed": failed,
+        "errors": errors,
+    }
+
+
+UPLOAD_COLUMN_ALIASES = {
+    "phone": "phone_number",
+    "phone_number": "phone_number",
+    "mobile": "phone_number",
+    "mobile_number": "phone_number",
+    "mobile_no": "phone_number",
+    "contact": "phone_number",
+    "contact_number": "phone_number",
+    "name": "lead_name",
+    "lead_name": "lead_name",
+    "customer_name": "lead_name",
+    "customer": "lead_name",
+    "full_name": "lead_name",
+    "email": "email",
+    "email_id": "email",
+    "city": "city",
+    "town": "city",
+    "location": "location",
+    "area": "location",
+    "source": "source",
+    "lead_source": "source",
+    "service": "service_type",
+    "service_type": "service_type",
+    "requirement": "service_type",
+    "product": "service_type",
+    "interest": "service_type",
+    "notes": "crm_notes",
+    "note": "crm_notes",
+    "message": "crm_notes",
+    "comment": "crm_notes",
+    "comments": "crm_notes",
+    "remark": "crm_notes",
+    "remarks": "crm_notes",
+    "status": "crm_status",
+    "crm_status": "crm_status",
+    "business_name": "business_name",
+    "business": "business_name",
+    "company": "business_name",
+    "campaign": "campaign_name",
+    "campaign_name": "campaign_name",
+    "budget": "budget",
+    "assigned_to": "assigned_to",
+    "agent": "assigned_to",
+    "followup": "next_followup_at",
+    "follow_up": "next_followup_at",
+    "next_followup_at": "next_followup_at",
+}
 
 
 def _normalize_upload_row(row: dict) -> dict:
-    aliases = {"phone": "phone_number", "name": "lead_name"}
     out = {}
-    for key, value in row.items():
-        clean_key = (key or "").strip().lower()
-        out[aliases.get(clean_key, clean_key)] = value
+    for key, value in (row or {}).items():
+        if key is None:
+            continue
+        clean_key = str(key).strip().lower().replace(" ", "_").replace("-", "_")
+        mapped = UPLOAD_COLUMN_ALIASES.get(clean_key, clean_key)
+        if mapped in out and (value is None or str(value).strip() == ""):
+            continue
+        out[mapped] = value
     return out
 
 
@@ -946,7 +1055,7 @@ async def api_upload_crm_leads(file: UploadFile = File(...)):
     name = file.filename or ""
     content = await file.read()
     upload_batch_id = str(uuid.uuid4())
-    rows = []
+    rows: list = []
     try:
         if name.lower().endswith(".csv"):
             text = content.decode("utf-8-sig")
@@ -961,13 +1070,16 @@ async def api_upload_crm_leads(file: UploadFile = File(...)):
                 rows = [_normalize_upload_row(dict(zip(headers, row))) for row in values[1:] if any(v is not None and str(v).strip() for v in row)]
         else:
             raise HTTPException(400, "Only .csv and .xlsx files are supported")
-        if rows and not (("phone_number" in rows[0] or "phone" in rows[0]) and ("lead_name" in rows[0] or "name" in rows[0])):
-            raise HTTPException(400, "Required columns: phone_number/phone and lead_name/name")
+
+        if rows and not any(r.get("phone_number") or r.get("phone") for r in rows):
+            raise HTTPException(400, "Required column missing: phone (aliases: phone_number, mobile, contact_number)")
+
         result = await _import_leads(rows, import_source="file_upload", upload_batch_id=upload_batch_id)
         return {**result, "upload_batch_id": upload_batch_id}
     except HTTPException:
         raise
     except Exception as exc:
+        await log_error("server", "Lead upload failed", str(exc), "error")
         raise HTTPException(400, f"Upload failed: {exc}")
 
 
@@ -1094,8 +1206,19 @@ async def api_call_selected(req: CrmCallSelectedRequest):
         req.system_prompt,
         req.agent_profile_id,
     )
-    asyncio.create_task(_run_campaign(campaign_id))
+    _start_campaign_task(campaign_id)
     return {"success": True, "dispatched": len(contacts), "failed": failed, "message": "Selected lead calling started"}
+
+
+@app.put("/api/crm/contacts/{phone}")
+async def api_update_crm_contact(phone: str, req: CrmLeadUpdateRequest):
+    updates = {k: v for k, v in req.dict().items() if v is not None}
+    if not updates:
+        raise HTTPException(400, "No fields to update")
+    ok = await update_crm_contact_full(phone, updates)
+    if not ok:
+        raise HTTPException(404, "CRM contact not found")
+    return {"success": True, "message": "Lead updated", "phone_number": phone}
 
 
 @app.patch("/api/crm/contacts/{phone}/status")
@@ -1163,20 +1286,85 @@ async def api_set_default_profile(profile_id: str):
     return {"status": "default set"}
 
 
+# ── Campaign sequencing ─────────────────────────────────────────────
+# These statuses live in each ``contact`` dict inside ``contacts_json`` and are
+# persisted back to Supabase after every transition so pause/resume/stop
+# survives a process restart.
+CAMPAIGN_TERMINAL_LEAD_STATUSES = {
+    "completed", "answered", "no_answer", "busy", "failed", "skipped", "cancelled",
+}
+
+# Map call_logs.outcome → campaign lead status.
+_OUTCOME_TO_LEAD_STATUS = {
+    "booked": "answered",
+    "answered": "answered",
+    "interested": "answered",
+    "not_interested": "answered",
+    "callback_requested": "answered",
+    "transferred": "answered",
+    "completed": "completed",
+    "no_answer": "no_answer",
+    "busy": "busy",
+    "failed": "failed",
+    "voicemail": "no_answer",
+}
+
+# Tasks currently executing each campaign (so /run can be idempotent).
+_active_campaign_tasks: "dict[str, asyncio.Task]" = {}
+
+
+def _campaign_env_int(name: str, default: int) -> int:
+    try:
+        return max(int(os.getenv(name, str(default))), 0)
+    except (TypeError, ValueError):
+        return default
+
+
+async def _campaign_max_concurrent() -> int:
+    raw = await eff("MAX_CONCURRENT_OUTBOUND_CALLS")
+    try:
+        return max(int(raw or "1"), 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+async def _campaign_call_delay(default: int) -> int:
+    raw = await eff("OUTBOUND_CALL_DELAY_SECONDS")
+    try:
+        return max(int(raw or str(default)), 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _norm_lead_status(value: Optional[str]) -> str:
+    return (value or "").strip().lower() or "pending"
+
+
+async def _build_dispatch_metadata(contact: dict, prompt: Optional[str], profile: Optional[dict]) -> dict:
+    saved_prompt = prompt or (await get_setting("system_prompt", "")) or None
+    metadata = {
+        "phone_number": contact["phone"],
+        "lead_name": contact.get("lead_name", "there"),
+        "business_name": contact.get("business_name", "our company"),
+        "service_type": contact.get("service_type", "our service"),
+        "system_prompt": saved_prompt,
+    }
+    if profile:
+        if not metadata["system_prompt"] and profile.get("system_prompt"):
+            metadata["system_prompt"] = profile["system_prompt"]
+        if profile.get("voice"):
+            metadata["voice_override"] = profile["voice"]
+        if profile.get("model"):
+            metadata["model_override"] = profile["model"]
+        if profile.get("enabled_tools"):
+            metadata["tools_override"] = profile["enabled_tools"]
+    return metadata
+
+
 async def _dispatch_one(lk, lk_api, contact: dict, room_name: str, prompt: Optional[str], profile: Optional[dict] = None) -> bool:
     try:
         await lk.room.create_room(lk_api.CreateRoomRequest(name=room_name, empty_timeout=300, max_participants=5))
-        saved_prompt = prompt or (await get_setting("system_prompt", "")) or None
-        metadata = {"phone_number": contact["phone"], "lead_name": contact.get("lead_name", "there"), "business_name": contact.get("business_name", "our company"), "service_type": contact.get("service_type", "our service"), "system_prompt": saved_prompt}
-        if profile:
-            if not metadata["system_prompt"] and profile.get("system_prompt"):
-                metadata["system_prompt"] = profile["system_prompt"]
-            if profile.get("voice"):
-                metadata["voice_override"] = profile["voice"]
-            if profile.get("model"):
-                metadata["model_override"] = profile["model"]
-            if profile.get("enabled_tools"):
-                metadata["tools_override"] = profile["enabled_tools"]
+        metadata = await _build_dispatch_metadata(contact, prompt, profile)
         await lk.agent_dispatch.create_dispatch(lk_api.CreateAgentDispatchRequest(agent_name="outbound-caller", room=room_name, metadata=json.dumps(metadata)))
         return True
     except Exception as exc:
@@ -1184,13 +1372,93 @@ async def _dispatch_one(lk, lk_api, contact: dict, room_name: str, prompt: Optio
         return False
 
 
+async def _wait_for_room_finished(lk, lk_api_module, room_name: str, *, max_wait: int = 3600, poll_interval: int = 8) -> str:
+    """Block until the dispatched LiveKit room is empty (call ended).
+
+    Returns one of: ``completed`` (room gone / both peers left), ``no_answer``
+    (SIP never joined within the answer-grace window), ``timeout`` (safety cap).
+    This is what gives us *sequential* calling: we don't start lead N+1 until
+    lead N's room has shut down.
+    """
+    start = time.time()
+    answer_grace = start + 90  # SIP has 90s to actually ring + answer
+    sip_seen = False
+    while True:
+        if time.time() - start > max_wait:
+            return "timeout"
+        try:
+            resp = await lk.room.list_rooms(lk_api_module.ListRoomsRequest(names=[room_name]))
+            rooms = list(getattr(resp, "rooms", []) or [])
+        except Exception as exc:
+            logger.debug("list_rooms error for %s: %s", room_name, exc)
+            await asyncio.sleep(poll_interval)
+            continue
+        if not rooms:
+            # Room is gone — either never created or already torn down.
+            if sip_seen or time.time() > answer_grace:
+                return "completed"
+            await asyncio.sleep(poll_interval)
+            continue
+        room = rooms[0]
+        num_participants = int(getattr(room, "num_participants", 0) or 0)
+        if num_participants >= 2:
+            sip_seen = True
+        if sip_seen and num_participants <= 1:
+            # Caller hung up: only the agent (or no one) is left.
+            return "completed"
+        if not sip_seen and time.time() > answer_grace:
+            return "no_answer"
+        await asyncio.sleep(poll_interval)
+
+
+async def _classify_call_outcome(phone: str, dispatch_time: float, room_name: str) -> str:
+    """After the room closes, look up the call_log entry the agent just wrote."""
+    try:
+        calls = await get_calls_by_phone(phone)
+    except Exception:
+        return "completed"
+    for call in calls or []:
+        ts = call.get("timestamp") or ""
+        try:
+            # call_logs.timestamp is ISO; compare as string within the last hour.
+            if ts and ts >= datetime.fromtimestamp(dispatch_time).isoformat()[:19]:
+                outcome = (call.get("outcome") or "").strip().lower()
+                return _OUTCOME_TO_LEAD_STATUS.get(outcome, "completed")
+        except Exception:
+            continue
+    return "completed"
+
+
 async def _run_campaign(campaign_id: str) -> None:
     campaign = await get_campaign(campaign_id)
     if not campaign:
         return
-    contacts = json.loads(campaign.get("contacts_json") or "[]")
-    if not contacts:
+    try:
+        contacts = json.loads(campaign.get("contacts_json") or "[]")
+    except Exception:
+        contacts = []
+    if not isinstance(contacts, list) or not contacts:
         return
+
+    # De-dupe by phone within this campaign so the same number can't be queued
+    # twice in a single run.
+    seen_phones: set = set()
+    deduped: list = []
+    for contact in contacts:
+        if not isinstance(contact, dict):
+            continue
+        phone = (contact.get("phone") or "").strip()
+        if not phone:
+            continue
+        contact.setdefault("status", "pending")
+        if phone in seen_phones and _norm_lead_status(contact.get("status")) == "pending":
+            contact["status"] = "skipped"
+            contact["skip_reason"] = "duplicate phone in campaign"
+        seen_phones.add(phone)
+        deduped.append(contact)
+    contacts = deduped
+    await update_campaign_contacts(campaign_id, contacts)
+
     profile = await get_agent_profile(campaign.get("agent_profile_id")) if campaign.get("agent_profile_id") else None
     url = await eff("LIVEKIT_URL")
     key = await eff("LIVEKIT_API_KEY")
@@ -1198,32 +1466,120 @@ async def _run_campaign(campaign_id: str) -> None:
     if not (url and key and secret):
         logger.error("Campaign %s: LiveKit not configured", campaign_id)
         return
+
+    max_concurrent = await _campaign_max_concurrent()
+    delay_seconds = await _campaign_call_delay(int(campaign.get("call_delay_seconds") or 30))
+
     from livekit import api as lk_api_module
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ctx))
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_ctx))
     ok_count = fail_count = 0
+    final_status = "completed"
     try:
         lk = lk_api_module.LiveKitAPI(url=url, api_key=key, api_secret=secret, session=session)
-        for i, contact in enumerate(contacts):
-            phone = contact.get("phone", "")
+        for idx, contact in enumerate(contacts):
+            # Re-read campaign status on every iteration so pause/stop signals
+            # arrive at the next safe boundary.
+            latest = await get_campaign(campaign_id)
+            current_status = (latest or {}).get("status") if latest else None
+            if current_status == "paused":
+                logger.info("Campaign %s paused — stopping after current safe boundary", campaign_id)
+                final_status = "paused"
+                break
+            if current_status in ("stopped", "completed"):
+                logger.info("Campaign %s %s — cancelling pending leads", campaign_id, current_status)
+                final_status = current_status
+                # Mark every still-pending lead as cancelled so resume can't run them.
+                for c in contacts[idx:]:
+                    if _norm_lead_status(c.get("status")) == "pending":
+                        c["status"] = "cancelled"
+                break
+
+            if _norm_lead_status(contact.get("status")) != "pending":
+                continue  # already handled in a previous run (resume case)
+
+            phone = (contact.get("phone") or "").strip()
             if not phone.startswith("+"):
+                contact["status"] = "failed"
+                contact["failure_reason"] = "phone not in E.164 format"
                 fail_count += 1
+                await update_campaign_contacts(campaign_id, contacts)
                 continue
+
+            contact["status"] = "in_progress"
+            contact["started_at"] = datetime.now().isoformat()
+            await update_campaign_contacts(campaign_id, contacts)
+
             room_name = f"camp-{campaign_id[:8]}-{phone.replace('+','')}-{random.randint(100,999)}"
-            if await _dispatch_one(lk, lk_api_module, contact, room_name, campaign.get("system_prompt"), profile):
-                ok_count += 1
-            else:
+            contact["room_name"] = room_name
+            dispatched_at = time.time()
+            dispatched = await _dispatch_one(lk, lk_api_module, contact, room_name, campaign.get("system_prompt"), profile)
+            if not dispatched:
+                contact["status"] = "failed"
+                contact["failure_reason"] = "dispatch failed"
                 fail_count += 1
-            if i < len(contacts) - 1:
-                await asyncio.sleep(int(campaign.get("call_delay_seconds") or 3))
+                await update_campaign_contacts(campaign_id, contacts)
+                continue
+
+            # Sequential mode: wait for the room to drain before moving on.
+            if max_concurrent <= 1:
+                room_result = await _wait_for_room_finished(lk, lk_api_module, room_name)
+                if room_result == "no_answer":
+                    contact["status"] = "no_answer"
+                elif room_result == "timeout":
+                    contact["status"] = "failed"
+                    contact["failure_reason"] = "safety timeout while waiting for room"
+                else:
+                    contact["status"] = await _classify_call_outcome(phone, dispatched_at, room_name)
+            else:
+                # Parallel mode: trust the agent to write a call_log and move on
+                # after a short stagger.
+                contact["status"] = "completed"
+
+            contact["finished_at"] = datetime.now().isoformat()
+            ok_count += 1 if contact["status"] in ("answered", "completed") else 0
+            if contact["status"] in ("failed", "no_answer", "busy"):
+                fail_count += 1
+            await update_campaign_contacts(campaign_id, contacts)
+
+            # Pause/Stop can come in *during* a call — re-check right after
+            # finishing this one and don't sleep into the next dispatch.
+            latest = await get_campaign(campaign_id)
+            current_status = (latest or {}).get("status") if latest else None
+            if current_status == "paused":
+                final_status = "paused"
+                break
+            if current_status in ("stopped", "completed"):
+                final_status = current_status
+                break
+
+            # Inter-call delay (only between calls, not after the last one).
+            if idx < len(contacts) - 1 and delay_seconds:
+                await asyncio.sleep(delay_seconds)
         await lk.aclose()
     except Exception as exc:
         logger.error("Campaign run error: %s", exc)
+        await log_error("server", f"Campaign {campaign_id} run error", str(exc), "error")
     finally:
         await session.close()
-    await update_campaign_run_stats(campaign_id, ok_count, fail_count)
+        _active_campaign_tasks.pop(campaign_id, None)
+
+    # If everything got through, mark completed; otherwise leave whatever
+    # pause/stop state we detected.
+    if final_status == "completed" and all(_norm_lead_status(c.get("status")) in CAMPAIGN_TERMINAL_LEAD_STATUSES for c in contacts):
+        await update_campaign_run_stats(campaign_id, ok_count, fail_count, status="completed")
+    else:
+        await update_campaign_run_stats(campaign_id, ok_count, fail_count, status=final_status)
+
+
+def _start_campaign_task(campaign_id: str) -> None:
+    existing = _active_campaign_tasks.get(campaign_id)
+    if existing and not existing.done():
+        return  # already running, don't double-spawn
+    task = asyncio.create_task(_run_campaign(campaign_id))
+    _active_campaign_tasks[campaign_id] = task
 
 
 async def _reschedule_all_campaigns() -> None:
@@ -1286,7 +1642,7 @@ async def api_create_campaign(req: CampaignRequest):
     campaign_id = await create_campaign(req.name, json.dumps(req.contacts), req.schedule_type, req.schedule_time, req.call_delay_seconds, req.system_prompt, req.agent_profile_id)
     campaign = await get_campaign(campaign_id)
     if req.schedule_type == "once":
-        asyncio.create_task(_run_campaign(campaign_id))
+        _start_campaign_task(campaign_id)
     else:
         _schedule_campaign(campaign_id, req.schedule_type, req.schedule_time)
     return {"status": "created", "campaign_id": campaign_id, "campaign": campaign}
@@ -1312,22 +1668,78 @@ async def api_delete_campaign(campaign_id: str):
 async def api_run_campaign_now(campaign_id: str):
     if not await get_campaign(campaign_id):
         raise HTTPException(404, "Campaign not found")
-    asyncio.create_task(_run_campaign(campaign_id))
+    await update_campaign_status(campaign_id, "active")
+    _start_campaign_task(campaign_id)
     return {"status": "dispatching", "campaign_id": campaign_id}
+
+
+@app.get("/api/campaigns/{campaign_id}/progress")
+async def api_campaign_progress(campaign_id: str):
+    campaign = await get_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(404, "Campaign not found")
+    try:
+        contacts = json.loads(campaign.get("contacts_json") or "[]")
+    except Exception:
+        contacts = []
+    counts = {"pending": 0, "in_progress": 0, "completed": 0, "answered": 0, "no_answer": 0, "busy": 0, "failed": 0, "skipped": 0, "cancelled": 0}
+    for c in contacts:
+        counts[_norm_lead_status(c.get("status"))] = counts.get(_norm_lead_status(c.get("status")), 0) + 1
+    return {
+        "campaign_id": campaign_id,
+        "status": campaign.get("status"),
+        "total_leads": len(contacts),
+        "counts": counts,
+        "leads": [
+            {
+                "phone": c.get("phone"),
+                "lead_name": c.get("lead_name"),
+                "status": _norm_lead_status(c.get("status")),
+                "started_at": c.get("started_at"),
+                "finished_at": c.get("finished_at"),
+                "failure_reason": c.get("failure_reason") or c.get("skip_reason"),
+            } for c in contacts
+        ],
+    }
 
 
 @app.patch("/api/campaigns/{campaign_id}/status")
 async def api_update_campaign_status(campaign_id: str, req: StatusRequest):
-    if req.status not in ("active", "paused", "completed"):
-        raise HTTPException(400, "status must be: active | paused | completed")
+    allowed = {"active", "paused", "completed", "stopped"}
+    if req.status not in allowed:
+        raise HTTPException(400, f"status must be one of: {', '.join(sorted(allowed))}")
+    campaign = await get_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(404, "Campaign not found")
+
     ok = await update_campaign_status(campaign_id, req.status)
     if not ok:
         raise HTTPException(404, "Campaign not found")
+
     job_id = f"campaign_{campaign_id}"
-    if req.status == "paused" and _scheduler and _scheduler.get_job(job_id):
+    if req.status in ("paused", "stopped", "completed") and _scheduler and _scheduler.get_job(job_id):
         _scheduler.remove_job(job_id)
-    elif req.status == "active":
-        campaign = await get_campaign(campaign_id)
-        if campaign and campaign.get("schedule_type") in ("daily", "weekdays"):
+
+    if req.status == "stopped":
+        # Mark every still-pending lead cancelled so resume cannot run them.
+        try:
+            contacts = json.loads(campaign.get("contacts_json") or "[]")
+        except Exception:
+            contacts = []
+        changed = False
+        for c in contacts:
+            if _norm_lead_status(c.get("status")) == "pending":
+                c["status"] = "cancelled"
+                changed = True
+        if changed:
+            await update_campaign_contacts(campaign_id, contacts)
+
+    if req.status == "active":
+        # Resume: only the still-pending leads will be picked up (terminal
+        # statuses are skipped inside the loop), so no number is ever called twice.
+        if campaign.get("schedule_type") in ("daily", "weekdays"):
             _schedule_campaign(campaign_id, campaign["schedule_type"], campaign.get("schedule_time", "09:00"))
+        else:
+            _start_campaign_task(campaign_id)
+
     return {"status": req.status}
