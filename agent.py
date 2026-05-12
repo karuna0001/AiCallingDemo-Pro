@@ -185,7 +185,17 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception:
             pass
 
-    system_prompt = build_prompt(lead_name, business_name, service_type, metadata.get("system_prompt"))
+    _greeting_mode_pre = (os.getenv("OUTBOUND_GREETING_MODE") or "fixed").strip().lower()
+    _base_prompt = build_prompt(lead_name, business_name, service_type, metadata.get("system_prompt"))
+    if _greeting_mode_pre == "fixed" and phone_number:
+        # Prevent Gemini from autonomously producing an opening greeting.
+        # The fixed greeting will be injected via session.say() after session.start().
+        system_prompt = (
+            "IMPORTANT: Do NOT speak first. Do NOT generate any opening greeting. "
+            "Wait silently until the user speaks or you receive an explicit instruction to reply.\n\n"
+        ) + _base_prompt
+    else:
+        system_prompt = _base_prompt
     tool_ctx = AppointmentTools(ctx, phone_number=phone_number, lead_name=lead_name)
 
     await ctx.connect()
@@ -268,28 +278,35 @@ async def entrypoint(ctx: agents.JobContext):
     greeting_mode = (os.getenv("OUTBOUND_GREETING_MODE") or "fixed").strip().lower()
     fixed_greeting = (os.getenv("OUTBOUND_FIXED_GREETING") or "Hi, this is AI assistant. Am I speaking with you?").strip()
     active_model = os.getenv("GEMINI_MODEL", "")
-    spoke_fixed_greeting = False
+
     if greeting_mode == "fixed" and fixed_greeting and phone_number:
-        await _log("info", f"Fixed outbound greeting enabled — will speak immediately: {fixed_greeting!r}")
+        await _log("info", "Fixed outbound greeting mode enabled — speaking greeting immediately")
         try:
+            await _log("info", f"Speaking fixed outbound greeting: {fixed_greeting!r}")
             if hasattr(session, "say"):
                 await session.say(fixed_greeting, allow_interruptions=True)
             else:
-                await session.generate_reply(instructions=f"Say exactly this greeting verbatim and nothing else: {fixed_greeting}")
-            spoke_fixed_greeting = True
-            await _log("info", "Fixed greeting spoken — continuing AI realtime session")
+                await session.generate_reply(
+                    instructions=f"Say ONLY this exact text verbatim, word for word, nothing added: {fixed_greeting}"
+                )
+            await _log("info", "Fixed outbound greeting sent — Gemini realtime conversation continues")
         except Exception as exc:
-            await _log("warning", f"Fixed greeting failed, falling back to AI greeting: {exc}")
-
-    if spoke_fixed_greeting:
-        pass  # Gemini realtime continues the conversation from here normally.
-    elif "3.1" in active_model or "2.5" in active_model:
-        await _log("info", "Gemini native-audio: model will greet autonomously from system prompt")
+            await _log("warning", f"Fixed greeting failed, falling back to AI autonomous greeting: {exc}")
+            if "3.1" in active_model or "2.5" in active_model:
+                await _log("info", "Gemini native-audio: model will greet autonomously from system prompt")
+            else:
+                try:
+                    await session.generate_reply(instructions=f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}.")
+                except Exception as exc2:
+                    await _log("warning", f"generate_reply fallback also failed: {exc2}")
     else:
-        try:
-            await session.generate_reply(instructions=f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}.")
-        except Exception as exc:
-            await _log("warning", f"generate_reply failed: {exc}")
+        if "3.1" in active_model or "2.5" in active_model:
+            await _log("info", "Gemini native-audio: model will greet autonomously from system prompt")
+        else:
+            try:
+                await session.generate_reply(instructions=f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}.")
+            except Exception as exc:
+                await _log("warning", f"generate_reply failed: {exc}")
 
     if phone_number:
         sip_identity = f"sip_{phone_number}"

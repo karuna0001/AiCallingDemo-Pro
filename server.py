@@ -525,8 +525,6 @@ EXPORT_COLUMNS = [
     ("Duration Seconds", "duration_seconds"),
     ("Notes", "notes"),
     ("Recording URL", "recording_url"),
-    ("Recording Download Link", "recording_url"),
-    ("Created/Timestamp", "timestamp"),
 ]
 
 
@@ -553,10 +551,6 @@ def _export_value(row: dict, key: str) -> str:
 
 
 def _export_cell_value(row: dict, label: str, key: str) -> str:
-    # CSV exports MUST contain the real recording URL — not the text
-    # "Download Recording" — so users can open the file directly from a sheet.
-    if label == "Recording Download Link":
-        return _recording_link_value(row)
     if label == "Recording URL":
         if row.get("recording_deleted"):
             return ""
@@ -612,20 +606,11 @@ async def api_export_calls_xlsx(
         for cell in ws[1]:
             cell.font = Font(bold=True)
 
-        download_col = headers.index("Recording Download Link") + 1
         for row in rows:
             ws.append([
                 _export_cell_value(row, label, key)
                 for label, key in EXPORT_COLUMNS
             ])
-            recording_url = row.get("recording_url")
-            if recording_url and not row.get("recording_deleted"):
-                cell = ws.cell(row=ws.max_row, column=download_col)
-                # XLSX gets a clickable hyperlink with friendly text; CSV gets
-                # the raw URL (see _export_cell_value above).
-                cell.value = "Download Recording"
-                cell.hyperlink = recording_url
-                cell.style = "Hyperlink"
 
         for column in ws.columns:
             width = max(len(str(cell.value or "")) for cell in column)
