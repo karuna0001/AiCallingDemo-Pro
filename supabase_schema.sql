@@ -138,3 +138,43 @@ CREATE INDEX IF NOT EXISTS idx_crm_contacts_business_name ON crm_contacts(busine
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_campaign_name ON crm_contacts(campaign_name);
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_city ON crm_contacts(city);
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_created_at ON crm_contacts(created_at);
+
+-- ── Phase 7: Automation Actions Queue ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS automation_actions (
+    id TEXT PRIMARY KEY,
+    phone_number TEXT NOT NULL,
+    event_type TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    action_type TEXT NOT NULL,
+    scheduled_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    payload TEXT NOT NULL DEFAULT '{}',
+    result TEXT NOT NULL DEFAULT '{}',
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL DEFAULT ''
+);
+ALTER TABLE automation_actions DISABLE ROW LEVEL SECURITY;
+CREATE INDEX IF NOT EXISTS idx_automation_actions_status ON automation_actions(status);
+CREATE INDEX IF NOT EXISTS idx_automation_actions_phone ON automation_actions(phone_number);
+CREATE INDEX IF NOT EXISTS idx_automation_actions_scheduled_at ON automation_actions(scheduled_at);
+
+-- ── Phase 7: WhatsApp Logs ─────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS whatsapp_logs (
+    id TEXT PRIMARY KEY,
+    phone_number TEXT NOT NULL,
+    event_type TEXT NOT NULL DEFAULT '',
+    template_name TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT 'en',
+    parameters TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'unknown',
+    provider_message_id TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    source_type TEXT NOT NULL DEFAULT '',
+    source_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+ALTER TABLE whatsapp_logs DISABLE ROW LEVEL SECURITY;
+CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_phone ON whatsapp_logs(phone_number);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_status ON whatsapp_logs(status);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_created_at ON whatsapp_logs(created_at);

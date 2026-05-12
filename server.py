@@ -65,6 +65,17 @@ from prompts import (
     build_knowledge_context,
     get_kb_prompt_prefix,
 )
+from whatsapp import (
+    WA_SETTINGS_KEYS, AUTOMATION_EVENT_TYPES, AUTOMATION_ACTION_TYPES,
+    get_wa_settings_masked, save_wa_settings, get_wa_health,
+    send_whatsapp_template, get_whatsapp_logs,
+    get_automation_rules, save_automation_rules, find_automation_rule, source_to_event_type,
+    execute_automation_rule,
+    insert_automation_action, get_automation_actions, update_automation_action_status,
+    run_due_automation_actions,
+    send_callback_confirmation, send_appointment_confirmation, send_showroom_visit_confirmation,
+    handle_call_outcome_whatsapp_fallback,
+)
 
 load_dotenv(".env", override=False)
 logging.basicConfig(level=logging.INFO)
@@ -89,6 +100,9 @@ PUBLIC_API_ROUTES = {
     ("POST", "/api/auth/login"),
     ("GET", "/api/auth/me"),
     ("POST", "/api/auth/logout"),
+    ("GET", "/api/whatsapp/webhook"),   # Phase 8 — verify token
+    ("POST", "/api/whatsapp/webhook"),  # Phase 8 — incoming messages
+    ("POST", "/api/leads/incoming"),    # n8n / Facebook / website lead intake
 }
 
 
@@ -184,6 +198,17 @@ async def _startup():
         _scheduler.start()
         await _reschedule_all_campaigns()
         await _schedule_recording_cleanup()
+        # Automation action runner — every 60 seconds
+        try:
+            from apscheduler.triggers.interval import IntervalTrigger
+            _scheduler.add_job(
+                lambda: asyncio.create_task(run_due_automation_actions()),
+                trigger=IntervalTrigger(seconds=60),
+                id="automation_runner",
+                replace_existing=True,
+            )
+        except Exception as _e:
+            logger.warning("Automation runner schedule failed: %s", _e)
 
 
 @app.on_event("shutdown")
@@ -344,6 +369,53 @@ class OutboundScheduleRequest(BaseModel):
     OUTBOUND_END_TIME: Optional[str] = None
     OUTBOUND_ALLOWED_DAYS: Optional[str] = None
     OUTBOUND_CALLING_ENABLED: Optional[str] = None
+
+
+class WaSettingsRequest(BaseModel):
+    settings: dict
+
+
+class WaSendTemplateRequest(BaseModel):
+    phone: str
+    template_name: str
+    language: str = "en"
+    parameters: Optional[list] = None
+
+
+class AutomationRulesRequest(BaseModel):
+    rules: list
+
+
+class LeadIncomingRequest(BaseModel):
+    name: Optional[str] = None
+    phone: str
+    email: Optional[str] = None
+    source: Optional[str] = "api"
+    city: Optional[str] = None
+    service: Optional[str] = None
+    message: Optional[str] = None
+    business_name: Optional[str] = None
+    campaign_name: Optional[str] = None
+    extra: Optional[dict] = None
+
+
+class AutomationTestRequest(BaseModel):
+    phone: str
+    event_type: str
+    source: Optional[str] = None
+    lead_name: Optional[str] = "Test Lead"
+    dry_run: bool = True
+
+
+class WaConfirmRequest(BaseModel):
+    phone: str
+    lead_name: Optional[str] = None
+    business_name: Optional[str] = None
+    service_type: Optional[str] = None
+    appointment_date: Optional[str] = None
+    appointment_time: Optional[str] = None
+    address: Optional[str] = None
+    contact_number: Optional[str] = None
 
 
 @app.post("/api/auth/login")
@@ -1061,6 +1133,243 @@ async def api_save_kb_section(section: str, req: Request):
     return {"status": "saved", "section": section}
 
 
+# ── WhatsApp Settings & Health ───────────────────────────────────────────────
+
+@app.get("/api/whatsapp/settings")
+async def api_get_wa_settings():
+    return await get_wa_settings_masked()
+
+
+@app.post("/api/whatsapp/settings")
+async def api_save_wa_settings(req: WaSettingsRequest):
+    if not isinstance(req.settings, dict):
+        raise HTTPException(400, "settings must be a JSON object")
+    await save_wa_settings(req.settings)
+    return {"status": "saved", "keys_updated": [k for k in req.settings if k in WA_SETTINGS_KEYS]}
+
+
+@app.get("/api/whatsapp/health")
+async def api_wa_health():
+    return await get_wa_health()
+
+
+@app.post("/api/whatsapp/send-template")
+async def api_wa_send_template(req: WaSendTemplateRequest):
+    try:
+        phone = normalize_phone(req.phone)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    result = await send_whatsapp_template(
+        phone, req.template_name, req.language, req.parameters,
+        event_type="manual_send", source_type="dashboard", source_id="manual",
+    )
+    return result
+
+
+@app.get("/api/whatsapp/logs")
+async def api_wa_logs(phone: Optional[str] = None, limit: int = 50):
+    if phone:
+        try:
+            phone = normalize_phone(phone)
+        except Exception:
+            pass
+    return {"logs": await get_whatsapp_logs(phone=phone, limit=min(limit, 200))}
+
+
+# ── WhatsApp webhook stubs (Phase 8 — wired now so routes exist) ─────────────
+
+@app.get("/api/whatsapp/webhook")
+async def api_wa_webhook_verify(
+    hub_mode: Optional[str] = Query(None, alias="hub.mode"),
+    hub_verify_token: Optional[str] = Query(None, alias="hub.verify_token"),
+    hub_challenge: Optional[str] = Query(None, alias="hub.challenge"),
+):
+    from db import get_setting as _gs
+    verify_token = await _gs("WHATSAPP_VERIFY_TOKEN", "")
+    if hub_mode == "subscribe" and verify_token and hub_verify_token == verify_token:
+        return JSONResponse(content=int(hub_challenge or "0"), media_type="text/plain")
+    raise HTTPException(403, "Verification failed")
+
+
+@app.post("/api/whatsapp/webhook")
+async def api_wa_webhook_receive(request: Request):
+    # Phase 8 will process incoming messages here
+    return {"status": "received"}
+
+
+# ── Automation Rules ──────────────────────────────────────────────────────────
+
+@app.get("/api/automation/rules")
+async def api_get_automation_rules():
+    return {"rules": await get_automation_rules(), "event_types": AUTOMATION_EVENT_TYPES, "action_types": AUTOMATION_ACTION_TYPES}
+
+
+@app.post("/api/automation/rules")
+async def api_save_automation_rules(req: AutomationRulesRequest):
+    if not isinstance(req.rules, list):
+        raise HTTPException(400, "rules must be a list")
+    await save_automation_rules(req.rules)
+    return {"status": "saved", "count": len(req.rules)}
+
+
+@app.post("/api/automation/rules/reset")
+async def api_reset_automation_rules():
+    from whatsapp import _default_automation_rules
+    default = _default_automation_rules()
+    await save_automation_rules(default)
+    return {"status": "reset", "count": len(default)}
+
+
+@app.post("/api/automation/test")
+async def api_test_automation(req: AutomationTestRequest):
+    try:
+        phone = normalize_phone(req.phone)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    rules = await get_automation_rules()
+    rule = find_automation_rule(rules, req.event_type, req.source)
+    if req.dry_run:
+        return {
+            "dry_run": True,
+            "event_type": req.event_type,
+            "source": req.source,
+            "matched_rule": rule,
+            "planned_action": rule.get("action") if rule else "no_matching_rule",
+            "whatsapp_enabled": await get_wa_health(),
+        }
+    contact = {"phone": phone, "lead_name": req.lead_name or "Test Lead", "source": req.source or ""}
+    result = await execute_automation_rule(req.event_type, contact)
+    return {"dry_run": False, "event_type": req.event_type, **result}
+
+
+# ── Automation Action Queue ───────────────────────────────────────────────────
+
+@app.get("/api/automation/actions")
+async def api_get_automation_actions(status: Optional[str] = None, phone: Optional[str] = None, limit: int = 100):
+    if phone:
+        try:
+            phone = normalize_phone(phone)
+        except Exception:
+            pass
+    actions = await get_automation_actions(status=status, phone=phone, limit=min(limit, 500))
+    return {"actions": actions, "total": len(actions)}
+
+
+@app.patch("/api/automation/actions/{action_id}/status")
+async def api_update_action_status(action_id: str, req: StatusRequest):
+    allowed = {"pending", "running", "completed", "failed", "cancelled", "waiting_schedule"}
+    if req.status not in allowed:
+        raise HTTPException(400, f"status must be one of: {', '.join(sorted(allowed))}")
+    ok = await update_automation_action_status(action_id, req.status)
+    if not ok:
+        raise HTTPException(404, "Action not found")
+    return {"status": "updated", "action_id": action_id}
+
+
+@app.post("/api/automation/actions/run-due")
+async def api_run_due_actions():
+    result = await run_due_automation_actions()
+    return {"status": "ok", **result}
+
+
+# ── Lead Intake (n8n / Facebook / Website) ───────────────────────────────────
+
+@app.post("/api/leads/incoming")
+async def api_incoming_lead(req: LeadIncomingRequest):
+    """Public endpoint for n8n, Facebook Lead Ads, website forms, etc."""
+    try:
+        phone = normalize_phone(req.phone)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"success": False, "error": str(e)})
+
+    source = (req.source or "api").strip().lower()
+    lead_name = (req.name or "").strip() or "Unknown Lead"
+
+    lead_data = {
+        "phone_number": phone,
+        "lead_name": lead_name,
+        "email": req.email or "",
+        "city": req.city or "",
+        "source": source,
+        "service_type": req.service or "",
+        "business_name": req.business_name or "",
+        "campaign_name": req.campaign_name or "",
+        "crm_notes": req.message or "",
+    }
+
+    try:
+        upsert_result = await upsert_crm_lead(lead_data, import_source=source)
+        contact_status = upsert_result.get("status", "unknown")
+    except Exception as exc:
+        await log_error("leads_incoming", f"Upsert failed for {phone}", str(exc), "error")
+        return JSONResponse(status_code=500, content={"success": False, "error": str(exc)})
+
+    # Determine event type
+    if contact_status == "duplicate":
+        event_type = "re_enquiry"
+    else:
+        event_type = source_to_event_type(source)
+
+    # Build contact dict for automation
+    contact = {
+        "phone": phone,
+        "lead_name": lead_name,
+        "business_name": req.business_name or "",
+        "service_type": req.service or "",
+        "source": source,
+    }
+
+    # Execute automation rule
+    automation_result = await execute_automation_rule(event_type, contact)
+
+    return {
+        "success": True,
+        "phone": phone,
+        "contact_status": contact_status,
+        "event_type": event_type,
+        "automation_action": automation_result.get("action"),
+        "automation_status": automation_result.get("automation_status"),
+        "scheduled_action_id": automation_result.get("scheduled_action_id"),
+        "whatsapp_status": automation_result.get("whatsapp_status"),
+        "call_status": automation_result.get("call_status"),
+    }
+
+
+# ── Confirmation endpoints (Callback / Appointment / Showroom) ───────────────
+
+@app.post("/api/whatsapp/confirm/callback")
+async def api_wa_callback_confirm(req: WaConfirmRequest):
+    try:
+        phone = normalize_phone(req.phone)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    ctx = req.dict()
+    ctx["phone"] = phone
+    return await send_callback_confirmation(phone, ctx)
+
+
+@app.post("/api/whatsapp/confirm/appointment")
+async def api_wa_appointment_confirm(req: WaConfirmRequest):
+    try:
+        phone = normalize_phone(req.phone)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    ctx = req.dict()
+    ctx["phone"] = phone
+    return await send_appointment_confirmation(phone, ctx)
+
+
+@app.post("/api/whatsapp/confirm/showroom")
+async def api_wa_showroom_confirm(req: WaConfirmRequest):
+    try:
+        phone = normalize_phone(req.phone)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    ctx = req.dict()
+    ctx["phone"] = phone
+    return await send_showroom_visit_confirmation(phone, ctx)
+
+
 @app.get("/api/settings")
 async def api_get_settings():
     return await get_all_settings()
@@ -1472,6 +1781,13 @@ async def api_add_crm_contact(req: CrmLeadRequest):
             import_source=req.source or "manual",
             forbid_duplicate=True,
         )
+        # Trigger automation for manual lead
+        phone = normalize_phone(req.phone_number or "")
+        asyncio.create_task(execute_automation_rule(
+            "manual_lead",
+            {"phone": phone, "lead_name": req.lead_name or "", "source": req.source or "manual",
+             "business_name": req.business_name or "", "service_type": req.service_type or ""},
+        ))
         return {"success": True, **result, "message": "Lead added"}
     except DuplicateContactError as exc:
         # 409 Conflict so the Add-Lead UI shows a friendly error instead of
@@ -1518,6 +1834,22 @@ async def api_upload_crm_leads(file: UploadFile = File(...)):
             raise HTTPException(400, "Required column missing: phone (aliases: phone_number, mobile, contact_number)")
 
         result = await _import_leads(rows, import_source="file_upload", upload_batch_id=upload_batch_id)
+        # Trigger automation for each successfully inserted uploaded lead
+        async def _trigger_upload_automation(rows_: list) -> None:
+            for row_ in rows_:
+                try:
+                    ph_ = normalize_phone(row_.get("phone_number") or row_.get("phone") or "")
+                    if ph_:
+                        await execute_automation_rule(
+                            "uploaded_lead",
+                            {"phone": ph_, "lead_name": row_.get("lead_name") or "",
+                             "source": row_.get("source") or "file_upload",
+                             "business_name": row_.get("business_name") or "",
+                             "service_type": row_.get("service_type") or ""},
+                        )
+                except Exception:
+                    pass
+        asyncio.create_task(_trigger_upload_automation(rows))
         return {**result, "upload_batch_id": upload_batch_id}
     except HTTPException:
         raise
@@ -1884,6 +2216,15 @@ async def _run_batch(batch_id: str) -> None:
                     await update_crm_contact_status(normalize_phone(phone), crm_status, None)
             except Exception as exc:
                 logger.warning("Batch CRM status update failed for %s: %s", phone, exc)
+
+            # WhatsApp fallback on call outcome
+            try:
+                call_outcome = item.get("outcome") or ""
+                call_log_id = item.get("room_name") or ""
+                contact_info = {"lead_name": item.get("lead_name", "there")}
+                asyncio.create_task(handle_call_outcome_whatsapp_fallback(phone, call_outcome, call_log_id, contact_info))
+            except Exception:
+                pass
 
             # Check pause/stop after each call
             if b.get("status") in ("paused", "stopped"):
@@ -2296,6 +2637,15 @@ async def _run_campaign(campaign_id: str) -> None:
             if contact["status"] in ("failed", "no_answer", "busy"):
                 fail_count += 1
             await update_campaign_contacts(campaign_id, contacts)
+
+            # WhatsApp fallback on campaign call outcome
+            try:
+                call_outcome = contact.get("status") or ""
+                call_log_id = contact.get("room_name") or ""
+                contact_info = {"lead_name": contact.get("lead_name", "there")}
+                asyncio.create_task(handle_call_outcome_whatsapp_fallback(phone, call_outcome, call_log_id, contact_info))
+            except Exception:
+                pass
 
             # Pause/Stop can come in *during* a call — re-check right after
             # finishing this one and don't sleep into the next dispatch.

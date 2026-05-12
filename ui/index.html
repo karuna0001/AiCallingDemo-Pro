@@ -233,19 +233,147 @@
   </div>
 </div>
 </section>
-<section id="setup" class="panel"><div class="grid cols-2"><div class="card"><h2>🔧 Quick Start</h2><ol><li>Run <code>supabase_schema.sql</code> in Supabase SQL Editor.</li><li>Fill Settings and save credentials.</li><li>Create SIP trunk.</li><li>Create an agent profile.</li><li>Test a single call.</li></ol></div><div class="card"><h2>Cost Breakdown</h2><table><tr><th>Service</th><th>Cost/min</th></tr><tr><td>Vobiz SIP</td><td>₹1.00</td></tr><tr><td>LiveKit</td><td>₹0.17</td></tr><tr><td>Gemini Live</td><td>₹0.03</td></tr><tr><td><b>Total</b></td><td><b>≈ ₹1.20</b></td></tr></table></div></div></section>
-</main>
-<div id="modal-backdrop" class="modal-backdrop" onclick="if(event.target===this)closeModal()"><div class="modal-panel"><button class="modal-close" onclick="closeModal()" aria-label="Close">✕</button><div id="modal-body"></div></div></div>
+<section id="automation" class="panel">
+<div class="card">
+  <h2>⚡ Automation Rules</h2>
+  <p class="muted" style="margin-bottom:10px">Configure what happens automatically when a lead arrives or an event occurs.</p>
+  <div class="row" style="gap:8px;margin-bottom:14px">
+    <button class="primary" onclick="saveAutomationRules()">💾 Save All Rules</button>
+    <button onclick="initAutomation()">🔄 Reload</button>
+    <button onclick="resetAutomationRules()">↺ Reset Defaults</button>
+    <button onclick="testAutomationRule()">🧪 Test Rule</button>
+  </div>
+  <p id="auto-msg" class="muted" style="min-height:1.2em"></p>
+  <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:14px" id="auto-tabs-nav">
+    <button class="kb-tab-btn active" onclick="autoSwitchTab('lead-sources')">📥 Lead Sources</button>
+    <button class="kb-tab-btn" onclick="autoSwitchTab('followup-events')">🔁 Follow-up Events</button>
+    <button class="kb-tab-btn" onclick="autoSwitchTab('queue')">📋 Automation Queue</button>
+    <button class="kb-tab-btn" onclick="autoSwitchTab('test')">🧪 Test</button>
+  </div>
+
+  <!-- Lead Source Rules -->
+  <div class="kb-panel active" id="autop-lead-sources">
+    <h3 style="margin-bottom:10px">Lead Source Automation Rules</h3>
+    <div id="auto-lead-rules-list"></div>
+  </div>
+
+  <!-- Follow-up Event Rules -->
+  <div class="kb-panel" id="autop-followup-events">
+    <h3 style="margin-bottom:10px">Follow-up &amp; Event Rules</h3>
+    <div id="auto-followup-rules-list"></div>
+  </div>
+
+  <!-- Automation Queue -->
+  <div class="kb-panel" id="autop-queue">
+    <h3 style="margin-bottom:10px">Automation Queue</h3>
+    <div class="row" style="gap:8px;margin-bottom:10px">
+      <select id="auto-queue-status"><option value="">All statuses</option><option>pending</option><option>running</option><option>completed</option><option>failed</option><option>cancelled</option><option>waiting_schedule</option></select>
+      <input id="auto-queue-phone" placeholder="Filter by phone">
+      <button onclick="loadAutomationQueue()">🔄 Refresh</button>
+      <button onclick="runDueActions()">▶ Run Due Now</button>
+    </div>
+    <div id="auto-queue-list"></div>
+  </div>
+
+  <!-- Test Panel -->
+  <div class="kb-panel" id="autop-test">
+    <h3 style="margin-bottom:10px">🧪 Test Automation Rule</h3>
+    <div class="grid cols-2" style="gap:10px">
+      <div><label>Test Phone</label><input id="auto-test-phone" placeholder="+919876543210"></div>
+      <div><label>Event Type</label><select id="auto-test-event"><option value="new_lead">new_lead</option><option value="manual_lead">manual_lead</option><option value="uploaded_lead">uploaded_lead</option><option value="facebook_lead">facebook_lead</option><option value="instagram_lead">instagram_lead</option><option value="website_lead">website_lead</option><option value="google_sheet_lead">google_sheet_lead</option><option value="re_enquiry">re_enquiry</option><option value="followup_lead">followup_lead</option><option value="callback_scheduled">callback_scheduled</option><option value="appointment_confirmed">appointment_confirmed</option></select></div>
+      <div><label>Source (optional)</label><input id="auto-test-source" placeholder="e.g. facebook"></div>
+      <div><label>Mode</label><select id="auto-test-dryrun"><option value="true">Dry Run (no action)</option><option value="false">Execute (real action)</option></select></div>
+    </div>
+    <div class="row" style="margin-top:10px;gap:8px"><button class="primary" onclick="runAutoTest()">🧪 Test Rule</button></div>
+    <pre id="auto-test-result" style="background:#0d0d1a;border:1px solid #333;border-radius:6px;padding:12px;margin-top:10px;white-space:pre-wrap;font-size:0.85rem;color:#ccc;min-height:60px"></pre>
+  </div>
+</div>
+</section>
+
+<section id="whatsapp" class="panel">
+<div class="card">
+  <h2>💬 WhatsApp Settings</h2>
+  <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:14px">
+    <button class="kb-tab-btn active" onclick="waSwitchTab('settings')">⚙️ Settings</button>
+    <button class="kb-tab-btn" onclick="waSwitchTab('templates')">📝 Templates</button>
+    <button class="kb-tab-btn" onclick="waSwitchTab('send')">📤 Send Test</button>
+    <button class="kb-tab-btn" onclick="waSwitchTab('logs')">📋 Logs</button>
+    <button class="kb-tab-btn" onclick="waSwitchTab('health')">❤️ Health</button>
+  </div>
+
+  <!-- Settings -->
+  <div class="kb-panel active" id="wap-settings">
+    <h3 style="margin-bottom:10px">⚙️ WhatsApp Provider Settings</h3>
+    <div class="grid cols-2" style="gap:10px">
+      <div><label>WhatsApp Enabled</label><select id="wa-WHATSAPP_ENABLED"><option value="false">Disabled</option><option value="true">Enabled</option></select></div>
+      <div><label>Provider</label><select id="wa-WHATSAPP_PROVIDER"><option value="meta">Meta (Cloud API)</option></select></div>
+      <div><label>Graph API Version</label><input id="wa-WHATSAPP_GRAPH_VERSION" placeholder="v20.0"></div>
+      <div><label>Default Language</label><input id="wa-WHATSAPP_DEFAULT_LANGUAGE" placeholder="en"></div>
+      <div><label>Phone Number ID</label><input id="wa-WHATSAPP_PHONE_NUMBER_ID" placeholder="Meta Phone Number ID"></div>
+      <div><label>Business Account ID</label><input id="wa-WHATSAPP_BUSINESS_ACCOUNT_ID" placeholder="Meta Business Account ID"></div>
+      <div style="grid-column:1/-1"><label>Access Token <span class="muted" style="font-size:0.8rem">(stored securely — shown masked)</span></label><input id="wa-WHATSAPP_ACCESS_TOKEN" placeholder="Enter new token to update..."></div>
+      <div style="grid-column:1/-1"><label>Webhook Verify Token</label><input id="wa-WHATSAPP_VERIFY_TOKEN" placeholder="Your custom webhook verify token (Phase 8)"></div>
+    </div>
+    <div class="row" style="margin-top:12px;gap:8px"><button class="primary" onclick="saveWaSettings()">💾 Save Settings</button><button onclick="loadWaHealth()">❤️ Check Health</button></div>
+    <p id="wa-settings-msg" class="muted" style="min-height:1.2em;margin-top:6px"></p>
+    <div id="wa-health-box" style="margin-top:10px"></div>
+  </div>
+
+  <!-- Templates -->
+  <div class="kb-panel" id="wap-templates">
+    <h3 style="margin-bottom:10px">📝 WhatsApp Template Names</h3>
+    <p class="muted" style="margin-bottom:10px;font-size:0.85rem">Enter the exact template names as approved in your Meta Business Manager.</p>
+    <div class="grid cols-2" style="gap:10px">
+      <div><label>Welcome Template</label><input id="wa-WHATSAPP_WELCOME_TEMPLATE" placeholder="welcome_template"></div>
+      <div><label>Missed Call Template</label><input id="wa-WHATSAPP_MISSED_CALL_TEMPLATE" placeholder="missed_call_followup"></div>
+      <div><label>Busy Call Template</label><input id="wa-WHATSAPP_BUSY_CALL_TEMPLATE" placeholder="busy_call_followup"></div>
+      <div><label>Failed Call Template</label><input id="wa-WHATSAPP_FAILED_CALL_TEMPLATE" placeholder="failed_call_followup"></div>
+      <div><label>Callback Confirmation</label><input id="wa-WHATSAPP_CALLBACK_TEMPLATE" placeholder="callback_confirmation"></div>
+      <div><label>Appointment Confirmation</label><input id="wa-WHATSAPP_APPOINTMENT_TEMPLATE" placeholder="appointment_confirmation"></div>
+      <div><label>Showroom Visit Template</label><input id="wa-WHATSAPP_SHOWROOM_VISIT_TEMPLATE" placeholder="showroom_visit_confirmation"></div>
+      <div><label>Re-enquiry Template</label><input id="wa-WHATSAPP_RE_ENQUIRY_TEMPLATE" placeholder="re_enquiry_followup"></div>
+      <div><label>Follow-up Template</label><input id="wa-WHATSAPP_FOLLOWUP_TEMPLATE" placeholder="general_followup"></div>
+    </div>
+    <div class="row" style="margin-top:12px"><button class="primary" onclick="saveWaSettings()">💾 Save Templates</button></div>
+    <p id="wa-templates-msg" class="muted" style="min-height:1.2em;margin-top:6px"></p>
+  </div>
+
+  <!-- Send Test -->
+  <div class="kb-panel" id="wap-send">
+    <h3 style="margin-bottom:10px">📤 Send Test WhatsApp</h3>
+    <div class="grid cols-2" style="gap:10px">
+      <div><label>Phone</label><input id="wa-send-phone" placeholder="+919876543210"></div>
+      <div><label>Template Name</label><input id="wa-send-template" placeholder="welcome_template"></div>
+      <div><label>Language</label><input id="wa-send-lang" placeholder="en" value="en"></div>
+      <div><label>Parameters (comma-separated)</label><input id="wa-send-params" placeholder="Ramesh, Interior Design, Ladder Hub"></div>
+    </div>
+    <div class="row" style="margin-top:12px;gap:8px"><button class="primary" onclick="sendWaTest()">📤 Send WhatsApp</button></div>
+    <pre id="wa-send-result" style="background:#0d0d1a;border:1px solid #333;border-radius:6px;padding:12px;margin-top:10px;white-space:pre-wrap;font-size:0.85rem;color:#ccc;min-height:60px"></pre>
+  </div>
+
+  <!-- Logs -->
+  <div class="kb-panel" id="wap-logs">
+    <h3 style="margin-bottom:10px">📋 WhatsApp Logs</h3>
+    <div class="row" style="gap:8px;margin-bottom:10px">
+      <input id="wa-log-phone" placeholder="Filter by phone">
+      <button onclick="loadWaLogs()">🔄 Refresh</button>
+    </div>
+    <div id="wa-logs-list"></div>
+  </div>
+
+  <!-- Health -->
+  <div class="kb-panel" id="wap-health">
+    <h3 style="margin-bottom:10px">❤️ WhatsApp Health Check</h3>
+    <button onclick="loadWaHealth(true)">🔄 Refresh Health</button>
+    <div id="wa-health-detail" style="margin-top:12px"></div>
+  </div>
+</div>
+</section>
+
 <script>
-const tabs=[['stats','📊 Stats'],['single','📞 Single Call'],['batch','📋 Batch Call'],['batch-monitor','📡 Batch Monitor'],['campaigns','🚀 Campaigns'],['scheduled','📅 Scheduled Calls'],['agents','🤖 Agents'],['prompt','✏️ AI Prompt'],['kb','📚 Knowledge Base'],['appointments','� Appointments'],['calls','📝 Call Logs'],['crm','👥 CRM'],['settings','⚙️ Settings'],['logs','📋 Logs'],['setup','🔧 Setup']];
-const $=id=>document.getElementById(id);const api=(p,o)=>fetch(p,o).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok){if(r.status===401&&p!=='/api/auth/me')showLogin('Session expired. Please login again.');throw Error(j.detail||j.error||JSON.stringify(j))}return j});const apiPost=(p,b)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});const apiDel=p=>fetch(p,{method:'DELETE'});let charts={},batchContacts=[],campContacts=[],callPage=1,logsPaused=false,leadStatuses=[],crmContacts=[];
-function toast(msg,type='ok'){const d=document.createElement('div');d.className='toast '+(type==='err'?'err':'ok');d.textContent=msg;document.body.appendChild(d);setTimeout(()=>d.remove(),3500)}function showErr(id,msg){$(id).textContent=msg;$(id).className='err'}
-function showLogin(msg=''){$('login-error').textContent=msg;document.body.classList.remove('authenticated')}
-function showDashboard(){document.body.classList.add('authenticated');loadStats();loadCalls();loadAppointments();loadLogs();loadAgentProfiles()}
-async function checkAuth(){try{const r=await api('/api/auth/me');if(r.authenticated){showDashboard()}else{showLogin(r.error||'')}}catch(e){showLogin(e.message)}}
 async function logout(){await fetch('/api/auth/logout',{method:'POST'});showLogin('')}
 $('login-form').onsubmit=async e=>{e.preventDefault();$('login-error').textContent='';try{await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('login-username').value,password:$('login-password').value})});$('login-password').value='';showDashboard()}catch(err){showLogin(err.message)}};
-function switchTab(name){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id===name));if(name==='stats')loadStats();if(name==='campaigns'){loadCampaigns();_startCampaignProgressPoll()}if(name==='batch-monitor')refreshBatchMonitor();if(name==='scheduled')loadScheduledCalls();if(name==='agents')loadAgentProfiles();if(name==='prompt'){initPromptManager();loadPrompt();}if(name==='kb')initKB();if(name==='appointments')loadAppointments();if(name==='calls')loadCalls();if(name==='crm')loadCRM();if(name==='settings'){loadSettings();loadOutboundSchedule();}if(name==='logs')loadLogs()}
+function switchTab(name){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id===name));if(name==='stats')loadStats();if(name==='campaigns'){loadCampaigns();_startCampaignProgressPoll()}if(name==='batch-monitor')refreshBatchMonitor();if(name==='scheduled')loadScheduledCalls();if(name==='agents')loadAgentProfiles();if(name==='prompt'){initPromptManager();loadPrompt();}if(name==='kb')initKB();if(name==='automation')initAutomation();if(name==='whatsapp')initWhatsApp();if(name==='appointments')loadAppointments();if(name==='calls')loadCalls();if(name==='crm')loadCRM();if(name==='settings'){loadSettings();loadOutboundSchedule();}if(name==='logs')loadLogs()}
 function _mkChart(id,type,data,options={}){if(charts[id])charts[id].destroy();charts[id]=new Chart($(id),{type,data,options:{responsive:true,plugins:{legend:{labels:{color:'#ddd'}}},scales:type==='doughnut'?{}:{x:{ticks:{color:'#aaa'},grid:{color:'#222'}},y:{ticks:{color:'#aaa'},grid:{color:'#222'}}},...options}})}
 function _renderCharts(d){const outcomes=d.outcomes||{};_mkChart('chart-outcomes','doughnut',{labels:Object.keys(outcomes),datasets:[{data:Object.values(outcomes),backgroundColor:['#00ff88','#00ccff','#ffaa00','#ff4d4d','#888']}]});_mkChart('chart-timeline','line',{labels:(d.timeline||[]).map(x=>x.date.slice(5)),datasets:[{label:'Calls',data:(d.timeline||[]).map(x=>x.count),borderColor:'#00ccff',backgroundColor:'#00ccff33'}]});const dur=d.duration_by_outcome||{};_mkChart('chart-duration','bar',{labels:Object.keys(dur),datasets:[{label:'Avg sec',data:Object.values(dur),backgroundColor:'#00ff88'}]})}
 function loadCharts(d){try{_renderCharts(d)}catch(e){$('stats-error').textContent='Charts unavailable: '+e.message}}
@@ -603,6 +731,33 @@ async function saveOutboundSchedule(){
 }
 // ── Campaign list: inject progress div per campaign ─────────────────
 async function loadCampaigns(){try{const rows=await api('/api/campaigns');$('campaign-list').innerHTML=table(rows,['name','status','schedule_type','schedule_time','total_dispatched','total_failed'],r=>`<button onclick="runCampaign('${r.id}','${esc(r.name)}')">Run</button><button class="warn" onclick="toggleCampaignStatus('${r.id}','${r.status==='active'?'paused':'active'}')">${r.status==='active'?'Pause':'Activate'}</button><button class="danger" onclick="deleteCampaign('${r.id}','${esc(r.name)}')">Delete</button><button onclick="_pollCampaignProgress('${r.id}')">📊</button><div id="camp-progress-${r.id}"></div>`)+'';rows.filter(r=>['active','running'].includes(r.status)).forEach(r=>_pollCampaignProgress(r.id));}catch(e){toast(e.message,'err')}}
+// ── Automation Rules ─────────────────────────────────────────────────────────
+let _autoRules=[];
+const _LEAD_SOURCE_EVENTS=['new_lead','manual_lead','uploaded_lead','facebook_lead','instagram_lead','website_lead','google_sheet_lead','api_lead','re_enquiry'];
+const _FOLLOWUP_EVENTS=['followup_lead','callback_scheduled','appointment_confirmed','showroom_visit_confirmed','missed_call_retry'];
+const _ACTION_LABELS={'manual_only':'Manual Only (no automation)','call_only':'Call Only','whatsapp_only':'WhatsApp Only','whatsapp_and_call_now':'WhatsApp + Call Now','whatsapp_then_call_after_delay':'WhatsApp then Call after Delay','call_then_whatsapp_on_failure':'Call, then WhatsApp on Failure','call_then_whatsapp_always':'Call, then WhatsApp Always','whatsapp_then_call_on_reply':'WhatsApp, Call on Reply'};
+function autoSwitchTab(name){document.querySelectorAll('#auto-tabs-nav .kb-tab-btn').forEach(b=>b.classList.toggle('active',b.getAttribute('onclick').includes("'"+name+"'")));document.querySelectorAll('#automation .kb-panel').forEach(p=>p.classList.toggle('active',p.id==='autop-'+name));if(name==='queue')loadAutomationQueue()}
+async function initAutomation(){try{const r=await api('/api/automation/rules');_autoRules=r.rules||[];renderAutoRules()}catch(e){toast('Automation load failed: '+e.message,'err')}}
+function _ruleCard(rule,idx){const actionOpts=Object.entries(_ACTION_LABELS).map(([v,l])=>`<option value="${v}" ${rule.action===v?'selected':''}>${esc(l)}</option>`).join('');const showDelay=rule.action&&rule.action.includes('delay');const showFallback=rule.action&&(rule.action.includes('failure')||rule.action.includes('always'));return`<div class="card" style="margin-bottom:10px;padding:12px;border:1px solid ${rule.enabled?'#00ff8833':'#333'}"><div class="row" style="justify-content:space-between;align-items:center;margin-bottom:10px"><b style="color:${rule.enabled?'#00ff88':'#888'}">${esc(rule.event_type)}</b><label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" ${rule.enabled?'checked':''} onchange="_autoRules[${idx}].enabled=this.checked;this.closest('.card').style.borderColor=this.checked?'#00ff8833':'#333';this.closest('.card').querySelector('b').style.color=this.checked?'#00ff88':'#888'"> Enabled</label></div><div class="grid cols-2" style="gap:8px"><div><label style="font-size:0.8rem">Action</label><select onchange="_autoRules[${idx}].action=this.value;renderAutoRules()">${actionOpts}</select></div><div><label style="font-size:0.8rem">Call Type</label><input value="${esc(rule.call_type||'')}" oninput="_autoRules[${idx}].call_type=this.value" placeholder="welcome_call"></div><div><label style="font-size:0.8rem">WhatsApp Template</label><input value="${esc(rule.whatsapp_template||'')}" oninput="_autoRules[${idx}].whatsapp_template=this.value" placeholder="welcome_template"></div>${showDelay?`<div><label style="font-size:0.8rem">Delay (minutes)</label><input type="number" min="0" value="${rule.delay_minutes||0}" oninput="_autoRules[${idx}].delay_minutes=+this.value"></div>`:'<div></div>'}</div>${showFallback?`<div style="margin-top:8px"><label style="font-size:0.8rem">Fallback Template (on failure)</label><input value="${esc(rule.fallback_whatsapp_template||'')}" oninput="_autoRules[${idx}].fallback_whatsapp_template=this.value" placeholder="missed_call_template" style="width:100%"></div>`:''}${showFallback?`<div class="row" style="gap:12px;margin-top:6px;flex-wrap:wrap"><label style="font-size:0.8rem;display:flex;gap:4px;align-items:center"><input type="checkbox" ${rule.send_on_no_answer?'checked':''} onchange="_autoRules[${idx}].send_on_no_answer=this.checked"> On No Answer</label><label style="font-size:0.8rem;display:flex;gap:4px;align-items:center"><input type="checkbox" ${rule.send_on_busy?'checked':''} onchange="_autoRules[${idx}].send_on_busy=this.checked"> On Busy</label><label style="font-size:0.8rem;display:flex;gap:4px;align-items:center"><input type="checkbox" ${rule.send_on_failed?'checked':''} onchange="_autoRules[${idx}].send_on_failed=this.checked"> On Failed</label></div>`:''}
+</div>`}
+function renderAutoRules(){const leadC=$('auto-lead-rules-list'),fuC=$('auto-followup-rules-list');if(!leadC||!fuC)return;const leadRules=_autoRules.filter(r=>_LEAD_SOURCE_EVENTS.includes(r.event_type));const fuRules=_autoRules.filter(r=>_FOLLOWUP_EVENTS.includes(r.event_type));leadC.innerHTML=leadRules.length?leadRules.map((r,i)=>_ruleCard(r,_autoRules.indexOf(r))).join(''):'<p class="muted">No lead source rules.</p>';fuC.innerHTML=fuRules.length?fuRules.map((r,i)=>_ruleCard(r,_autoRules.indexOf(r))).join(''):'<p class="muted">No follow-up rules.</p>'}
+async function saveAutomationRules(){try{await api('/api/automation/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rules:_autoRules})});toast('Automation rules saved');const m=$('auto-msg');if(m){m.textContent='Saved.';m.className='ok';setTimeout(()=>{m.textContent='';m.className='muted'},3000)}}catch(e){toast(e.message,'err')}}
+async function resetAutomationRules(){if(!confirm('Reset all rules to defaults?'))return;try{const r=await api('/api/automation/rules/reset',{method:'POST'});_autoRules=r.rules||[];await initAutomation();toast('Rules reset to defaults')}catch(e){toast(e.message,'err')}}
+function testAutomationRule(){autoSwitchTab('test')}
+async function runAutoTest(){const phone=$('auto-test-phone').value;const event_type=$('auto-test-event').value;const source=$('auto-test-source').value||null;const dry_run=$('auto-test-dryrun').value==='true';try{const r=await api('/api/automation/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,event_type,source,dry_run})});$('auto-test-result').textContent=JSON.stringify(r,null,2)}catch(e){$('auto-test-result').textContent='Error: '+e.message}}
+async function loadAutomationQueue(){const status=$('auto-queue-status').value;const phone=$('auto-queue-phone').value;let url='/api/automation/actions?limit=100';if(status)url+='&status='+encodeURIComponent(status);if(phone)url+='&phone='+encodeURIComponent(phone);try{const r=await api(url);const rows=r.actions||[];$('auto-queue-list').innerHTML=rows.length?`<table><thead><tr><th>Phone</th><th>Event</th><th>Action</th><th>Status</th><th>Scheduled</th><th>Completed</th><th>Cancel</th></tr></thead><tbody>${rows.map(a=>`<tr><td>${esc(a.phone_number||'')}</td><td>${esc(a.event_type||'')}</td><td>${esc(a.action_type||'')}</td><td><span class="badge ${a.status==='completed'?'ok':a.status==='failed'?'err':a.status==='pending'?'warnc':''}">${esc(a.status||'')}</span></td><td style="white-space:nowrap">${esc((a.scheduled_at||'').slice(0,16).replace('T',' '))}</td><td style="white-space:nowrap">${esc((a.completed_at||'').slice(0,16).replace('T',' '))}</td><td>${a.status==='pending'||a.status==='waiting_schedule'?`<button class="danger" style="padding:2px 8px" onclick="cancelAction('${esc(a.id)}')">✕</button>`:''}</td></tr>`).join('')}</tbody></table>`:'<p class="muted">No actions found.</p>'}catch(e){toast(e.message,'err')}}
+window.cancelAction=async id=>{try{await api('/api/automation/actions/'+id+'/status',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'cancelled'})});loadAutomationQueue();toast('Action cancelled')}catch(e){toast(e.message,'err')}}
+async function runDueActions(){try{const r=await api('/api/automation/actions/run-due',{method:'POST'});toast('Ran due actions: '+r.processed+' processed');loadAutomationQueue()}catch(e){toast(e.message,'err')}}
+// ── WhatsApp ──────────────────────────────────────────────────────────────────
+let _waSettings={};
+const _WA_SETTINGS_KEYS=['WHATSAPP_ENABLED','WHATSAPP_PROVIDER','WHATSAPP_GRAPH_VERSION','WHATSAPP_DEFAULT_LANGUAGE','WHATSAPP_PHONE_NUMBER_ID','WHATSAPP_BUSINESS_ACCOUNT_ID','WHATSAPP_ACCESS_TOKEN','WHATSAPP_VERIFY_TOKEN'];
+const _WA_TEMPLATE_KEYS=['WHATSAPP_WELCOME_TEMPLATE','WHATSAPP_MISSED_CALL_TEMPLATE','WHATSAPP_BUSY_CALL_TEMPLATE','WHATSAPP_FAILED_CALL_TEMPLATE','WHATSAPP_CALLBACK_TEMPLATE','WHATSAPP_APPOINTMENT_TEMPLATE','WHATSAPP_SHOWROOM_VISIT_TEMPLATE','WHATSAPP_RE_ENQUIRY_TEMPLATE','WHATSAPP_FOLLOWUP_TEMPLATE'];
+function waSwitchTab(name){document.querySelectorAll('#whatsapp .kb-tab-btn').forEach(b=>b.classList.toggle('active',b.getAttribute('onclick').includes("'"+name+"'")));document.querySelectorAll('#whatsapp .kb-panel').forEach(p=>p.classList.toggle('active',p.id==='wap-'+name));if(name==='logs')loadWaLogs();if(name==='health')loadWaHealth(true)}
+async function initWhatsApp(){try{_waSettings=await api('/api/whatsapp/settings');[..._WA_SETTINGS_KEYS,..._WA_TEMPLATE_KEYS].forEach(k=>{const el=$('wa-'+k);if(!el)return;if(el.tagName==='SELECT')el.value=_waSettings[k]||'';else el.value=_waSettings[k]||''})}catch(e){toast('WA settings load failed: '+e.message,'err')}}
+async function saveWaSettings(){const settings={};[..._WA_SETTINGS_KEYS,..._WA_TEMPLATE_KEYS].forEach(k=>{const el=$('wa-'+k);if(el)settings[k]=el.value});try{await api('/api/whatsapp/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({settings})});toast('WhatsApp settings saved');['wa-settings-msg','wa-templates-msg'].forEach(id=>{const m=$(id);if(m){m.textContent='Saved.';m.className='ok';setTimeout(()=>{m.textContent='';m.className='muted'},3000)}})}catch(e){toast(e.message,'err')}}
+async function loadWaHealth(showDetail=false){try{const h=await api('/api/whatsapp/health');const box=$('wa-health-box'),detail=$('wa-health-detail');const statusBadge=`<span class="badge ${h.status==='ok'?'ok':'err'}">${h.status}</span>`;const html=`<div class="row" style="gap:8px;flex-wrap:wrap">${statusBadge}<span class="badge ${h.enabled?'ok':'warnc'}">WhatsApp: ${h.enabled?'Enabled':'Disabled'}</span><span class="badge ${h.phone_number_id_configured?'ok':'err'}">Phone ID: ${h.phone_number_id_configured?'Set':'Missing'}</span><span class="badge ${h.access_token_configured?'ok':'err'}">Token: ${h.access_token_configured?'Set':'Missing'}</span><span class="badge warnc">${h.templates_configured} templates configured</span></div>${h.missing&&h.missing.length?'<p class="muted" style="margin-top:6px;color:#f87171">Missing: '+esc(h.missing.join(', '))+'</p>':''}`;if(box)box.innerHTML=html;if(detail&&showDetail)detail.innerHTML='<pre style="background:#0d0d1a;padding:12px;border-radius:6px;font-size:0.82rem;color:#ccc">'+JSON.stringify(h,null,2)+'</pre>'}catch(e){toast(e.message,'err')}}
+async function sendWaTest(){const phone=$('wa-send-phone').value;const template=$('wa-send-template').value;const lang=$('wa-send-lang').value||'en';const paramsRaw=$('wa-send-params').value;const parameters=paramsRaw?paramsRaw.split(',').map(s=>s.trim()).filter(Boolean):null;try{const r=await api('/api/whatsapp/send-template',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,template_name:template,language:lang,parameters})});$('wa-send-result').textContent=JSON.stringify(r,null,2);if(r.success)toast('WhatsApp sent!');else toast(r.error||'Send failed','err')}catch(e){$('wa-send-result').textContent='Error: '+e.message;toast(e.message,'err')}}
+async function loadWaLogs(){const phone=$('wa-log-phone').value;let url='/api/whatsapp/logs?limit=100';if(phone)url+='&phone='+encodeURIComponent(phone);try{const r=await api(url);const rows=r.logs||[];$('wa-logs-list').innerHTML=rows.length?`<table><thead><tr><th>Phone</th><th>Event</th><th>Template</th><th>Status</th><th>Msg ID</th><th>Error</th><th>Time</th></tr></thead><tbody>${rows.map(l=>`<tr><td>${esc(l.phone_number||'')}</td><td>${esc(l.event_type||'')}</td><td>${esc(l.template_name||'')}</td><td><span class="badge ${l.status==='sent'?'ok':l.status==='failed'?'err':'warnc'}">${esc(l.status||'')}</span></td><td style="font-size:0.75rem;color:#888">${esc(l.provider_message_id||'—')}</td><td style="font-size:0.75rem;color:#f87171">${esc((l.error_message||'').slice(0,60))}</td><td style="white-space:nowrap;font-size:0.8rem">${esc((l.created_at||'').slice(0,16).replace('T',' '))}</td></tr>`).join('')}</tbody></table>`:'<p class="muted">No WhatsApp logs found.</p>'}catch(e){toast(e.message,'err')}}
 // ── init ────────────────────────────────────────────────────────────
 function init(){tabs.forEach(([id,label])=>{let b=document.createElement('button');b.className='tab'+(id==='stats'?' active':'');b.dataset.tab=id;b.textContent=label;b.onclick=()=>switchTab(id);$('tabs').appendChild(b)});$('agent-voice').innerHTML=voiceOptions();checkAuth();setInterval(()=>{if(document.body.classList.contains('authenticated'))loadStats()},10000);scheduleLogsRefresh()}document.addEventListener('DOMContentLoaded',init);
 </script>
