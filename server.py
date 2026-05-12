@@ -1222,14 +1222,13 @@ async def api_wa_conversations(
     search: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
-    _user=Depends(require_auth),
 ):
     convs = await get_conversations(status=status, ai_enabled=ai_enabled, search=search, limit=limit, offset=offset)
     return {"conversations": convs, "total": len(convs)}
 
 
 @app.get("/api/whatsapp/conversations/{conv_id}")
-async def api_wa_conversation_detail(conv_id: str, _user=Depends(require_auth)):
+async def api_wa_conversation_detail(conv_id: str):
     conv = await get_conversation_by_id(conv_id)
     if not conv:
         raise HTTPException(404, "Conversation not found")
@@ -1242,7 +1241,6 @@ async def api_wa_conversation_messages(
     conv_id: str,
     limit: int = 50,
     offset: int = 0,
-    _user=Depends(require_auth),
 ):
     msgs = await get_messages(conv_id, limit=limit, offset=offset)
     return {"messages": msgs}
@@ -1256,7 +1254,7 @@ class WaConvPatchRequest(BaseModel):
 
 
 @app.patch("/api/whatsapp/conversations/{conv_id}")
-async def api_wa_patch_conversation(conv_id: str, req: WaConvPatchRequest, _user=Depends(require_auth)):
+async def api_wa_patch_conversation(conv_id: str, req: WaConvPatchRequest):
     updates = req.dict(exclude_none=True)
     if not updates:
         raise HTTPException(400, "No fields to update")
@@ -1271,7 +1269,7 @@ class WaConvSendRequest(BaseModel):
 
 
 @app.post("/api/whatsapp/conversations/{conv_id}/send")
-async def api_wa_conv_send(conv_id: str, req: WaConvSendRequest, _user=Depends(require_auth)):
+async def api_wa_conv_send(conv_id: str, req: WaConvSendRequest):
     conv = await get_conversation_by_id(conv_id)
     if not conv:
         raise HTTPException(404, "Conversation not found")
@@ -1311,7 +1309,7 @@ class WaConvTemplateRequest(BaseModel):
 
 
 @app.post("/api/whatsapp/conversations/{conv_id}/send-template")
-async def api_wa_conv_send_template(conv_id: str, req: WaConvTemplateRequest, _user=Depends(require_auth)):
+async def api_wa_conv_send_template(conv_id: str, req: WaConvTemplateRequest):
     conv = await get_conversation_by_id(conv_id)
     if not conv:
         raise HTTPException(404, "Conversation not found")
