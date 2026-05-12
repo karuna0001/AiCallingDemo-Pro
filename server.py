@@ -36,7 +36,7 @@ def _certifi_ssl(purpose=ssl.Purpose.SERVER_AUTH, **kwargs):
 ssl.create_default_context = _certifi_ssl
 
 from db import (
-    ConfigError, cancel_appointment, clear_all_test_data, clear_appointments,
+    ConfigError, DuplicateContactError, cancel_appointment, clear_all_test_data, clear_appointments,
     clear_call_logs, clear_campaigns, clear_contact_memory, clear_error_logs,
     clear_errors, create_agent_profile, create_campaign, delete_agent_profile,
     delete_campaign, get_agent_profile,
@@ -916,8 +916,13 @@ async def _crm_contacts_from_filters(filters: dict) -> list:
 
 
 async def _import_leads(leads: list, import_source: str = "api", upload_batch_id: Optional[str] = None) -> dict:
-    """Insert/update many leads, never aborting on a single bad row."""
-    inserted = updated = skipped = failed = 0
+    """Insert/update many leads, never aborting on a single bad row.
+
+    The mobile number (normalized to E.164) is treated as the unique CRM
+    identity. Existing phone numbers are merged into the existing record and
+    counted as ``duplicate_count`` — *not* as ``imported_count``.
+    """
+    inserted = duplicates = skipped = failed = 0
     errors = []
     for idx, lead in enumerate(leads, start=1):
         if not isinstance(lead, dict):
@@ -931,10 +936,16 @@ async def _import_leads(leads: list, import_source: str = "api", upload_batch_id
             continue
         try:
             result = await upsert_crm_lead(lead, import_source=import_source, upload_batch_id=upload_batch_id)
-            if result["status"] == "inserted":
+            status = result.get("status")
+            if status == "inserted":
                 inserted += 1
+            elif status == "duplicate":
+                # Existing phone — merged + audit-noted, but reported separately.
+                duplicates += 1
             else:
-                updated += 1
+                # Defensive: any other status (e.g. legacy "updated") still
+                # counts as a duplicate-merge for reporting purposes.
+                duplicates += 1
         except Exception as exc:
             failed += 1
             errors.append({"row": idx, "phone": lead.get("phone_number") or lead.get("phone") or "", "error": str(exc)})
@@ -942,12 +953,13 @@ async def _import_leads(leads: list, import_source: str = "api", upload_batch_id
         "success": True,
         "total_rows": len(leads),
         "imported_count": inserted,
-        "updated_count": updated,
+        "duplicate_count": duplicates,
+        "updated_count": duplicates,  # alias kept for older UI builds
         "skipped_count": skipped,
         "failed_count": failed,
-        # Back-compat keys (used by older dashboard UI):
+        # Back-compat keys (used by the original dashboard UI):
         "inserted": inserted,
-        "updated": updated,
+        "updated": duplicates,
         "failed": failed,
         "errors": errors,
     }
@@ -1039,8 +1051,23 @@ async def api_delete_lead_status(status_id: str):
 @app.post("/api/crm/contacts")
 async def api_add_crm_contact(req: CrmLeadRequest):
     try:
-        result = await upsert_crm_lead(req.dict(), import_source=req.source or "manual")
-        return {"success": True, **result, "message": "Lead added" if result["status"] == "inserted" else "Lead updated"}
+        result = await upsert_crm_lead(
+            req.dict(),
+            import_source=req.source or "manual",
+            forbid_duplicate=True,
+        )
+        return {"success": True, **result, "message": "Lead added"}
+    except DuplicateContactError as exc:
+        # 409 Conflict so the Add-Lead UI shows a friendly error instead of
+        # silently merging on top of an existing CRM record.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "duplicate_contact",
+                "phone_number": exc.phone,
+                "message": "This mobile number already exists. Please open the existing lead and update it.",
+            },
+        )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
 

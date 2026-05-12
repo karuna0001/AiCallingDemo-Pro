@@ -167,6 +167,17 @@ class ConfigError(Exception):
     """Raised when a required env var is missing — surfaced as HTTP 503 by the server."""
 
 
+class DuplicateContactError(Exception):
+    """Raised by upsert_crm_lead when forbid_duplicate=True and a CRM contact
+    already exists for the normalized phone number. The server maps this to
+    HTTP 409 so the Add-Lead UI can show a friendly 'lead already exists' error."""
+
+    def __init__(self, phone: str, existing: Optional[dict] = None):
+        super().__init__(f"CRM contact already exists for {phone}")
+        self.phone = phone
+        self.existing = existing or {}
+
+
 def _require_supabase() -> tuple:
     url = _default("SUPABASE_URL")
     key = _default("SUPABASE_SERVICE_KEY")
@@ -653,7 +664,24 @@ async def get_crm_contacts(status: Optional[str] = None, outcome: Optional[str] 
     return filtered
 
 
-async def upsert_crm_lead(lead: dict, import_source: Optional[str] = None, upload_batch_id: Optional[str] = None) -> dict:
+async def upsert_crm_lead(
+    lead: dict,
+    import_source: Optional[str] = None,
+    upload_batch_id: Optional[str] = None,
+    *,
+    forbid_duplicate: bool = False,
+) -> dict:
+    """Insert or merge a CRM lead, treating the normalized phone number as the
+    unique identity.
+
+    - ``forbid_duplicate=True``: if a contact already exists for this phone, raise
+      :class:`DuplicateContactError` instead of merging. This is what the manual
+      *Add Lead* UI uses so the operator gets HTTP 409 + a clear error message.
+    - ``forbid_duplicate=False`` (default, used by CSV upload / inbound flows):
+      merge into the existing record, append a *re-enquiry* audit line to
+      ``crm_notes``, and return ``{"status": "duplicate"}`` so the caller can
+      report ``duplicate_count`` separately from ``imported_count``.
+    """
     db = await _adb()
     phone = normalize_phone(lead.get("phone_number") or lead.get("phone") or "")
     lead_name = _clean_value(lead.get("lead_name") or lead.get("name"))
@@ -666,6 +694,12 @@ async def upsert_crm_lead(lead: dict, import_source: Optional[str] = None, uploa
         logger.warning("upsert_crm_lead: lookup failed for %s: %s", phone, exc)
         current = None
     existing_row = _safe_row(current)
+
+    if existing_row and forbid_duplicate:
+        # Manual Add-Lead path: do NOT silently merge. Surface as 409 so the UI
+        # can prompt the user to open & edit the existing lead instead.
+        raise DuplicateContactError(phone, existing_row)
+
     incoming = {}
     for field in CRM_LEAD_FIELDS:
         if field == "phone_number":
@@ -696,11 +730,30 @@ async def upsert_crm_lead(lead: dict, import_source: Optional[str] = None, uploa
                 updates[field] = incoming[field]
         if incoming.get("crm_status"):
             updates["crm_status"] = incoming["crm_status"]
+
+        # Build merged notes: explicit incoming note + re-enquiry audit line.
+        existing_notes = existing.get("crm_notes") or ""
+        merged_notes = existing_notes
+        stamp_minute = datetime.now().strftime("%Y-%m-%d %H:%M")
+        stamp_day = datetime.now().strftime("%Y-%m-%d")
         if incoming.get("crm_notes"):
-            stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-            updates["crm_notes"] = f"{existing.get('crm_notes')}\n[{stamp}] {incoming['crm_notes']}" if existing.get("crm_notes") else incoming["crm_notes"]
+            line = f"[{stamp_minute}] {incoming['crm_notes']}"
+            merged_notes = f"{merged_notes}\n{line}" if merged_notes else line
+        # Re-enquiry / duplicate audit line: only when this upsert came from an
+        # automated source (CSV upload, inbound call, etc.) — not when an
+        # operator is just editing an existing record.
+        auto_sources = {"file_upload", "api", "inbound", "outbound", "call"}
+        if import_source and import_source in auto_sources:
+            src_label = incoming.get("source") or import_source
+            audit = f"[{stamp_day}] Re-enquiry received from {src_label}"
+            # Don't spam if the exact same audit line was added earlier today.
+            if audit not in merged_notes:
+                merged_notes = f"{merged_notes}\n{audit}" if merged_notes else audit
+        if merged_notes != existing_notes:
+            updates["crm_notes"] = merged_notes
+
         await db.table("crm_contacts").update(updates).eq("phone_number", phone).execute()
-        return {"status": "updated", "phone_number": phone}
+        return {"status": "duplicate", "phone_number": phone}
 
     incoming.setdefault("crm_status", "New")
     incoming["created_at"] = now
