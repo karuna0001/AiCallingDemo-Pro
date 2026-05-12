@@ -605,7 +605,60 @@ def _crm_fallback_contact(row: dict) -> dict:
     }
 
 
-async def get_crm_contacts(status: Optional[str] = None, outcome: Optional[str] = None, q: Optional[str] = None, due_today: bool = False, source: Optional[str] = None, business_name: Optional[str] = None, campaign_name: Optional[str] = None, city: Optional[str] = None, date_from: Optional[str] = None, date_to: Optional[str] = None, assigned_to: Optional[str] = None, recording_available: Optional[bool] = None, has_followup: Optional[bool] = None) -> list:
+# Lead statuses that are considered "active" (not yet closed/terminal).
+CRM_ACTIVE_STATUSES = {
+    "New", "Pending Call", "Contacted", "No Answer", "Busy",
+    "Interested", "Callback Requested", "Follow-up Scheduled",
+    "Appointment Booked", "Appointment Confirmed", "Visited",
+    "Quotation Sent", "Payment Pending",
+}
+# Statuses where no further outbound action is needed.
+CRM_TERMINAL_STATUSES = {"Converted", "Lost", "Invalid Number", "Duplicate", "Not Interested"}
+# Statuses valid for inclusion in the "Due Today" bucket.
+CRM_DUE_TODAY_STATUSES = {
+    "New", "Pending Call", "Callback Requested", "Follow-up Scheduled",
+    "No Answer", "Busy", "Interested",
+}
+
+
+def _tz_today(timezone_name: Optional[str] = None) -> str:
+    """Return today's date as YYYY-MM-DD in the given IANA timezone (or local)."""
+    tz_name = (timezone_name or "Asia/Kolkata").strip()
+    try:
+        from zoneinfo import ZoneInfo  # Python 3.9+
+        from datetime import timezone as _tz
+        now_tz = datetime.now(tz=ZoneInfo(tz_name))
+    except Exception:
+        # Fallback: use UTC offset heuristic for Asia/Kolkata (+05:30)
+        try:
+            offsets = {"Asia/Kolkata": 330, "UTC": 0, "Asia/Dhaka": 360,
+                       "America/New_York": -300, "America/Los_Angeles": -480,
+                       "Europe/London": 0, "Asia/Dubai": 240}
+            offset_min = offsets.get(tz_name, 330)
+            from datetime import timezone as _tz, timedelta as _td
+            now_tz = datetime.now(tz=_tz(offset=_td(minutes=offset_min)))
+        except Exception:
+            now_tz = datetime.now()
+    return now_tz.date().isoformat()
+
+
+async def get_crm_contacts(
+    status: Optional[str] = None,
+    outcome: Optional[str] = None,
+    q: Optional[str] = None,
+    due_today: bool = False,
+    today: bool = False,
+    timezone: Optional[str] = None,
+    source: Optional[str] = None,
+    business_name: Optional[str] = None,
+    campaign_name: Optional[str] = None,
+    city: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+    recording_available: Optional[bool] = None,
+    has_followup: Optional[bool] = None,
+) -> list:
     try:
         db = await _adb()
         query = db.table("crm_contacts").select("*").order("updated_at", desc=True)
@@ -625,7 +678,7 @@ async def get_crm_contacts(status: Optional[str] = None, outcome: Optional[str] 
         rows = [_crm_fallback_contact(c) for c in rows]
 
     needle = (q or "").strip().lower()
-    today = datetime.now().date().isoformat()
+    today_str = _tz_today(timezone)
     filtered = []
     for row in rows:
         if needle and needle not in (row.get("phone_number") or "").lower() and needle not in (row.get("lead_name") or "").lower():
@@ -634,8 +687,19 @@ async def get_crm_contacts(status: Optional[str] = None, outcome: Optional[str] 
             continue
         if outcome and row.get("last_call_outcome") != outcome:
             continue
-        if due_today and not (row.get("next_followup_at") or "").startswith(today):
-            continue
+        if due_today:
+            # Must have a next_followup_at that falls on today in the chosen timezone.
+            fup = (row.get("next_followup_at") or "")[:10]
+            if fup != today_str:
+                continue
+            # And the lead must not be in a terminal status.
+            row_status = row.get("crm_status") or "New"
+            if row_status in CRM_TERMINAL_STATUSES:
+                continue
+        if today:
+            created = (row.get("created_at") or "")[:10]
+            if created != today_str:
+                continue
         if source and (row.get("source") or "") != source:
             continue
         if business_name and (row.get("business_name") or "") != business_name:
@@ -723,13 +787,34 @@ async def upsert_crm_lead(
         fill_if_blank = [
             "lead_name", "email", "city", "location", "requirement", "budget", "source",
             "business_name", "campaign_name", "service_type", "custom_status",
-            "next_followup_at", "assigned_to", "upload_batch_id", "import_source",
+            "assigned_to", "upload_batch_id", "import_source",
+            # NOTE: next_followup_at is NOT in fill_if_blank; we always reset it
+            # to today on re-enquiry (see below) so the lead re-enters Due Today.
         ]
         for field in fill_if_blank:
             if incoming.get(field) and not existing.get(field):
                 updates[field] = incoming[field]
-        if incoming.get("crm_status"):
+
+        # Always reset next_followup_at to today on any re-enquiry/duplicate so
+        # the lead immediately surfaces in the Due Today bucket.
+        today_str = _tz_today()  # server-local timezone (Asia/Kolkata default)
+        _start_time = (os.environ.get("OUTBOUND_START_TIME") or "10:00").strip()
+        if incoming.get("next_followup_at"):
+            # Caller supplied an explicit follow-up date — use it.
+            updates["next_followup_at"] = incoming["next_followup_at"]
+        else:
+            # No explicit date → reset to today at outbound start time so lead
+            # is Due Today and callable as soon as the window opens.
+            updates["next_followup_at"] = f"{today_str}T{_start_time}:00"
+
+        # Re-enquiry: update status to actionable unless currently terminal/converted.
+        existing_status = (existing.get("crm_status") or "New")
+        if existing_status not in CRM_TERMINAL_STATUSES:
+            new_status = incoming.get("crm_status") or "Callback Requested"
+            updates["crm_status"] = new_status
+        elif incoming.get("crm_status") and incoming["crm_status"] not in CRM_TERMINAL_STATUSES:
             updates["crm_status"] = incoming["crm_status"]
+        # else: keep existing terminal status unchanged.
 
         # Build merged notes: explicit incoming note + re-enquiry audit line.
         existing_notes = existing.get("crm_notes") or ""
@@ -755,7 +840,13 @@ async def upsert_crm_lead(
         await db.table("crm_contacts").update(updates).eq("phone_number", phone).execute()
         return {"status": "duplicate", "phone_number": phone}
 
+    # Fresh insert — default followup to today at outbound start time + default status.
     incoming.setdefault("crm_status", "New")
+    if not incoming.get("next_followup_at"):
+        # Automatically Due Today and callable as soon as the calling window opens.
+        today_str = _tz_today()
+        _start_time = (os.environ.get("OUTBOUND_START_TIME") or "10:00").strip()
+        incoming["next_followup_at"] = f"{today_str}T{_start_time}:00"
     incoming["created_at"] = now
     await db.table("crm_contacts").insert(incoming).execute()
     return {"status": "inserted", "phone_number": phone}

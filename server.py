@@ -36,7 +36,8 @@ def _certifi_ssl(purpose=ssl.Purpose.SERVER_AUTH, **kwargs):
 ssl.create_default_context = _certifi_ssl
 
 from db import (
-    ConfigError, DuplicateContactError, cancel_appointment, clear_all_test_data, clear_appointments,
+    ConfigError, CRM_TERMINAL_STATUSES, DuplicateContactError,
+    cancel_appointment, clear_all_test_data, clear_appointments,
     clear_call_logs, clear_campaigns, clear_contact_memory, clear_error_logs,
     clear_errors, create_agent_profile, create_campaign, delete_agent_profile,
     delete_campaign, get_agent_profile,
@@ -46,7 +47,7 @@ from db import (
     get_crm_summary, get_lead_statuses, get_crm_contact_by_phone,
     get_logs, get_recording_storage_stats, get_recordings_for_cleanup,
     get_setting, get_stats, init_db, log_error, mark_recording_deleted,
-    normalize_phone, upsert_crm_lead,
+    normalize_phone, _tz_today, upsert_crm_lead,
     save_settings, set_default_agent_profile, set_setting,
     add_lead_status, delete_lead_status, update_agent_profile, update_call_notes,
     update_campaign_contacts, update_campaign_run_stats, update_campaign_status,
@@ -424,6 +425,9 @@ async def serve_dashboard():
 
 @app.post("/api/call")
 async def api_dispatch_call(req: CallRequest):
+    # ── Outbound calling-window guard ──────────────────────────────────────
+    if not await _is_outbound_allowed():
+        raise HTTPException(403, await _outbound_window_error())
     url = await eff("LIVEKIT_URL")
     key = await eff("LIVEKIT_API_KEY")
     secret = await eff("LIVEKIT_API_SECRET")
@@ -903,6 +907,8 @@ async def _crm_contacts_from_filters(filters: dict) -> list:
         outcome=filters.get("outcome"),
         q=filters.get("q"),
         due_today=_bool_query(filters.get("due_today")) is True,
+        today=_bool_query(filters.get("today")) is True,
+        timezone=filters.get("timezone"),
         source=filters.get("source"),
         business_name=filters.get("business_name"),
         campaign_name=filters.get("campaign_name"),
@@ -913,6 +919,107 @@ async def _crm_contacts_from_filters(filters: dict) -> list:
         recording_available=_bool_query(filters.get("recording_available")),
         has_followup=_bool_query(filters.get("has_followup")),
     )
+
+
+# ── Outbound calling-window helpers ─────────────────────────────────────────
+
+async def _outbound_tz() -> str:
+    return (await eff("OUTBOUND_TIMEZONE") or "Asia/Kolkata").strip()
+
+
+async def _outbound_window() -> tuple:
+    """Return (start_hhmm, end_hhmm, allowed_day_abbrs) from env/settings."""
+    tz = await _outbound_tz()
+    start = (await eff("OUTBOUND_START_TIME") or "10:00").strip()
+    end = (await eff("OUTBOUND_END_TIME") or "19:00").strip()
+    days_raw = (await eff("OUTBOUND_ALLOWED_DAYS") or "mon,tue,wed,thu,fri,sat").strip().lower()
+    days = {d.strip() for d in days_raw.split(",") if d.strip()}
+    return tz, start, end, days
+
+
+def _parse_hhmm(hhmm: str) -> tuple:
+    """Parse '10:00' -> (10, 0). Safe fallback to (0, 0)."""
+    try:
+        h, m = hhmm.split(":")
+        return int(h), int(m)
+    except Exception:
+        return 0, 0
+
+
+async def _is_outbound_allowed() -> bool:
+    """Return True if current local time is within the outbound calling window."""
+    tz_name, start_str, end_str, allowed_days = await _outbound_window()
+    try:
+        from zoneinfo import ZoneInfo
+        now_tz = datetime.now(tz=ZoneInfo(tz_name))
+    except Exception:
+        now_tz = datetime.now()
+    day_abbr = now_tz.strftime("%a").lower()  # 'mon', 'tue', ...
+    if day_abbr not in allowed_days:
+        return False
+    sh, sm = _parse_hhmm(start_str)
+    eh, em = _parse_hhmm(end_str)
+    current_minutes = now_tz.hour * 60 + now_tz.minute
+    start_minutes = sh * 60 + sm
+    end_minutes = eh * 60 + em
+    return start_minutes <= current_minutes < end_minutes
+
+
+async def _outbound_window_error() -> dict:
+    """Build the structured 403 detail used by single-call and call-selected endpoints."""
+    tz_name, start_str, end_str, allowed_days = await _outbound_window()
+    # Compute next_allowed_at: next occurrence of start_str on an allowed day.
+    try:
+        from zoneinfo import ZoneInfo
+        now_tz = datetime.now(tz=ZoneInfo(tz_name))
+    except Exception:
+        now_tz = datetime.now()
+    sh, sm = _parse_hhmm(start_str)
+    # Walk forward day-by-day until we land on an allowed day.
+    from datetime import timedelta as _td
+    candidate = now_tz.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    if candidate <= now_tz:
+        candidate = candidate + _td(days=1)
+    for _ in range(8):  # safety: max 7 days ahead
+        if candidate.strftime("%a").lower() in allowed_days:
+            break
+        candidate = candidate + _td(days=1)
+    try:
+        next_allowed_at = candidate.isoformat()
+    except Exception:
+        next_allowed_at = None
+    days_display = ", ".join(sorted(allowed_days))
+    return {
+        "error": "outside_outbound_window",
+        "message": (
+            f"Outbound calling is allowed only between {start_str} and {end_str} "
+            f"{tz_name} ({days_display})."
+        ),
+        "start_time": start_str,
+        "end_time": end_str,
+        "timezone": tz_name,
+        "allowed_days": sorted(allowed_days),
+        "next_allowed_at": next_allowed_at,
+    }
+
+
+async def _wait_for_outbound_window(campaign_id: str, poll_seconds: int = 120) -> bool:
+    """Block until the outbound calling window opens (or campaign is paused/stopped).
+
+    Returns True if the window opened, False if the campaign was externally
+    paused or stopped while waiting.
+    """
+    while not await _is_outbound_allowed():
+        latest = await get_campaign(campaign_id)
+        if not latest or (latest.get("status") in ("paused", "stopped", "completed")):
+            return False
+        tz_name, start_str, *_ = await _outbound_window()
+        logger.info(
+            "Campaign %s: outside outbound window (%s), sleeping %ds before retry",
+            campaign_id, start_str, poll_seconds,
+        )
+        await asyncio.sleep(poll_seconds)
+    return True
 
 
 async def _import_leads(leads: list, import_source: str = "api", upload_batch_id: Optional[str] = None) -> dict:
@@ -1129,6 +1236,8 @@ async def api_get_crm_contacts(
     outcome: Optional[str] = None,
     q: Optional[str] = None,
     due_today: bool = False,
+    today: bool = False,
+    timezone: Optional[str] = None,
     source: Optional[str] = None,
     business_name: Optional[str] = None,
     campaign_name: Optional[str] = None,
@@ -1139,7 +1248,15 @@ async def api_get_crm_contacts(
     recording_available: Optional[str] = None,
     has_followup: Optional[str] = None,
 ):
-    filters = _crm_filter_dict(status=status, outcome=outcome, q=q, due_today=str(due_today).lower() if due_today else "", source=source, business_name=business_name, campaign_name=campaign_name, city=city, date_from=date_from, date_to=date_to, assigned_to=assigned_to, recording_available=recording_available, has_followup=has_followup)
+    filters = _crm_filter_dict(
+        status=status, outcome=outcome, q=q,
+        due_today=str(due_today).lower() if due_today else "",
+        today=str(today).lower() if today else "",
+        timezone=timezone,
+        source=source, business_name=business_name, campaign_name=campaign_name,
+        city=city, date_from=date_from, date_to=date_to, assigned_to=assigned_to,
+        recording_available=recording_available, has_followup=has_followup,
+    )
     data = await _crm_contacts_from_filters(filters)
     return {"data": data, "total": len(data), "filters": filters}
 
@@ -1205,6 +1322,9 @@ async def api_get_crm_contact_detail(phone: str):
 
 @app.post("/api/crm/call-selected")
 async def api_call_selected(req: CrmCallSelectedRequest):
+    # ── Outbound calling-window guard ──────────────────────────────────────
+    if not await _is_outbound_allowed():
+        raise HTTPException(403, await _outbound_window_error())
     contacts = []
     failed = 0
     for phone in req.phones or []:
@@ -1526,6 +1646,25 @@ async def _run_campaign(campaign_id: str) -> None:
 
             if _norm_lead_status(contact.get("status")) != "pending":
                 continue  # already handled in a previous run (resume case)
+
+            # ── Outbound calling-window guard ──────────────────────────────
+            # If we're currently outside the allowed calling window, wait until
+            # it opens (or the campaign is paused/stopped externally).  Leads
+            # are NEVER skipped or cancelled just because of the time — they
+            # remain pending until we get a window.
+            if not await _is_outbound_allowed():
+                opened = await _wait_for_outbound_window(campaign_id)
+                if not opened:
+                    # Campaign was paused/stopped while waiting — exit cleanly.
+                    latest = await get_campaign(campaign_id)
+                    final_status = (latest or {}).get("status") or "paused"
+                    break
+                # Re-check campaign status now that time passed.
+                latest = await get_campaign(campaign_id)
+                current_status = (latest or {}).get("status") if latest else None
+                if current_status in ("paused", "stopped", "completed"):
+                    final_status = current_status
+                    break
 
             phone = (contact.get("phone") or "").strip()
             if not phone.startswith("+"):
