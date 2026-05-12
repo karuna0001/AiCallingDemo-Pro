@@ -1,0 +1,161 @@
+diff --git a/db.py b/db.py
+index 3ffccfb..b406d0f 100644
+--- a/db.py
++++ b/db.py
+@@ -210,6 +210,42 @@ async def clear_errors() -> None:
+     await db.table("error_logs").delete().neq("id", "").execute()
+ 
+ 
++async def _clear_table(table_name: str) -> int:
++    db = await _adb()
++    result = await db.table(table_name).delete().neq("id", "").execute()
++    return len(result.data or [])
++
++
++async def clear_call_logs() -> int:
++    return await _clear_table("call_logs")
++
++
++async def clear_error_logs() -> int:
++    return await _clear_table("error_logs")
++
++
++async def clear_contact_memory() -> int:
++    return await _clear_table("contact_memory")
++
++
++async def clear_appointments() -> int:
++    return await _clear_table("appointments")
++
++
++async def clear_campaigns() -> int:
++    return await _clear_table("campaigns")
++
++
++async def clear_all_test_data() -> dict:
++    return {
++        "call_logs": await clear_call_logs(),
++        "error_logs": await clear_error_logs(),
++        "contact_memory": await clear_contact_memory(),
++        "appointments": await clear_appointments(),
++        "campaigns": await clear_campaigns(),
++    }
++
++
+ async def insert_appointment(name: str, phone: str, date: str, time: str, service: str) -> str:
+     full_id = str(uuid.uuid4())
+     db = await _adb()
+diff --git a/server.py b/server.py
+index ef4fc1b..39029ed 100644
+--- a/server.py
++++ b/server.py
+@@ -28,8 +28,10 @@ def _certifi_ssl(purpose=ssl.Purpose.SERVER_AUTH, **kwargs):
+ ssl.create_default_context = _certifi_ssl
+ 
+ from db import (
+-    ConfigError, cancel_appointment, clear_errors, create_agent_profile,
+-    create_campaign, delete_agent_profile, delete_campaign, get_agent_profile,
++    ConfigError, cancel_appointment, clear_all_test_data, clear_appointments,
++    clear_call_logs, clear_campaigns, clear_contact_memory, clear_error_logs,
++    clear_errors, create_agent_profile, create_campaign, delete_agent_profile,
++    delete_campaign, get_agent_profile,
+     get_all_agent_profiles, get_all_appointments, get_all_calls,
+     get_all_campaigns, get_all_settings, get_calls_by_phone, get_campaign,
+     get_call_logs_for_export, get_contacts, get_logs, get_setting, get_stats, init_db, log_error,
+@@ -136,6 +138,10 @@ class StatusRequest(BaseModel):
+     status: str
+ 
+ 
++class ClearRecordsRequest(BaseModel):
++    confirm: Optional[str] = None
++
++
+ @app.get("/api/health")
+ async def api_health():
+     """Lightweight healthcheck — does NOT touch Supabase so it stays green during DB blips."""
+@@ -429,6 +435,64 @@ async def api_clear_logs():
+     return {"status": "cleared"}
+ 
+ 
++def _clear_confirmation_error(req: Optional[ClearRecordsRequest]):
++    if not req or req.confirm != "CLEAR_RECORDS":
++        return JSONResponse(status_code=400, content={"success": False, "error": "Confirmation required"})
++    return None
++
++
++async def _admin_clear_response(req: Optional[ClearRecordsRequest], label: str, clear_fn):
++    confirmation_error = _clear_confirmation_error(req)
++    if confirmation_error:
++        return confirmation_error
++    deleted = await clear_fn()
++    message = f"Cleared {deleted} {label}."
++    logger.warning("Admin clear action: %s deleted=%s", label, deleted)
++    if label != "error logs":
++        await log_error("server", f"Admin clear action: {label}", f"deleted={deleted}", "warning")
++    return {"success": True, "deleted": deleted, "message": message}
++
++
++@app.delete("/api/admin/clear/call-logs")
++async def api_admin_clear_call_logs(req: Optional[ClearRecordsRequest] = None):
++    return await _admin_clear_response(req, "call logs", clear_call_logs)
++
++
++@app.delete("/api/admin/clear/error-logs")
++async def api_admin_clear_error_logs(req: Optional[ClearRecordsRequest] = None):
++    return await _admin_clear_response(req, "error logs", clear_error_logs)
++
++
++@app.delete("/api/admin/clear/contact-memory")
++async def api_admin_clear_contact_memory(req: Optional[ClearRecordsRequest] = None):
++    return await _admin_clear_response(req, "CRM memory records", clear_contact_memory)
++
++
++@app.delete("/api/admin/clear/appointments")
++async def api_admin_clear_appointments(req: Optional[ClearRecordsRequest] = None):
++    return await _admin_clear_response(req, "appointments", clear_appointments)
++
++
++@app.delete("/api/admin/clear/campaigns")
++async def api_admin_clear_campaigns(req: Optional[ClearRecordsRequest] = None):
++    return await _admin_clear_response(req, "campaigns", clear_campaigns)
++
++
++@app.delete("/api/admin/clear/all-test-data")
++async def api_admin_clear_all_test_data(req: Optional[ClearRecordsRequest] = None):
++    confirmation_error = _clear_confirmation_error(req)
++    if confirmation_error:
++        return confirmation_error
++    deleted_by_table = await clear_all_test_data()
++    deleted = sum(deleted_by_table.values())
++    logger.warning("Admin clear action: all test data deleted=%s details=%s", deleted, deleted_by_table)
++    return {
++        "success": True,
++        "deleted": deleted,
++        "message": "Cleared all test data. Settings and agent profiles were not changed.",
++    }
++
++
+ @app.get("/api/crm")
+ async def api_get_contacts():
+     return {"data": await get_contacts()}
+diff --git a/ui/index.html b/ui/index.html
+index 903fb94..d50d3ae 100644
+--- a/ui/index.html
++++ b/ui/index.html
+@@ -21,7 +21,7 @@
+ <section id="appointments" class="panel"><div class="card"><h2>📅 Appointments</h2><div class="row"><input id="appt-date" type="date"><button onclick="loadAppointments()">Filter</button></div><div id="appt-list"></div></div></section>
+ <section id="calls" class="panel"><div class="card"><h2>📝 Call Logs</h2><div class="row"><button class="primary" onclick="exportCalls('xlsx')">Export Excel</button><button onclick="exportCalls('csv')">Export CSV</button></div><div id="calls-list"></div><div class="row"><button onclick="loadCalls(callPage-1)">Prev</button><span id="call-page"></span><button onclick="loadCalls(callPage+1)">Next</button></div></div></section>
+ <section id="crm" class="panel"><div class="grid cols-2"><div class="card"><h2>👥 CRM</h2><div id="crm-list"></div></div><div class="card"><h2>Contact Detail</h2><div id="crm-detail" class="muted">Select a contact.</div></div></div></section>
+-<section id="settings" class="panel"><div class="card"><h2>⚙️ Settings</h2><div id="settings-groups" class="grid cols-2"></div></div></section>
++<section id="settings" class="panel"><div class="card"><h2>⚙️ Settings</h2><div id="settings-groups" class="grid cols-2"></div></div><div class="card" style="margin-top:16px"><h2>Danger Zone / Clear Records</h2><p class="muted">These actions permanently delete selected records. Settings and agent profiles are not cleared.</p><div class="row" style="margin-top:12px"><button class="danger" onclick="clearAdminRecords('call-logs')">Clear Call Logs</button><button class="danger" onclick="clearAdminRecords('error-logs')">Clear Error Logs</button><button class="danger" onclick="clearAdminRecords('contact-memory')">Clear CRM Memory</button><button class="danger" onclick="clearAdminRecords('appointments')">Clear Appointments</button><button class="danger" onclick="clearAdminRecords('campaigns')">Clear Campaigns</button><button class="danger" onclick="clearAdminRecords('all-test-data',true)">Clear All Test Data</button></div></div></section>
+ <section id="logs" class="panel"><div class="card"><h2>📋 Logs</h2><div class="row"><select id="log-level"><option value="">all</option><option>info</option><option>warning</option><option>error</option></select><input id="log-source" placeholder="source"><button onclick="loadLogs()">Refresh</button><button class="danger" onclick="clearLogs()">Clear</button><button onclick="logsPaused=!logsPaused;this.textContent=logsPaused?'Resume':'Pause'">Pause</button></div><div id="log-box" class="logbox"></div></div></section>
+ <section id="setup" class="panel"><div class="grid cols-2"><div class="card"><h2>🔧 Quick Start</h2><ol><li>Run <code>supabase_schema.sql</code> in Supabase SQL Editor.</li><li>Fill Settings and save credentials.</li><li>Create SIP trunk.</li><li>Create an agent profile.</li><li>Test a single call.</li></ol></div><div class="card"><h2>Cost Breakdown</h2><table><tr><th>Service</th><th>Cost/min</th></tr><tr><td>Vobiz SIP</td><td>₹1.00</td></tr><tr><td>LiveKit</td><td>₹0.17</td></tr><tr><td>Gemini Live</td><td>₹0.03</td></tr><tr><td><b>Total</b></td><td><b>≈ ₹1.20</b></td></tr></table></div></div></section>
+ </main>
+@@ -43,6 +43,7 @@ async function loadAgentProfiles(){let profiles=[];try{const raw=await api('/api
+ async function loadPrompt(){const p=await api('/api/prompt');$('prompt-text').value=p.prompt;$('prompt-count').textContent=p.prompt.length+' chars'}window.savePrompt=async()=>{await apiPost('/api/prompt',{prompt:$('prompt-text').value});toast('Prompt saved')};window.resetPrompt=async()=>{await apiDel('/api/prompt');loadPrompt()};$('prompt-text').oninput=()=>$('prompt-count').textContent=$('prompt-text').value.length+' chars';
+ async function loadAppointments(){const q=$('appt-date').value?'?date='+$('appt-date').value:'';$('appt-list').innerHTML=table(await api('/api/appointments'+q),['name','phone','date','time','service','status'],r=>`<button class="danger" onclick="cancelAppointment('${r.id}')">Cancel</button>`)}window.cancelAppointment=async id=>{await apiDel('/api/appointments/'+id);loadAppointments()};async function loadCalls(page=1){if(page<1)return;callPage=page;const rows=await api(`/api/calls?page=${page}&limit=20`);$('call-page').textContent='Page '+page;$('calls-list').innerHTML=table(rows,['phone_number','lead_name','outcome','duration_seconds','timestamp','recording_url'],r=>`<textarea id="notes-${r.id}">${esc(r.notes||'')}</textarea><button onclick="saveNotes('${r.id}')">Save Notes</button>`)}window.saveNotes=async id=>{await fetch(`/api/calls/${id}/notes`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({notes:$('notes-'+id).value})});toast('Notes saved')};async function loadCRM(){let r=await api('/api/crm');$('crm-list').innerHTML=table(r.data||[],['phone_number','lead_name','total_calls','booked','last_outcome'],x=>`<button onclick="loadContactDetail('${x.phone_number}')">Open</button>`)}window.loadContactDetail=async phone=>{let r=await api('/api/crm/calls?phone='+encodeURIComponent(phone));$('crm-detail').innerHTML=table(r.data||[])}
+ function exportCalls(format){window.location.href='/api/export/calls.'+format}
++async function clearAdminRecords(kind,all=false){const msg=all?'This will delete call logs, appointments, CRM memory, campaigns, and error logs. Continue?':'Are you sure? This action cannot be undone.';if(!confirm(msg))return;try{const r=await api('/api/admin/clear/'+kind,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:'CLEAR_RECORDS'})});toast(r.message||'Records cleared');loadStats();loadCalls();loadAppointments();loadCampaigns();loadCRM();loadLogs()}catch(e){toast(e.message,'err')}}
+ const groups={LiveKit:['LIVEKIT_URL','LIVEKIT_API_KEY','LIVEKIT_API_SECRET'],Gemini:['GOOGLE_API_KEY','GEMINI_MODEL','GEMINI_TTS_VOICE','USE_GEMINI_REALTIME'],Vobiz:['VOBIZ_SIP_DOMAIN','VOBIZ_USERNAME','VOBIZ_PASSWORD','VOBIZ_OUTBOUND_NUMBER','OUTBOUND_TRUNK_ID','DEFAULT_TRANSFER_NUMBER'],Twilio:['TWILIO_ACCOUNT_SID','TWILIO_AUTH_TOKEN','TWILIO_FROM_NUMBER'],S3:['S3_ACCESS_KEY_ID','S3_SECRET_ACCESS_KEY','S3_ENDPOINT_URL','S3_REGION','S3_BUCKET'],Calcom:['CALCOM_API_KEY','CALCOM_EVENT_TYPE_ID','CALCOM_TIMEZONE'],Tools:['ENABLED_TOOLS']};async function loadSettings(){const s=await api('/api/settings');$('settings-groups').innerHTML=Object.entries(groups).map(([g,keys])=>`<div class="card"><h3>${g}</h3>${keys.map(k=>`<label>${k} <span class="badge ${s[k]?.configured?'ok':'err'}">${s[k]?.configured?'configured':'missing'}</span></label><input id="set-${k}" type="${k.includes('KEY')||k.includes('SECRET')||k.includes('TOKEN')||k.includes('PASSWORD')?'password':'text'}" value="${esc(s[k]?.value||'')}">`).join('')}<button class="primary" onclick="saveGroup('${g}')">Save ${g}</button>${g==='Vobiz'?'<button onclick="createSIPTrunk()">⚡ Create SIP Trunk</button>':''}</div>`).join('')}async function saveGroup(g){let settings={};groups[g].forEach(k=>settings[k]=$('set-'+k).value);await apiPost('/api/settings',{settings});toast(g+' saved')}window.createSIPTrunk=async()=>{let r=await api('/api/setup/trunk',{method:'POST'});toast('Trunk: '+r.trunk_id)};window.saveToolToggles=async()=>saveGroup('Tools');
+ async function loadLogs(){if(logsPaused)return;let q=`?limit=200&level=${$('log-level').value}&source=${encodeURIComponent($('log-source').value)}`;let rows=await api('/api/logs'+q);$('log-box').textContent=rows.map(l=>`[${l.timestamp}] ${l.level}/${l.source}: ${l.message}\n${l.detail||''}`).join('\n')}async function clearLogs(){await apiDel('/api/logs');loadLogs()}function scheduleLogsRefresh(){setInterval(loadLogs,5000)}
+ function esc(s){return String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}function table(rows,cols,actions){rows=Array.isArray(rows)?rows:[];if(!rows.length)return '<p class="muted">No data.</p>';cols=cols||Object.keys(rows[0]);return `<table><thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}${actions?'<th>Actions</th>':''}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${c==='recording_url'&&r[c]?`<a href="${esc(r[c])}" target="_blank">recording</a>`:esc(r[c])}</td>`).join('')}${actions?`<td>${actions(r)}</td>`:''}</tr>`).join('')}</tbody></table>`}

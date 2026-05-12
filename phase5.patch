@@ -1,0 +1,638 @@
+diff --git a/db.py b/db.py
+index 35d31a0..ad708f3 100644
+--- a/db.py
++++ b/db.py
+@@ -1,4 +1,5 @@
+ ﻿import os
++import re
+ import uuid
+ from datetime import datetime, timedelta
+ from typing import Optional
+@@ -62,11 +63,49 @@ DEFAULT_LEAD_STATUSES = [
+     ("No Response", "#94a3b8"),
+ ]
+ 
++CRM_LEAD_FIELDS = [
++    "phone_number", "lead_name", "email", "city", "location", "requirement",
++    "budget", "source", "business_name", "campaign_name", "service_type",
++    "crm_status", "custom_status", "crm_notes", "next_followup_at", "assigned_to",
++    "upload_batch_id", "import_source", "last_synced_at",
++]
++
+ 
+ def _default(key: str) -> str:
+     return os.getenv(key, DEFAULTS.get(key, ""))
+ 
+ 
++def normalize_phone(phone: str) -> str:
++    raw = str(phone or "").strip()
++    if raw.endswith(".0"):
++        raw = raw[:-2]
++    if not raw:
++        raise ValueError("Invalid phone number")
++    if raw.startswith("+"):
++        digits = "+" + re.sub(r"\D", "", raw)
++    else:
++        digits = re.sub(r"\D", "", raw)
++        if len(digits) == 10:
++            digits = "+91" + digits
++        elif len(digits) == 12 and digits.startswith("91"):
++            digits = "+" + digits
++        else:
++            digits = "+" + digits if raw.strip().startswith("+") else digits
++    if not digits.startswith("+"):
++        raise ValueError("Invalid phone number")
++    body = digits[1:]
++    if not body.isdigit() or len(body) < 8 or len(body) > 15:
++        raise ValueError("Invalid phone number")
++    return digits
++
++
++def _clean_value(value):
++    if value is None:
++        return None
++    text = str(value).strip()
++    return text if text else None
++
++
+ SUPABASE_URL = _default("SUPABASE_URL")
+ SUPABASE_KEY = _default("SUPABASE_SERVICE_KEY")
+ 
+@@ -486,6 +525,15 @@ def _crm_fallback_contact(row: dict) -> dict:
+     return {
+         "phone_number": row.get("phone_number"),
+         "lead_name": row.get("lead_name"),
++        "email": row.get("email"),
++        "city": row.get("city"),
++        "location": row.get("location"),
++        "requirement": row.get("requirement"),
++        "budget": row.get("budget"),
++        "source": row.get("source"),
++        "business_name": row.get("business_name"),
++        "campaign_name": row.get("campaign_name"),
++        "service_type": row.get("service_type"),
+         "crm_status": row.get("crm_status") or "New",
+         "custom_status": row.get("custom_status"),
+         "next_followup_at": row.get("next_followup_at"),
+@@ -494,10 +542,12 @@ def _crm_fallback_contact(row: dict) -> dict:
+         "last_call_outcome": row.get("last_call_outcome") or row.get("last_outcome"),
+         "last_call_at": row.get("last_call_at") or row.get("last_call"),
+         "total_calls": row.get("total_calls") or 0,
++        "created_at": row.get("created_at"),
++        "updated_at": row.get("updated_at"),
+     }
+ 
+ 
+-async def get_crm_contacts(status: Optional[str] = None, outcome: Optional[str] = None, q: Optional[str] = None, due_today: bool = False) -> list:
++async def get_crm_contacts(status: Optional[str] = None, outcome: Optional[str] = None, q: Optional[str] = None, due_today: bool = False, source: Optional[str] = None, business_name: Optional[str] = None, campaign_name: Optional[str] = None, city: Optional[str] = None, date_from: Optional[str] = None, date_to: Optional[str] = None, assigned_to: Optional[str] = None, recording_available: Optional[bool] = None, has_followup: Optional[bool] = None) -> list:
+     try:
+         db = await _adb()
+         query = db.table("crm_contacts").select("*").order("updated_at", desc=True)
+@@ -528,12 +578,87 @@ async def get_crm_contacts(status: Optional[str] = None, outcome: Optional[str]
+             continue
+         if due_today and not (row.get("next_followup_at") or "").startswith(today):
+             continue
++        if source and (row.get("source") or "") != source:
++            continue
++        if business_name and (row.get("business_name") or "") != business_name:
++            continue
++        if campaign_name and (row.get("campaign_name") or "") != campaign_name:
++            continue
++        if city and (row.get("city") or "") != city:
++            continue
++        if assigned_to and (row.get("assigned_to") or "") != assigned_to:
++            continue
++        created = row.get("created_at") or ""
++        if date_from and created < date_from:
++            continue
++        if date_to and created[:10] > date_to:
++            continue
++        if has_followup is True and not row.get("next_followup_at"):
++            continue
++        if has_followup is False and row.get("next_followup_at"):
++            continue
++        if recording_available is not None:
++            calls = await get_calls_by_phone(row.get("phone_number") or "")
++            has_recording = any(c.get("recording_url") and not c.get("recording_deleted") for c in calls)
++            if recording_available != has_recording:
++                continue
+         filtered.append(row)
+     return filtered
+ 
+ 
++async def upsert_crm_lead(lead: dict, import_source: Optional[str] = None, upload_batch_id: Optional[str] = None) -> dict:
++    db = await _adb()
++    phone = normalize_phone(lead.get("phone_number") or lead.get("phone") or "")
++    lead_name = _clean_value(lead.get("lead_name") or lead.get("name"))
++    if not lead_name:
++        raise ValueError("lead_name is required")
++    now = datetime.now().isoformat()
++    current = await db.table("crm_contacts").select("*").eq("phone_number", phone).maybe_single().execute()
++    incoming = {}
++    for field in CRM_LEAD_FIELDS:
++        if field == "phone_number":
++            incoming[field] = phone
++            continue
++        value = _clean_value(lead.get(field))
++        if value is not None:
++            incoming[field] = value
++    incoming.setdefault("lead_name", lead_name)
++    incoming.setdefault("source", "manual")
++    if import_source:
++        incoming["import_source"] = import_source
++    if upload_batch_id:
++        incoming["upload_batch_id"] = upload_batch_id
++    incoming["last_synced_at"] = now
++    incoming["updated_at"] = now
++
++    if current.data:
++        existing = current.data
++        updates = {"updated_at": now, "last_synced_at": now}
++        fill_if_blank = [
++            "lead_name", "email", "city", "location", "requirement", "budget", "source",
++            "business_name", "campaign_name", "service_type", "custom_status",
++            "next_followup_at", "assigned_to", "upload_batch_id", "import_source",
++        ]
++        for field in fill_if_blank:
++            if incoming.get(field) and not existing.get(field):
++                updates[field] = incoming[field]
++        if incoming.get("crm_status"):
++            updates["crm_status"] = incoming["crm_status"]
++        if incoming.get("crm_notes"):
++            stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
++            updates["crm_notes"] = f"{existing.get('crm_notes')}\n[{stamp}] {incoming['crm_notes']}" if existing.get("crm_notes") else incoming["crm_notes"]
++        await db.table("crm_contacts").update(updates).eq("phone_number", phone).execute()
++        return {"status": "updated", "phone_number": phone}
++
++    incoming.setdefault("crm_status", "New")
++    incoming["created_at"] = now
++    await db.table("crm_contacts").insert(incoming).execute()
++    return {"status": "inserted", "phone_number": phone}
++
++
+ async def _ensure_crm_contact(phone: str) -> None:
+     db = await _adb()
++    phone = normalize_phone(phone)
+     current = await db.table("crm_contacts").select("phone_number").eq("phone_number", phone).maybe_single().execute()
+     if current.data:
+         return
+@@ -551,6 +676,7 @@ async def _ensure_crm_contact(phone: str) -> None:
+ 
+ async def update_crm_contact_status(phone: str, crm_status: str, custom_status: Optional[str] = None) -> bool:
+     db = await _adb()
++    phone = normalize_phone(phone)
+     await _ensure_crm_contact(phone)
+     result = await db.table("crm_contacts").update({"crm_status": crm_status, "custom_status": custom_status, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
+     return len(result.data or []) > 0
+@@ -558,6 +684,7 @@ async def update_crm_contact_status(phone: str, crm_status: str, custom_status:
+ 
+ async def update_crm_contact_followup(phone: str, next_followup_at: Optional[str]) -> bool:
+     db = await _adb()
++    phone = normalize_phone(phone)
+     await _ensure_crm_contact(phone)
+     result = await db.table("crm_contacts").update({"next_followup_at": next_followup_at, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
+     return len(result.data or []) > 0
+@@ -565,11 +692,63 @@ async def update_crm_contact_followup(phone: str, next_followup_at: Optional[str
+ 
+ async def update_crm_contact_notes(phone: str, crm_notes: str) -> bool:
+     db = await _adb()
++    phone = normalize_phone(phone)
+     await _ensure_crm_contact(phone)
+     result = await db.table("crm_contacts").update({"crm_notes": crm_notes, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
+     return len(result.data or []) > 0
+ 
+ 
++async def get_crm_contact_by_phone(phone: str) -> Optional[dict]:
++    db = await _adb()
++    clean = normalize_phone(phone)
++    result = await db.table("crm_contacts").select("*").eq("phone_number", clean).maybe_single().execute()
++    if result.data:
++        return _crm_fallback_contact(result.data)
++    for row in await get_contacts():
++        if row.get("phone_number") == clean:
++            return _crm_fallback_contact(row)
++    return None
++
++
++async def get_crm_contact_detail(phone: str) -> dict:
++    clean = normalize_phone(phone)
++    contact = await get_crm_contact_by_phone(clean)
++    calls = await get_calls_by_phone(clean)
++    appointments = await get_appointments_by_phone(clean)
++    latest_recording_url = ""
++    for call in calls:
++        if call.get("recording_url") and not call.get("recording_deleted"):
++            latest_recording_url = call["recording_url"]
++            break
++    return {
++        "contact": contact,
++        "calls": calls,
++        "appointments": appointments,
++        "latest_recording_url": latest_recording_url,
++        "summary": {
++            "total_calls": len(calls),
++            "last_outcome": calls[0].get("outcome") if calls else None,
++            "last_call_at": calls[0].get("timestamp") if calls else None,
++            "has_active_recording": bool(latest_recording_url),
++        },
++    }
++
++
++async def get_crm_summary() -> dict:
++    rows = await get_crm_contacts()
++    today = datetime.now().date().isoformat()
++    return {
++        "total_leads": len(rows),
++        "new_leads": sum(1 for r in rows if r.get("crm_status") == "New"),
++        "hot_leads": sum(1 for r in rows if r.get("crm_status") == "Hot Lead"),
++        "due_today": sum(1 for r in rows if (r.get("next_followup_at") or "").startswith(today)),
++        "no_answer": sum(1 for r in rows if r.get("last_call_outcome") == "no_answer"),
++        "booked": sum(1 for r in rows if r.get("last_call_outcome") == "booked"),
++        "closed_won": sum(1 for r in rows if r.get("crm_status") == "Closed Won"),
++        "closed_lost": sum(1 for r in rows if r.get("crm_status") == "Closed Lost"),
++    }
++
++
+ async def get_stats() -> dict:
+     db = await _adb()
+     rows = (await db.table("call_logs").select("outcome, duration_seconds, timestamp").execute()).data or []
+diff --git a/server.py b/server.py
+index bc466ac..8f5b02b 100644
+--- a/server.py
++++ b/server.py
+@@ -8,6 +8,7 @@ import logging
+ import os
+ import random
+ import ssl
++import uuid
+ import certifi
+ import aiohttp
+ from pathlib import Path
+@@ -16,7 +17,7 @@ from typing import Optional
+ from zoneinfo import ZoneInfo
+ 
+ from dotenv import load_dotenv
+-from fastapi import FastAPI, HTTPException, Query, Request
++from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+ from pydantic import BaseModel
+ 
+@@ -36,9 +37,11 @@ from db import (
+     delete_campaign, get_agent_profile,
+     get_all_agent_profiles, get_all_appointments, get_all_calls,
+     get_all_campaigns, get_all_settings, get_calls_by_phone, get_campaign,
+-    get_call_logs_for_export, get_contacts, get_crm_contacts, get_lead_statuses,
++    get_call_logs_for_export, get_contacts, get_crm_contact_detail, get_crm_contacts,
++    get_crm_summary, get_lead_statuses, get_crm_contact_by_phone,
+     get_logs, get_recording_storage_stats, get_recordings_for_cleanup,
+     get_setting, get_stats, init_db, log_error, mark_recording_deleted,
++    normalize_phone, upsert_crm_lead,
+     save_settings, set_default_agent_profile, set_setting,
+     add_lead_status, delete_lead_status, update_agent_profile, update_call_notes,
+     update_campaign_run_stats, update_campaign_status, update_crm_contact_followup,
+@@ -166,6 +169,40 @@ class CrmNotesRequest(BaseModel):
+     crm_notes: str = ""
+ 
+ 
++class CrmLeadRequest(BaseModel):
++    phone_number: str
++    lead_name: str
++    email: Optional[str] = None
++    city: Optional[str] = None
++    location: Optional[str] = None
++    requirement: Optional[str] = None
++    budget: Optional[str] = None
++    source: Optional[str] = "manual"
++    business_name: Optional[str] = None
++    campaign_name: Optional[str] = None
++    service_type: Optional[str] = None
++    crm_status: Optional[str] = None
++    custom_status: Optional[str] = None
++    crm_notes: Optional[str] = None
++    next_followup_at: Optional[str] = None
++    assigned_to: Optional[str] = None
++
++
++class CrmBulkImportRequest(BaseModel):
++    leads: list
++    import_source: Optional[str] = "api"
++
++
++class CrmCallSelectedRequest(BaseModel):
++    phones: list
++    business_name: str = "our company"
++    service_type: str = "our service"
++    campaign_name: str = "Selected CRM Leads"
++    call_delay_seconds: int = 15
++    agent_profile_id: Optional[str] = None
++    system_prompt: Optional[str] = None
++
++
+ class RecordingCleanupRequest(BaseModel):
+     confirm: Optional[str] = None
+ 
+@@ -633,6 +670,67 @@ async def api_get_contact_calls(phone: str = Query(...)):
+     return {"data": await get_calls_by_phone(phone)}
+ 
+ 
++CRM_EXPORT_COLUMNS = [
++    "lead_name", "phone_number", "email", "city", "location", "requirement", "budget",
++    "source", "business_name", "campaign_name", "service_type", "crm_status",
++    "custom_status", "next_followup_at", "assigned_to", "crm_notes",
++    "last_call_outcome", "last_call_at", "total_calls", "created_at", "updated_at",
++]
++
++
++def _bool_query(value: Optional[str]):
++    if value is None or value == "":
++        return None
++    return str(value).lower() in ("1", "true", "yes", "on")
++
++
++def _crm_filter_dict(**kwargs) -> dict:
++    return {k: v for k, v in kwargs.items() if v not in (None, "")}
++
++
++async def _crm_contacts_from_filters(filters: dict) -> list:
++    return await get_crm_contacts(
++        status=filters.get("status"),
++        outcome=filters.get("outcome"),
++        q=filters.get("q"),
++        due_today=_bool_query(filters.get("due_today")) is True,
++        source=filters.get("source"),
++        business_name=filters.get("business_name"),
++        campaign_name=filters.get("campaign_name"),
++        city=filters.get("city"),
++        date_from=filters.get("date_from"),
++        date_to=filters.get("date_to"),
++        assigned_to=filters.get("assigned_to"),
++        recording_available=_bool_query(filters.get("recording_available")),
++        has_followup=_bool_query(filters.get("has_followup")),
++    )
++
++
++async def _import_leads(leads: list, import_source: str = "api", upload_batch_id: Optional[str] = None) -> dict:
++    inserted = updated = failed = 0
++    errors = []
++    for idx, lead in enumerate(leads, start=1):
++        try:
++            result = await upsert_crm_lead(lead, import_source=import_source, upload_batch_id=upload_batch_id)
++            if result["status"] == "inserted":
++                inserted += 1
++            else:
++                updated += 1
++        except Exception as exc:
++            failed += 1
++            errors.append({"row": idx, "phone": lead.get("phone_number") or lead.get("phone") or "", "error": str(exc)})
++    return {"success": True, "inserted": inserted, "updated": updated, "failed": failed, "errors": errors}
++
++
++def _normalize_upload_row(row: dict) -> dict:
++    aliases = {"phone": "phone_number", "name": "lead_name"}
++    out = {}
++    for key, value in row.items():
++        clean_key = (key or "").strip().lower()
++        out[aliases.get(clean_key, clean_key)] = value
++    return out
++
++
+ @app.get("/api/lead-statuses")
+ async def api_get_lead_statuses():
+     return {"data": await get_lead_statuses()}
+@@ -654,14 +752,175 @@ async def api_delete_lead_status(status_id: str):
+     return {"success": True, "message": "Status deleted"}
+ 
+ 
++@app.post("/api/crm/contacts")
++async def api_add_crm_contact(req: CrmLeadRequest):
++    try:
++        result = await upsert_crm_lead(req.dict(), import_source=req.source or "manual")
++        return {"success": True, **result, "message": "Lead added" if result["status"] == "inserted" else "Lead updated"}
++    except ValueError as exc:
++        raise HTTPException(400, str(exc))
++
++
++@app.post("/api/crm/import-leads")
++async def api_import_crm_leads(req: CrmBulkImportRequest):
++    return await _import_leads(req.leads or [], import_source=req.import_source or "api")
++
++
++@app.post("/api/crm/upload-leads")
++async def api_upload_crm_leads(file: UploadFile = File(...)):
++    name = file.filename or ""
++    content = await file.read()
++    upload_batch_id = str(uuid.uuid4())
++    rows = []
++    try:
++        if name.lower().endswith(".csv"):
++            text = content.decode("utf-8-sig")
++            rows = [_normalize_upload_row(r) for r in csv.DictReader(StringIO(text))]
++        elif name.lower().endswith(".xlsx"):
++            from openpyxl import load_workbook
++            wb = load_workbook(BytesIO(content), read_only=True, data_only=True)
++            ws = wb.active
++            values = list(ws.iter_rows(values_only=True))
++            if values:
++                headers = [str(h or "").strip() for h in values[0]]
++                rows = [_normalize_upload_row(dict(zip(headers, row))) for row in values[1:] if any(v is not None and str(v).strip() for v in row)]
++        else:
++            raise HTTPException(400, "Only .csv and .xlsx files are supported")
++        if rows and not (("phone_number" in rows[0] or "phone" in rows[0]) and ("lead_name" in rows[0] or "name" in rows[0])):
++            raise HTTPException(400, "Required columns: phone_number/phone and lead_name/name")
++        result = await _import_leads(rows, import_source="file_upload", upload_batch_id=upload_batch_id)
++        return {**result, "upload_batch_id": upload_batch_id}
++    except HTTPException:
++        raise
++    except Exception as exc:
++        raise HTTPException(400, f"Upload failed: {exc}")
++
++
++@app.get("/api/crm/sample-leads.csv")
++async def api_sample_leads_csv():
++    rows = [
++        ["lead_name","phone_number","email","city","location","requirement","budget","source","business_name","campaign_name","service_type","crm_status","crm_notes","next_followup_at","assigned_to"],
++        ["Ramesh","+919876543210","ramesh@gmail.com","Chennai","Tambaram","Villa plot","2500000","Facebook","Abhi Properties","Tambaram Villa Plot","Home visit","New","Interested in site visit","",""],
++        ["Suresh","9876543211","suresh@gmail.com","Chennai","Velachery","Apartment","5000000","Website","Abhi Properties","Website Leads","Property consultation","New","Call after 5 PM","",""],
++    ]
++    out = StringIO()
++    csv.writer(out).writerows(rows)
++    out.seek(0)
++    return StreamingResponse(iter([out.getvalue()]), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="sample_leads.csv"'})
++
++
+ @app.get("/api/crm/contacts")
+ async def api_get_crm_contacts(
+     status: Optional[str] = None,
+     outcome: Optional[str] = None,
+     q: Optional[str] = None,
+     due_today: bool = False,
++    source: Optional[str] = None,
++    business_name: Optional[str] = None,
++    campaign_name: Optional[str] = None,
++    city: Optional[str] = None,
++    date_from: Optional[str] = None,
++    date_to: Optional[str] = None,
++    assigned_to: Optional[str] = None,
++    recording_available: Optional[str] = None,
++    has_followup: Optional[str] = None,
++):
++    filters = _crm_filter_dict(status=status, outcome=outcome, q=q, due_today=str(due_today).lower() if due_today else "", source=source, business_name=business_name, campaign_name=campaign_name, city=city, date_from=date_from, date_to=date_to, assigned_to=assigned_to, recording_available=recording_available, has_followup=has_followup)
++    data = await _crm_contacts_from_filters(filters)
++    return {"data": data, "total": len(data), "filters": filters}
++
++
++@app.get("/api/crm/summary")
++async def api_crm_summary():
++    return await get_crm_summary()
++
++
++@app.get("/api/crm/export/leads.csv")
++async def api_export_crm_leads_csv(
++    status: Optional[str] = None, outcome: Optional[str] = None, q: Optional[str] = None, due_today: Optional[str] = None,
++    source: Optional[str] = None, business_name: Optional[str] = None, campaign_name: Optional[str] = None, city: Optional[str] = None,
++    date_from: Optional[str] = None, date_to: Optional[str] = None, assigned_to: Optional[str] = None,
++    recording_available: Optional[str] = None, has_followup: Optional[str] = None,
+ ):
+-    return {"data": await get_crm_contacts(status=status, outcome=outcome, q=q, due_today=due_today)}
++    filters = _crm_filter_dict(status=status, outcome=outcome, q=q, due_today=due_today, source=source, business_name=business_name, campaign_name=campaign_name, city=city, date_from=date_from, date_to=date_to, assigned_to=assigned_to, recording_available=recording_available, has_followup=has_followup)
++    rows = await _crm_contacts_from_filters(filters)
++    out = StringIO()
++    writer = csv.writer(out)
++    writer.writerow(CRM_EXPORT_COLUMNS)
++    for row in rows:
++        writer.writerow([row.get(c, "") for c in CRM_EXPORT_COLUMNS])
++    out.seek(0)
++    return StreamingResponse(iter([out.getvalue()]), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="crm_leads_export.csv"'})
++
++
++@app.get("/api/crm/export/leads.xlsx")
++async def api_export_crm_leads_xlsx(
++    status: Optional[str] = None, outcome: Optional[str] = None, q: Optional[str] = None, due_today: Optional[str] = None,
++    source: Optional[str] = None, business_name: Optional[str] = None, campaign_name: Optional[str] = None, city: Optional[str] = None,
++    date_from: Optional[str] = None, date_to: Optional[str] = None, assigned_to: Optional[str] = None,
++    recording_available: Optional[str] = None, has_followup: Optional[str] = None,
++):
++    from openpyxl import Workbook
++    from openpyxl.styles import Font
++    filters = _crm_filter_dict(status=status, outcome=outcome, q=q, due_today=due_today, source=source, business_name=business_name, campaign_name=campaign_name, city=city, date_from=date_from, date_to=date_to, assigned_to=assigned_to, recording_available=recording_available, has_followup=has_followup)
++    rows = await _crm_contacts_from_filters(filters)
++    wb = Workbook()
++    ws = wb.active
++    ws.title = "CRM Leads"
++    ws.append(CRM_EXPORT_COLUMNS)
++    for cell in ws[1]:
++        cell.font = Font(bold=True)
++    for row in rows:
++        ws.append([row.get(c, "") for c in CRM_EXPORT_COLUMNS])
++    for column in ws.columns:
++        width = max(len(str(cell.value or "")) for cell in column)
++        ws.column_dimensions[column[0].column_letter].width = min(max(width + 2, 12), 50)
++    stream = BytesIO()
++    wb.save(stream)
++    stream.seek(0)
++    return StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": 'attachment; filename="crm_leads_export.xlsx"'})
++
++
++@app.get("/api/crm/contacts/{phone}")
++async def api_get_crm_contact_detail(phone: str):
++    detail = await get_crm_contact_detail(phone)
++    if not detail.get("contact"):
++        raise HTTPException(404, "CRM contact not found")
++    return detail
++
++
++@app.post("/api/crm/call-selected")
++async def api_call_selected(req: CrmCallSelectedRequest):
++    contacts = []
++    failed = 0
++    for phone in req.phones or []:
++        try:
++            clean = normalize_phone(phone)
++            contact = await get_crm_contact_by_phone(clean)
++            if not contact:
++                failed += 1
++                continue
++            contacts.append({
++                "phone": clean,
++                "lead_name": contact.get("lead_name") or "there",
++                "business_name": req.business_name or contact.get("business_name") or "our company",
++                "service_type": req.service_type or contact.get("service_type") or "our service",
++            })
++        except Exception:
++            failed += 1
++    if not contacts:
++        raise HTTPException(400, "No valid leads selected")
++    campaign_id = await create_campaign(
++        req.campaign_name or "Selected CRM Leads",
++        json.dumps(contacts),
++        "once",
++        "09:00",
++        req.call_delay_seconds or 15,
++        req.system_prompt,
++        req.agent_profile_id,
++    )
++    asyncio.create_task(_run_campaign(campaign_id))
++    return {"success": True, "dispatched": len(contacts), "failed": failed, "message": "Selected lead calling started"}
+ 
+ 
+ @app.patch("/api/crm/contacts/{phone}/status")
+diff --git a/supabase_schema.sql b/supabase_schema.sql
+index 02b279e..1a1fe49 100644
+--- a/supabase_schema.sql
++++ b/supabase_schema.sql
+@@ -119,3 +119,22 @@ CREATE TABLE IF NOT EXISTS crm_contacts (
+ ALTER TABLE crm_contacts DISABLE ROW LEVEL SECURITY;
+ CREATE INDEX IF NOT EXISTS idx_crm_contacts_status ON crm_contacts (crm_status);
+ CREATE INDEX IF NOT EXISTS idx_crm_contacts_followup ON crm_contacts (next_followup_at);
++
++ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS email text;
++ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS city text;
++ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS location text;
++ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS requirement text;
++ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS budget text;
++ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS source text DEFAULT 'manual';
++ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS business_name text;
++ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS campaign_name text;
++ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS service_type text;
++ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS upload_batch_id text;
++ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS import_source text;
++ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS last_synced_at timestamptz;
++
++CREATE INDEX IF NOT EXISTS idx_crm_contacts_source ON crm_contacts(source);
++CREATE INDEX IF NOT EXISTS idx_crm_contacts_business_name ON crm_contacts(business_name);
++CREATE INDEX IF NOT EXISTS idx_crm_contacts_campaign_name ON crm_contacts(campaign_name);
++CREATE INDEX IF NOT EXISTS idx_crm_contacts_city ON crm_contacts(city);
++CREATE INDEX IF NOT EXISTS idx_crm_contacts_created_at ON crm_contacts(created_at);
+diff --git a/ui/index.html b/ui/index.html
+index b7bb044..26c4d23 100644
+--- a/ui/index.html
++++ b/ui/index.html
+@@ -20,7 +20,7 @@
+ <section id="prompt" class="panel"><div class="card"><h2>✏️ AI Prompt</h2><textarea id="prompt-text" style="min-height:460px"></textarea><div class="row"><span id="prompt-count" class="muted"></span><button class="primary" onclick="savePrompt()">Save</button><button class="danger" onclick="resetPrompt()">Reset</button></div></div></section>
+ <section id="appointments" class="panel"><div class="card"><h2>📅 Appointments</h2><div class="row"><input id="appt-date" type="date"><button onclick="loadAppointments()">Filter</button></div><div id="appt-list"></div></div></section>
+ <section id="calls" class="panel"><div class="card"><h2>📝 Call Logs</h2><div class="row"><button class="primary" onclick="exportCalls('xlsx')">Export Excel</button><button onclick="exportCalls('csv')">Export CSV</button></div><div id="calls-list"></div><div class="row"><button onclick="loadCalls(callPage-1)">Prev</button><span id="call-page"></span><button onclick="loadCalls(callPage+1)">Next</button></div></div></section>
+-<section id="crm" class="panel"><div class="grid cols-2"><div class="card"><h2>👥 CRM</h2><div class="grid cols-2"><input id="crm-q" placeholder="Search name or phone"><select id="crm-status-filter"></select><select id="crm-outcome-filter"><option value="">All outcomes</option></select><label><input id="crm-due-today" type="checkbox" style="width:auto"> Due today</label></div><div class="row"><button onclick="loadCRM()">Apply Filters</button><button onclick="resetCRMFilters()">Reset</button></div><div id="crm-list"></div><hr style="border-color:var(--border);margin:18px 0"><h3>Status Manager</h3><div class="grid cols-3"><input id="new-status-name" placeholder="Status name"><input id="new-status-color" type="color" value="#00ff88"><button onclick="addLeadStatusUI()">Add Status</button></div><div id="status-list"></div></div><div class="card"><h2>Contact Detail</h2><div id="crm-detail" class="muted">Select a contact.</div></div></div></section>
++<section id="crm" class="panel"><div class="grid cols-2"><div class="card"><h2>👥 CRM</h2><div id="crm-summary" class="grid cols-4"></div><h3>Upload Leads</h3><div class="row"><input id="lead-upload-file" type="file" accept=".csv,.xlsx"><button class="primary" onclick="uploadLeads()">Upload</button><button onclick="location.href='/api/crm/sample-leads.csv'">Download Sample CSV</button></div><p id="lead-upload-result" class="muted"></p><h3>Manual Add Lead</h3><div class="grid cols-3"><input id="lead-name" placeholder="Lead Name"><input id="lead-phone" placeholder="Phone Number"><input id="lead-email" placeholder="Email"><input id="lead-city" placeholder="City"><input id="lead-location" placeholder="Location"><input id="lead-requirement" placeholder="Requirement"><input id="lead-budget" placeholder="Budget"><input id="lead-source" placeholder="Source"><input id="lead-business" placeholder="Business Name"><input id="lead-campaign" placeholder="Campaign Name"><input id="lead-service" placeholder="Service Type"><textarea id="lead-notes" placeholder="Notes"></textarea></div><button class="primary" onclick="addManualLead()">Add Lead</button><h3>Filters</h3><div class="grid cols-3"><input id="crm-q" placeholder="Search name or phone"><select id="crm-status-filter"></select><select id="crm-outcome-filter"><option value="">All outcomes</option></select><input id="crm-source-filter" placeholder="Source"><input id="crm-business-filter" placeholder="Business Name"><input id="crm-campaign-filter" placeholder="Campaign Name"><input id="crm-city-filter" placeholder="City"><label><input id="crm-due-today" type="checkbox" style="width:auto"> Due today</label></div><div class="row"><button onclick="loadCRM()">Apply Filter</button><button onclick="resetCRMFilters()">Reset</button><button onclick="exportCrmLeads('xlsx')">Download Filtered Leads Excel</button><button onclick="exportCrmLeads('csv')">Download Filtered Leads CSV</button></div><div class="row"><button class="primary" onclick="callSelectedLeads()">Start Calling Selected Leads</button><button onclick="markSelectedStatus('Hot Lead')">Mark Selected as Hot Lead</button><button onclick="markSelectedStatus('Not Interested')">Mark Selected as Not Interested</button></div><div id="crm-list"></div><hr style="border-color:var(--border);margin:18px 0"><h3>Status Manager</h3><div class="grid cols-3"><input id="new-status-name" placeholder="Status name"><input id="new-status-color" type="color" value="#00ff88"><button onclick="addLeadStatusUI()">Add Status</button></div><div id="status-list"></div></div><div class="card"><h2>Lead Detail</h2><div id="crm-detail" class="muted">Select a contact.</div></div></div></section>
+ <section id="settings" class="panel"><div class="card"><h2>⚙️ Settings</h2><div id="settings-groups" class="grid cols-2"></div></div><div class="card" style="margin-top:16px"><h2>Recording Storage & Retention</h2><div class="grid cols-3"><div><label>Auto delete old recordings</label><select id="rec-auto"><option value="false">OFF</option><option value="true">ON</option></select></div><div><label>Keep recordings for days</label><input id="rec-days" type="number" min="1" value="7"></div><div><label>Cleanup time</label><input id="rec-time" type="time" value="02:00"></div></div><div class="row" style="margin-top:12px"><button class="primary" onclick="saveRecordingSettings()">Save Settings</button><button onclick="loadRecordingStorage()">Refresh Storage Usage</button><button class="danger" onclick="cleanupRecordingsNow()">Delete Old Recordings Now</button></div><div id="recording-storage" class="row" style="margin-top:12px"></div></div><div class="card" style="margin-top:16px"><h2>Danger Zone / Clear Records</h2><p class="muted">These actions permanently delete selected records. Settings and agent profiles are not cleared.</p><div class="row" style="margin-top:12px"><button class="danger" onclick="clearAdminRecords('call-logs')">Clear Call Logs</button><button class="danger" onclick="clearAdminRecords('error-logs')">Clear Error Logs</button><button class="danger" onclick="clearAdminRecords('contact-memory')">Clear CRM Memory</button><button class="danger" onclick="clearAdminRecords('appointments')">Clear Appointments</button><button class="danger" onclick="clearAdminRecords('campaigns')">Clear Campaigns</button><button class="danger" onclick="clearAdminRecords('all-test-data',true)">Clear All Test Data</button></div></div></section>
+ <section id="logs" class="panel"><div class="card"><h2>📋 Logs</h2><div class="row"><select id="log-level"><option value="">all</option><option>info</option><option>warning</option><option>error</option></select><input id="log-source" placeholder="source"><button onclick="loadLogs()">Refresh</button><button class="danger" onclick="clearLogs()">Clear</button><button onclick="logsPaused=!logsPaused;this.textContent=logsPaused?'Resume':'Pause'">Pause</button></div><div id="log-box" class="logbox"></div></div></section>
+ <section id="setup" class="panel"><div class="grid cols-2"><div class="card"><h2>🔧 Quick Start</h2><ol><li>Run <code>supabase_schema.sql</code> in Supabase SQL Editor.</li><li>Fill Settings and save credentials.</li><li>Create SIP trunk.</li><li>Create an agent profile.</li><li>Test a single call.</li></ol></div><div class="card"><h2>Cost Breakdown</h2><table><tr><th>Service</th><th>Cost/min</th></tr><tr><td>Vobiz SIP</td><td>₹1.00</td></tr><tr><td>LiveKit</td><td>₹0.17</td></tr><tr><td>Gemini Live</td><td>₹0.03</td></tr><tr><td><b>Total</b></td><td><b>≈ ₹1.20</b></td></tr></table></div></div></section>
+@@ -42,6 +42,19 @@ function voiceOptions(){return `<optgroup label="Female voices"><option value="A
+ async function loadAgentProfiles(){let profiles=[];try{const raw=await api('/api/agent-profiles');profiles=Array.isArray(raw)?raw:[]}catch(e){}const opts='<option value="">Default/global</option>'+profiles.map(p=>`<option value="${p.id}">${esc(p.name)}${p.is_default?' ★':''}</option>`).join('');['f-agent-profile','bc-agent-profile','camp-agent-profile'].forEach(id=>$(id).innerHTML=opts);$('agent-list').innerHTML=table(profiles,['name','voice','model','is_default'],r=>`<button onclick="editAgentProfile('${r.id}')">Edit</button><button onclick="setDefaultAgentProfile('${r.id}','${esc(r.name)}')">★ Default</button><button class="danger" onclick="deleteAgentProfile('${r.id}','${esc(r.name)}')">Delete</button>`)}window.saveAgentProfile=async()=>{let id=$('agent-id').value;let body={name:$('agent-name').value,voice:$('agent-voice').value,model:$('agent-model').value,enabled_tools:$('agent-tools').value,system_prompt:$('agent-prompt').value,is_default:$('agent-default').checked};await api(`/api/agent-profiles${id?'/'+id:''}`,{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Profile saved');resetAgentForm();loadAgentProfiles()};window.editAgentProfile=async id=>{let p=await api('/api/agent-profiles/'+id);$('agent-id').value=p.id;$('agent-name').value=p.name;$('agent-voice').value=p.voice;$('agent-model').value=p.model;$('agent-tools').value=p.enabled_tools||'[]';$('agent-prompt').value=p.system_prompt||'';$('agent-default').checked=!!p.is_default};window.deleteAgentProfile=async id=>{if(confirm('Delete profile?')){await apiDel('/api/agent-profiles/'+id);loadAgentProfiles()}};window.setDefaultAgentProfile=async id=>{await apiPost(`/api/agent-profiles/${id}/set-default`,{});loadAgentProfiles()};window.resetAgentForm=()=>['agent-id','agent-name','agent-prompt'].forEach(id=>$(id).value='')
+ async function loadPrompt(){const p=await api('/api/prompt');$('prompt-text').value=p.prompt;$('prompt-count').textContent=p.prompt.length+' chars'}window.savePrompt=async()=>{await apiPost('/api/prompt',{prompt:$('prompt-text').value});toast('Prompt saved')};window.resetPrompt=async()=>{await apiDel('/api/prompt');loadPrompt()};$('prompt-text').oninput=()=>$('prompt-count').textContent=$('prompt-text').value.length+' chars';
+ async function loadAppointments(){const q=$('appt-date').value?'?date='+$('appt-date').value:'';$('appt-list').innerHTML=table(await api('/api/appointments'+q),['name','phone','date','time','service','status'],r=>`<button class="danger" onclick="cancelAppointment('${r.id}')">Cancel</button>`)}window.cancelAppointment=async id=>{await apiDel('/api/appointments/'+id);loadAppointments()};async function loadCalls(page=1){if(page<1)return;callPage=page;const rows=await api(`/api/calls?page=${page}&limit=20`);$('call-page').textContent='Page '+page;$('calls-list').innerHTML=table(rows,['phone_number','lead_name','outcome','duration_seconds','timestamp','recording_url'],r=>`<textarea id="notes-${r.id}">${esc(r.notes||'')}</textarea><button onclick="saveNotes('${r.id}')">Save Notes</button>`)}window.saveNotes=async id=>{await fetch(`/api/calls/${id}/notes`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({notes:$('notes-'+id).value})});toast('Notes saved')};async function loadLeadStatuses(){let r=await api('/api/lead-statuses');leadStatuses=r.data||[];const opts='<option value="">All CRM statuses</option>'+leadStatuses.map(s=>`<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');$('crm-status-filter').innerHTML=opts;$('status-list').innerHTML=table(leadStatuses,['name','color'],s=>`<button class="danger" onclick="deleteLeadStatus('${s.id}')">Delete</button>`)}async function loadCRM(){const selectedStatus=$('crm-status-filter').value,selectedOutcome=$('crm-outcome-filter').value;await loadLeadStatuses();$('crm-status-filter').value=selectedStatus;const p=new URLSearchParams();if($('crm-q').value)p.set('q',$('crm-q').value);if(selectedStatus)p.set('status',selectedStatus);if(selectedOutcome)p.set('outcome',selectedOutcome);if($('crm-due-today').checked)p.set('due_today','true');let r=await api('/api/crm/contacts?'+p.toString());crmContacts=r.data||[];const outcomes=[...new Set(crmContacts.map(c=>c.last_call_outcome).filter(Boolean))];$('crm-outcome-filter').innerHTML='<option value="">All outcomes</option>'+outcomes.map(o=>`<option value="${esc(o)}">${esc(o)}</option>`).join('');$('crm-outcome-filter').value=selectedOutcome;$('crm-list').innerHTML=table(crmContacts,['phone_number','lead_name','crm_status','last_call_outcome','total_calls','next_followup_at'],x=>`<button onclick="loadContactDetail('${x.phone_number}')">Open</button>`)}window.resetCRMFilters=()=>{$('crm-q').value='';$('crm-status-filter').value='';$('crm-outcome-filter').value='';$('crm-due-today').checked=false;loadCRM()};window.loadContactDetail=async phone=>{const contact=crmContacts.find(c=>c.phone_number===phone)||{phone_number:phone};let calls=await api('/api/crm/calls?phone='+encodeURIComponent(phone));let statusOptions=leadStatuses.map(s=>`<option value="${esc(s.name)}" ${s.name===(contact.crm_status||'New')?'selected':''}>${esc(s.name)}</option>`).join('');$('crm-detail').innerHTML=`<div class="grid cols-2"><div><label>CRM Status</label><select id="detail-status">${statusOptions}</select></div><div><label>Custom Status</label><input id="detail-custom" value="${esc(contact.custom_status||'')}"></div><div><label>Next Follow-up</label><input id="detail-followup" type="datetime-local" value="${esc((contact.next_followup_at||'').slice(0,16))}"></div><div class="row"><button class="primary" onclick="saveCrmStatus('${phone}')">Save Status</button><button onclick="saveCrmFollowup('${phone}')">Save Follow-up</button></div><div style="grid-column:1/-1"><label>CRM Notes</label><textarea id="detail-notes">${esc(contact.crm_notes||'')}</textarea><button onclick="saveCrmNotes('${phone}')">Save Notes</button></div></div><h3 style="margin-top:16px">Call History</h3>${table(calls.data||[])}`};window.saveCrmStatus=async phone=>{await fetch('/api/crm/contacts/'+encodeURIComponent(phone)+'/status',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({crm_status:$('detail-status').value,custom_status:$('detail-custom').value||null})});toast('CRM status saved');loadCRM()};window.saveCrmFollowup=async phone=>{await fetch('/api/crm/contacts/'+encodeURIComponent(phone)+'/followup',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({next_followup_at:$('detail-followup').value||null})});toast('Follow-up saved');loadCRM()};window.saveCrmNotes=async phone=>{await fetch('/api/crm/contacts/'+encodeURIComponent(phone)+'/notes',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({crm_notes:$('detail-notes').value})});toast('CRM notes saved');loadCRM()};window.addLeadStatusUI=async()=>{await api('/api/lead-statuses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('new-status-name').value,color:$('new-status-color').value})});$('new-status-name').value='';toast('Status added');loadCRM()};window.deleteLeadStatus=async id=>{if(confirm('Delete this status?')){await apiDel('/api/lead-statuses/'+id);toast('Status deleted');loadCRM()}}
++function selectedLeadPhones(){return Array.from(document.querySelectorAll('.lead-select:checked')).map(x=>x.value)}
++function crmFilterParams(){const p=new URLSearchParams();[['q','crm-q'],['status','crm-status-filter'],['outcome','crm-outcome-filter'],['source','crm-source-filter'],['business_name','crm-business-filter'],['campaign_name','crm-campaign-filter'],['city','crm-city-filter']].forEach(([k,id])=>{if($(id)?.value)p.set(k,$(id).value)});if($('crm-due-today')?.checked)p.set('due_today','true');return p}
++async function loadCrmSummary(){try{const s=await api('/api/crm/summary');$('crm-summary').innerHTML=[['Total',s.total_leads],['New',s.new_leads],['Hot',s.hot_leads],['Due Today',s.due_today],['No Answer',s.no_answer],['Booked',s.booked],['Won',s.closed_won]].map(x=>`<div class="card"><div>${x[0]}</div><div class="kpi">${x[1]||0}</div></div>`).join('')}catch(e){}}
++loadCRM=async function(){await loadLeadStatuses();const selectedStatus=$('crm-status-filter').value,selectedOutcome=$('crm-outcome-filter').value;const p=crmFilterParams();let r=await api('/api/crm/contacts?'+p.toString());crmContacts=r.data||[];$('crm-status-filter').value=selectedStatus;$('crm-outcome-filter').value=selectedOutcome;const outcomes=[...new Set(crmContacts.map(c=>c.last_call_outcome).filter(Boolean))];$('crm-outcome-filter').innerHTML='<option value="">All outcomes</option>'+outcomes.map(o=>`<option value="${esc(o)}">${esc(o)}</option>`).join('');$('crm-outcome-filter').value=selectedOutcome;$('crm-list').innerHTML=leadTable(crmContacts);loadCrmSummary()}
++function leadTable(rows){if(!rows.length)return '<p class="muted">No leads.</p>';return `<table><thead><tr><th></th><th>Name</th><th>Phone</th><th>City</th><th>Source</th><th>Business</th><th>Campaign</th><th>Status</th><th>Outcome</th><th>Calls</th><th>Follow-up</th><th>Actions</th></tr></thead><tbody>${rows.map(r=>`<tr><td><input class="lead-select" type="checkbox" value="${esc(r.phone_number)}"></td><td>${esc(r.lead_name||'')}</td><td>${esc(r.phone_number||'')}</td><td>${esc(r.city||'')}</td><td>${esc(r.source||'')}</td><td>${esc(r.business_name||'')}</td><td>${esc(r.campaign_name||'')}</td><td>${esc(r.crm_status||'')}</td><td>${esc(r.last_call_outcome||'')}</td><td>${esc(r.total_calls||0)}</td><td>${esc(r.next_followup_at||'')}</td><td><button onclick="loadContactDetail('${r.phone_number}')">Open</button><button onclick="window.open('https://wa.me/${String(r.phone_number||'').replace('+','')}')">WhatsApp</button><button onclick="callOneLead('${r.phone_number}')">Call now</button></td></tr>`).join('')}</tbody></table>`}
++window.resetCRMFilters=()=>['crm-q','crm-source-filter','crm-business-filter','crm-campaign-filter','crm-city-filter'].forEach(id=>$(id).value='')||($('crm-status-filter').value='')||($('crm-outcome-filter').value='')||($('crm-due-today').checked=false)||loadCRM()
++window.loadContactDetail=async phone=>{const d=await api('/api/crm/contacts/'+encodeURIComponent(phone));const c=d.contact||{};let statusOptions=leadStatuses.map(s=>`<option value="${esc(s.name)}" ${s.name===(c.crm_status||'New')?'selected':''}>${esc(s.name)}</option>`).join('');$('crm-detail').innerHTML=`<p><b>${esc(c.lead_name||'')}</b> ${esc(c.phone_number||'')}</p><p>${esc([c.email,c.city,c.location,c.requirement,c.budget].filter(Boolean).join(' | '))}</p><div class="grid cols-2"><div><label>CRM Status</label><select id="detail-status">${statusOptions}</select></div><div><label>Custom Status</label><input id="detail-custom" value="${esc(c.custom_status||'')}"></div><div><label>Next Follow-up</label><input id="detail-followup" type="datetime-local" value="${esc((c.next_followup_at||'').slice(0,16))}"></div><div><label>WhatsApp</label><button onclick="window.open('https://wa.me/${String(c.phone_number||'').replace('+','')}')">Open WhatsApp</button></div><div style="grid-column:1/-1"><label>CRM Notes</label><textarea id="detail-notes">${esc(c.crm_notes||'')}</textarea></div></div><div class="row"><button class="primary" onclick="saveCrmStatus('${phone}')">Save Status</button><button onclick="saveCrmFollowup('${phone}')">Save Follow-up</button><button onclick="saveCrmNotes('${phone}')">Save Notes</button></div><h3>Call History</h3>${table(d.calls||[])}<h3>Appointments</h3>${table(d.appointments||[])}`
++async function addManualLead(){const body={lead_name:$('lead-name').value,phone_number:$('lead-phone').value,email:$('lead-email').value,city:$('lead-city').value,location:$('lead-location').value,requirement:$('lead-requirement').value,budget:$('lead-budget').value,source:$('lead-source').value||'manual',business_name:$('lead-business').value,campaign_name:$('lead-campaign').value,service_type:$('lead-service').value,crm_status:$('crm-status-filter').value||'New',crm_notes:$('lead-notes').value};const r=await api('/api/crm/contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast(r.message);loadCRM()}
++async function uploadLeads(){const f=$('lead-upload-file').files[0];if(!f){toast('Choose a CSV or Excel file','err');return}const fd=new FormData();fd.append('file',f);const r=await api('/api/crm/upload-leads',{method:'POST',body:fd});$('lead-upload-result').textContent=`Inserted ${r.inserted}, updated ${r.updated}, failed ${r.failed}`;loadCRM()}
++function exportCrmLeads(format){window.location.href='/api/crm/export/leads.'+format+'?'+crmFilterParams().toString()}
++async function callOneLead(phone){await api('/api/crm/call-selected',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phones:[phone]})});toast('Calling started')}
++async function callSelectedLeads(){const phones=selectedLeadPhones();if(!phones.length){toast('Select leads first','err');return}const r=await api('/api/crm/call-selected',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phones})});toast(`${r.dispatched} calls started, ${r.failed} failed`)}
++async function markSelectedStatus(status){const phones=selectedLeadPhones();for(const phone of phones){await fetch('/api/crm/contacts/'+encodeURIComponent(phone)+'/status',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({crm_status:status})})}toast('Selected leads updated');loadCRM()}
+ function exportCalls(format){window.location.href='/api/export/calls.'+format}
+ async function clearAdminRecords(kind,all=false){const msg=all?'This will delete call logs, appointments, CRM memory, campaigns, and error logs. Continue?':'Are you sure? This action cannot be undone.';if(!confirm(msg))return;try{const r=await api('/api/admin/clear/'+kind,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:'CLEAR_RECORDS'})});toast(r.message||'Records cleared');loadStats();loadCalls();loadAppointments();loadCampaigns();loadCRM();loadLogs()}catch(e){toast(e.message,'err')}}
+ async function loadRecordingStorage(){try{const d=await api('/api/recordings/storage');$('recording-storage').innerHTML=[`<span class="badge">Total: ${d.total_recordings}</span>`,`<span class="badge">Active: ${d.active_recordings}</span>`,`<span class="badge">Deleted: ${d.deleted_recordings}</span>`,`<span class="badge">Size: ${d.total_size_mb} MB / ${d.total_size_gb} GB</span>`,`<span class="badge">Retention: ${d.retention_days} days</span>`,`<span class="badge">Auto delete: ${d.auto_delete_enabled?'ON':'OFF'}</span>`].join('')+(d.size_tracking_note?`<p class="muted">${d.size_tracking_note}</p>`:'')}catch(e){$('recording-storage').innerHTML=`<span class="err">${esc(e.message)}</span>`}}async function saveRecordingSettings(){await apiPost('/api/settings',{settings:{RECORDING_AUTO_DELETE_ENABLED:$('rec-auto').value,RECORDING_RETENTION_DAYS:$('rec-days').value,RECORDING_CLEANUP_TIME:$('rec-time').value}});toast('Recording retention saved');loadRecordingStorage()}async function cleanupRecordingsNow(){if(!confirm('This will permanently delete old call recordings from Cloudflare R2. Continue?'))return;try{const r=await api('/api/recordings/cleanup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:'DELETE_OLD_RECORDINGS'})});toast(`${r.deleted} recordings deleted, ${r.failed} failed`);loadRecordingStorage();loadCalls()}catch(e){toast(e.message,'err')}}

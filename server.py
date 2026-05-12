@@ -53,6 +53,8 @@ from db import (
     update_campaign_contacts, update_campaign_run_stats, update_campaign_status,
     update_crm_contact_followup, update_crm_contact_full, update_crm_contact_notes,
     update_crm_contact_status,
+    get_knowledge_base, save_knowledge_base, get_kb_section, save_kb_section,
+    _KB_SECTIONS,
 )
 from prompts import (
     DEFAULT_SYSTEM_PROMPT,
@@ -60,6 +62,8 @@ from prompts import (
     get_default_prompt,
     get_prompt_label,
     build_prompt_for_type,
+    build_knowledge_context,
+    get_kb_prompt_prefix,
 )
 
 load_dotenv(".env", override=False)
@@ -794,16 +798,19 @@ async def resolve_ai_prompt(
     """
     Resolve final prompt for a call.
     Priority: saved AI_PROMPT_{type} → built-in default for type → fallback type.
+    KB context is prepended when knowledge base has content.
     Returns an interpolated prompt string ready to pass to Gemini.
     """
     resolved_type = call_type if call_type in _VALID_PROMPT_TYPES else fallback
     saved = await get_setting(_AI_PROMPT_KEY.format(resolved_type), "")
+    kb = await get_knowledge_base()
     return build_prompt_for_type(
         prompt_type=resolved_type,
         lead_name=lead_name,
         business_name=business_name,
         service_type=service_type,
         saved_text=saved or None,
+        kb=kb,
     )
 
 
@@ -893,6 +900,165 @@ async def api_reset_ai_prompt(prompt_type: str):
         "type": prompt_type,
         "prompt": get_default_prompt(prompt_type),
     }
+
+
+# ── Knowledge Base API endpoints ─────────────────────────────────────────────
+
+_KB_SAMPLE = {
+    "company_profile": {
+        "business_name": "Demo Business",
+        "legal_name": "",
+        "short_description": "Professional customer support and appointment services.",
+        "about_us": "We provide professional customer support and appointment booking services for individuals and businesses.",
+        "industry_type": "Local Services",
+        "owner_name": "",
+        "website": "",
+        "email": "info@demobusiness.com",
+        "phone": "",
+        "whatsapp_number": "",
+    },
+    "working_hours": {
+        "timezone": "Asia/Kolkata",
+        "opening_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+        "opening_time": "09:00",
+        "closing_time": "18:00",
+        "holiday_notes": "Closed on national holidays.",
+        "emergency_support_available": False,
+    },
+    "faqs": [
+        {"question": "What are your working hours?", "answer": "We are open Monday to Saturday, 9 AM to 6 PM.", "category": "General", "language": "English", "active": True},
+        {"question": "How can I book an appointment?", "answer": "You can book an appointment by calling us or through our AI assistant.", "category": "Booking", "language": "English", "active": True},
+        {"question": "What is your cancellation policy?", "answer": "You can cancel or reschedule up to 24 hours before your appointment at no charge.", "category": "Policy", "language": "English", "active": True},
+    ],
+    "appointment_rules": {
+        "appointment_required": True,
+        "allow_same_day_booking": True,
+        "appointment_duration_minutes": 30,
+        "appointment_buffer_minutes": 15,
+        "default_visit_type": "phone_consultation",
+        "confirmation_required": True,
+        "reminder_before_hours": 24,
+    },
+}
+
+
+@app.get("/api/knowledge-base")
+async def api_get_knowledge_base():
+    return await get_knowledge_base()
+
+
+@app.post("/api/knowledge-base")
+async def api_save_knowledge_base(req: Request):
+    try:
+        data = await req.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Body must be a JSON object")
+    saved = await save_knowledge_base(data)
+    return {"status": "saved", "sections_saved": [k for k in data if k in _KB_SECTIONS]}
+
+
+@app.get("/api/knowledge-base/search")
+async def api_search_knowledge_base(q: str = Query(default="")):
+    if not q or not q.strip():
+        return {"results": []}
+    kb = await get_knowledge_base()
+    query = q.strip().lower()
+    results = []
+
+    # Search FAQs
+    for faq in (kb.get("faqs") or []):
+        score = 0
+        question = (faq.get("question") or "").lower()
+        answer = (faq.get("answer") or "").lower()
+        for word in query.split():
+            if word in question:
+                score += 2
+            if word in answer:
+                score += 1
+        if score > 0:
+            results.append({"section": "faqs", "title": faq.get("question", ""), "answer": faq.get("answer", ""), "score": score})
+
+    # Search services
+    for svc in (kb.get("services") or []):
+        score = 0
+        text = " ".join(str(svc.get(k, "")) for k in ("name", "category", "description")).lower()
+        for word in query.split():
+            if word in text:
+                score += 2
+        if score > 0:
+            results.append({"section": "services", "title": svc.get("name", ""), "answer": svc.get("description", ""), "score": score})
+
+    # Search packages
+    for pkg in (kb.get("packages") or []):
+        score = 0
+        text = " ".join(str(pkg.get(k, "")) for k in ("package_name", "description", "included_items")).lower()
+        for word in query.split():
+            if word in text:
+                score += 2
+        if score > 0:
+            results.append({"section": "packages", "title": pkg.get("package_name", ""), "answer": pkg.get("description", ""), "score": score})
+
+    # Search about us / policies
+    cp = kb.get("company_profile") or {}
+    about = (cp.get("about_us") or "").lower()
+    if about:
+        score = sum(2 for w in query.split() if w in about)
+        if score > 0:
+            results.append({"section": "about_us", "title": "About Us", "answer": cp.get("about_us", ""), "score": score})
+
+    pol = kb.get("policies") or {}
+    for k, label in [("cancellation_policy", "Cancellation Policy"), ("refund_policy", "Refund Policy"),
+                     ("appointment_policy", "Appointment Policy"), ("payment_policy", "Payment Policy")]:
+        val = (pol.get(k) or "").lower()
+        if val:
+            score = sum(2 for w in query.split() if w in val)
+            if score > 0:
+                results.append({"section": "policies", "title": label, "answer": pol.get(k, ""), "score": score})
+
+    # Search locations
+    for loc in (kb.get("locations") or []):
+        text = " ".join(str(loc.get(k, "")) for k in ("branch_name", "address", "city")).lower()
+        score = sum(2 for w in query.split() if w in text)
+        if score > 0:
+            results.append({"section": "locations", "title": loc.get("branch_name", ""), "answer": f"{loc.get('address','')} {loc.get('city','')}", "score": score})
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return {"query": q, "results": results[:10]}
+
+
+@app.get("/api/knowledge-base/preview")
+async def api_kb_preview():
+    kb = await get_knowledge_base()
+    context = build_knowledge_context(kb)
+    return {"preview": context, "char_count": len(context)}
+
+
+@app.post("/api/knowledge-base/sample")
+async def api_kb_load_sample():
+    saved = await save_knowledge_base(_KB_SAMPLE)
+    return {"status": "sample_loaded", "sections": list(_KB_SAMPLE.keys())}
+
+
+@app.get("/api/knowledge-base/{section}")
+async def api_get_kb_section(section: str):
+    if section not in _KB_SECTIONS:
+        raise HTTPException(404, f"Unknown section: {section}. Valid: {_KB_SECTIONS}")
+    data = await get_kb_section(section)
+    return {"section": section, "data": data}
+
+
+@app.post("/api/knowledge-base/{section}")
+async def api_save_kb_section(section: str, req: Request):
+    if section not in _KB_SECTIONS:
+        raise HTTPException(400, f"Unknown section: {section}. Valid: {_KB_SECTIONS}")
+    try:
+        data = await req.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+    await save_kb_section(section, data)
+    return {"status": "saved", "section": section}
 
 
 @app.get("/api/settings")

@@ -259,20 +259,201 @@ def get_prompt_label(prompt_type: str) -> str:
     return entry[0] if entry else prompt_type.replace("_", " ").title()
 
 
+def build_knowledge_context(kb: dict, max_chars: int = 4000) -> str:
+    """
+    Convert a Knowledge Base dict into a clean text block suitable for injection
+    into Gemini prompts.  Truncated to max_chars to stay within context limits.
+    Returns an empty string if the KB is empty / has no useful content.
+    """
+    if not kb or not isinstance(kb, dict):
+        return ""
+
+    lines: list = []
+
+    # Company
+    cp = kb.get("company_profile") or {}
+    if cp.get("business_name"):
+        lines.append(f"[COMPANY KNOWLEDGE BASE]")
+        lines.append(f"Business: {cp.get('business_name','')}")
+        if cp.get("industry_type"):
+            lines.append(f"Industry: {cp['industry_type']}")
+        if cp.get("short_description"):
+            lines.append(f"Description: {cp['short_description']}")
+        if cp.get("about_us"):
+            lines.append(f"About: {cp['about_us']}")
+        if cp.get("website"):
+            lines.append(f"Website: {cp['website']}")
+        if cp.get("email"):
+            lines.append(f"Email: {cp['email']}")
+
+    # Contact
+    cd = kb.get("contact_details") or {}
+    contact_bits = []
+    for f in ("primary_phone", "support_phone", "whatsapp_number", "email", "address", "city", "state"):
+        if cd.get(f):
+            contact_bits.append(f"{f.replace('_', ' ').title()}: {cd[f]}")
+    if cd.get("google_maps_link"):
+        contact_bits.append(f"Maps: {cd['google_maps_link']}")
+    if contact_bits:
+        lines.append("")
+        lines.append("[CONTACT]")
+        lines.extend(contact_bits)
+
+    # Working hours
+    wh = kb.get("working_hours") or {}
+    if wh.get("opening_time") or wh.get("opening_days"):
+        lines.append("")
+        lines.append("[WORKING HOURS]")
+        days = wh.get("opening_days")
+        if isinstance(days, list):
+            days = ", ".join(days)
+        if days:
+            lines.append(f"Days: {days}")
+        if wh.get("opening_time") and wh.get("closing_time"):
+            lines.append(f"Hours: {wh['opening_time']} – {wh['closing_time']}")
+        if wh.get("timezone"):
+            lines.append(f"Timezone: {wh['timezone']}")
+        if wh.get("holiday_notes"):
+            lines.append(f"Holidays: {wh['holiday_notes']}")
+        if wh.get("emergency_support_available"):
+            lines.append("Emergency support: Available")
+
+    # Services
+    services = [s for s in (kb.get("services") or []) if s.get("active", True) and s.get("name")]
+    if services:
+        lines.append("")
+        lines.append("[SERVICES / PRODUCTS]")
+        for s in services[:10]:
+            parts = [s["name"]]
+            if s.get("category"):
+                parts.append(f"({s['category']})")
+            if s.get("description"):
+                parts.append(f"— {s['description']}")
+            price_parts = []
+            if s.get("price_from"):
+                price_parts.append(str(s["price_from"]))
+            if s.get("price_to"):
+                price_parts.append(str(s["price_to"]))
+            if price_parts:
+                parts.append(f"Price: {' – '.join(price_parts)}")
+            if s.get("duration"):
+                parts.append(f"Duration: {s['duration']}")
+            lines.append("• " + " ".join(parts))
+
+    # Packages
+    packages = [p for p in (kb.get("packages") or []) if p.get("active", True) and p.get("package_name")]
+    if packages:
+        lines.append("")
+        lines.append("[PACKAGES]")
+        for p in packages[:6]:
+            parts = [p["package_name"]]
+            if p.get("price"):
+                parts.append(f"— ₹{p['price']}")
+            if p.get("description"):
+                parts.append(f"| {p['description']}")
+            if p.get("validity"):
+                parts.append(f"| Valid: {p['validity']}")
+            lines.append("• " + " ".join(parts))
+
+    # FAQs
+    faqs = [f for f in (kb.get("faqs") or []) if f.get("active", True) and f.get("question")]
+    if faqs:
+        lines.append("")
+        lines.append("[FAQs]")
+        for faq in faqs[:15]:
+            lines.append(f"Q: {faq['question']}")
+            if faq.get("answer"):
+                lines.append(f"A: {faq['answer']}")
+
+    # Policies (non-empty)
+    pol = kb.get("policies") or {}
+    pol_parts = []
+    for k, label in [
+        ("cancellation_policy", "Cancellation"),
+        ("refund_policy", "Refund"),
+        ("appointment_policy", "Appointment"),
+        ("payment_policy", "Payment"),
+        ("terms_notes", "Terms"),
+    ]:
+        if pol.get(k):
+            pol_parts.append(f"{label}: {pol[k]}")
+    if pol_parts:
+        lines.append("")
+        lines.append("[POLICIES]")
+        lines.extend(pol_parts)
+
+    # Appointment rules
+    ar = kb.get("appointment_rules") or {}
+    ar_parts = []
+    if ar.get("appointment_required"):
+        ar_parts.append("Appointment required: Yes")
+    if ar.get("allow_same_day_booking"):
+        ar_parts.append("Same-day booking: Allowed")
+    if ar.get("appointment_duration_minutes"):
+        ar_parts.append(f"Duration: {ar['appointment_duration_minutes']} min")
+    if ar.get("default_visit_type"):
+        ar_parts.append(f"Default visit: {ar['default_visit_type'].replace('_', ' ')}")
+    if ar.get("confirmation_required"):
+        ar_parts.append("Confirmation: Required")
+    if ar_parts:
+        lines.append("")
+        lines.append("[APPOINTMENT RULES]")
+        lines.extend(ar_parts)
+
+    # Human transfer
+    tr = kb.get("transfer_rules") or {}
+    if tr.get("transfer_enabled") and tr.get("transfer_number"):
+        lines.append("")
+        lines.append("[HUMAN TRANSFER]")
+        lines.append(f"Transfer number: {tr['transfer_number']}")
+        if tr.get("transfer_conditions"):
+            lines.append(f"Conditions: {tr['transfer_conditions']}")
+        if tr.get("working_hours_only"):
+            lines.append("Available: Working hours only")
+
+    if not lines:
+        return ""
+
+    # KB grounding instruction
+    lines.append("")
+    lines.append(
+        "IMPORTANT: Answer all business-related questions strictly using the company knowledge base above. "
+        "If information is not available in the knowledge base, say our team will confirm and get back."
+    )
+
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n...[knowledge base truncated]"
+    return text
+
+
+def get_kb_prompt_prefix(kb: dict, max_chars: int = 4000) -> str:
+    """Return KB context block ready to prepend to any call-type prompt."""
+    ctx = build_knowledge_context(kb, max_chars=max_chars)
+    return (ctx + "\n\n") if ctx else ""
+
+
 def build_prompt_for_type(
     prompt_type: str,
     lead_name: str = "there",
     business_name: str = "our company",
     service_type: str = "our service",
     saved_text: str = None,
+    kb: dict = None,
 ) -> str:
-    """Build final prompt: use saved_text if provided, else built-in default for type."""
+    """Build final prompt: use saved_text if provided, else built-in default for type.
+    If kb is provided, prepend the KB context block."""
     template = saved_text if saved_text else get_default_prompt(prompt_type)
     try:
-        return template.format(
+        body = template.format(
             lead_name=lead_name,
             business_name=business_name,
             service_type=service_type,
         )
     except KeyError:
-        return template
+        body = template
+    if kb:
+        prefix = get_kb_prompt_prefix(kb)
+        if prefix:
+            return prefix + body
+    return body

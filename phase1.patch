@@ -1,0 +1,210 @@
+diff --git a/db.py b/db.py
+index 1a518ce..3ffccfb 100644
+--- a/db.py
++++ b/db.py
+@@ -273,6 +273,30 @@ async def get_all_calls(page: int = 1, limit: int = 20) -> list:
+     return result.data or []
+ 
+ 
++async def get_call_logs_for_export(filters: Optional[dict] = None) -> list:
++    db = await _adb()
++    filters = filters or {}
++    query = db.table("call_logs").select("*").order("timestamp", desc=True)
++
++    date_from = (filters.get("date_from") or "").strip()
++    date_to = (filters.get("date_to") or "").strip()
++    outcome = (filters.get("outcome") or "").strip()
++    phone = (filters.get("phone") or "").strip()
++
++    if date_from:
++        query = query.gte("timestamp", date_from)
++    if date_to:
++        end_value = f"{date_to}T23:59:59.999999" if len(date_to) == 10 else date_to
++        query = query.lte("timestamp", end_value)
++    if outcome:
++        query = query.eq("outcome", outcome)
++    if phone:
++        query = query.eq("phone_number", phone)
++
++    result = await query.execute()
++    return result.data or []
++
++
+ async def get_calls_by_phone(phone: str) -> list:
+     db = await _adb()
+     result = await db.table("call_logs").select("*").eq("phone_number", phone).order("timestamp", desc=True).execute()
+diff --git a/requirements.txt b/requirements.txt
+index 4a0197c..a21992e 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -17,3 +17,4 @@ twilio>=8.0.0
+ certifi>=2024.0.0
+ aiohttp>=3.9.0
+ google-generativeai>=0.8.0
++openpyxl>=3.1.0
+diff --git a/server.py b/server.py
+index c6f5a64..ef4fc1b 100644
+--- a/server.py
++++ b/server.py
+@@ -1,6 +1,8 @@
+ """FastAPI backend for the OutboundAI dashboard."""
+ 
+ import asyncio
++import csv
++from io import BytesIO, StringIO
+ import json
+ import logging
+ import os
+@@ -13,7 +15,7 @@ from typing import Optional
+ 
+ from dotenv import load_dotenv
+ from fastapi import FastAPI, HTTPException, Query, Request
+-from fastapi.responses import HTMLResponse, JSONResponse
++from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+ from pydantic import BaseModel
+ 
+ _orig_ssl = ssl.create_default_context
+@@ -30,7 +32,7 @@ from db import (
+     create_campaign, delete_agent_profile, delete_campaign, get_agent_profile,
+     get_all_agent_profiles, get_all_appointments, get_all_calls,
+     get_all_campaigns, get_all_settings, get_calls_by_phone, get_campaign,
+-    get_contacts, get_logs, get_setting, get_stats, init_db, log_error,
++    get_call_logs_for_export, get_contacts, get_logs, get_setting, get_stats, init_db, log_error,
+     save_settings, set_default_agent_profile, set_setting,
+     update_agent_profile, update_call_notes, update_campaign_run_stats,
+     update_campaign_status,
+@@ -226,6 +228,113 @@ async def api_update_notes(call_id: str, req: NotesRequest):
+     return {"status": "updated"}
+ 
+ 
++EXPORT_COLUMNS = [
++    ("Call Date/Time", "timestamp"),
++    ("Lead Name", "lead_name"),
++    ("Phone Number", "phone_number"),
++    ("Business Name", "business_name"),
++    ("Service Type", "service_type"),
++    ("Outcome", "outcome"),
++    ("Reason", "reason"),
++    ("Duration Seconds", "duration_seconds"),
++    ("Notes", "notes"),
++    ("Recording URL", "recording_url"),
++    ("Recording Download Link", "recording_url"),
++    ("Created/Timestamp", "timestamp"),
++]
++
++
++def _export_filters(date_from: Optional[str], date_to: Optional[str], outcome: Optional[str], phone: Optional[str]) -> dict:
++    return {
++        "date_from": date_from or "",
++        "date_to": date_to or "",
++        "outcome": outcome or "",
++        "phone": phone or "",
++    }
++
++
++def _export_value(row: dict, key: str) -> str:
++    value = row.get(key)
++    return "" if value is None else str(value)
++
++
++@app.get("/api/export/calls.csv")
++async def api_export_calls_csv(
++    date_from: Optional[str] = None,
++    date_to: Optional[str] = None,
++    outcome: Optional[str] = None,
++    phone: Optional[str] = None,
++):
++    try:
++        rows = await get_call_logs_for_export(_export_filters(date_from, date_to, outcome, phone))
++        out = StringIO()
++        writer = csv.writer(out)
++        writer.writerow([label for label, _ in EXPORT_COLUMNS])
++        for row in rows:
++            writer.writerow([
++                _export_value(row, key)
++                for label, key in EXPORT_COLUMNS
++            ])
++        out.seek(0)
++        return StreamingResponse(
++            iter([out.getvalue()]),
++            media_type="text/csv",
++            headers={"Content-Disposition": 'attachment; filename="call_logs_export.csv"'},
++        )
++    except Exception as exc:
++        await log_error("server", "CSV export failed", str(exc), "error")
++        return JSONResponse(status_code=500, content={"error": f"CSV export failed: {exc}"})
++
++
++@app.get("/api/export/calls.xlsx")
++async def api_export_calls_xlsx(
++    date_from: Optional[str] = None,
++    date_to: Optional[str] = None,
++    outcome: Optional[str] = None,
++    phone: Optional[str] = None,
++):
++    try:
++        from openpyxl import Workbook
++        from openpyxl.styles import Font
++
++        rows = await get_call_logs_for_export(_export_filters(date_from, date_to, outcome, phone))
++        wb = Workbook()
++        ws = wb.active
++        ws.title = "Call Logs"
++        headers = [label for label, _ in EXPORT_COLUMNS]
++        ws.append(headers)
++        for cell in ws[1]:
++            cell.font = Font(bold=True)
++
++        download_col = headers.index("Recording Download Link") + 1
++        for row in rows:
++            ws.append([
++                "Download Recording" if label == "Recording Download Link" and row.get("recording_url") else _export_value(row, key)
++                for label, key in EXPORT_COLUMNS
++            ])
++            recording_url = row.get("recording_url")
++            if recording_url:
++                cell = ws.cell(row=ws.max_row, column=download_col)
++                cell.hyperlink = recording_url
++                cell.style = "Hyperlink"
++
++        for column in ws.columns:
++            width = max(len(str(cell.value or "")) for cell in column)
++            ws.column_dimensions[column[0].column_letter].width = min(max(width + 2, 14), 60)
++
++        stream = BytesIO()
++        wb.save(stream)
++        stream.seek(0)
++        return StreamingResponse(
++            stream,
++            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
++            headers={"Content-Disposition": 'attachment; filename="call_logs_export.xlsx"'},
++        )
++    except Exception as exc:
++        await log_error("server", "Excel export failed", str(exc), "error")
++        return JSONResponse(status_code=500, content={"error": f"Excel export failed: {exc}"})
++
++
+ @app.get("/api/stats")
+ async def api_get_stats():
+     return await get_stats()
+diff --git a/ui/index.html b/ui/index.html
+index fb2c4ba..903fb94 100644
+--- a/ui/index.html
++++ b/ui/index.html
+@@ -19,7 +19,7 @@
+ <section id="agents" class="panel"><div class="card"><h2>🤖 Agents</h2><input id="agent-id" type="hidden"><div class="grid cols-2"><div><label>Name</label><input id="agent-name"></div><div><label>Voice</label><select id="agent-voice"></select></div><div><label>Model</label><select id="agent-model"><option>gemini-3.1-flash-live-preview</option><option>gemini-2.5-flash-native-audio-preview-12-2025</option></select></div><div><label>Enabled Tools JSON</label><input id="agent-tools" value="[]"></div><div style="grid-column:1/-1"><label>System Prompt</label><textarea id="agent-prompt"></textarea></div><label><input id="agent-default" type="checkbox" style="width:auto"> Default</label></div><div class="row"><button class="primary" onclick="saveAgentProfile()">Save Profile</button><button onclick="resetAgentForm()">Reset</button></div><div id="agent-list"></div></div></section>
+ <section id="prompt" class="panel"><div class="card"><h2>✏️ AI Prompt</h2><textarea id="prompt-text" style="min-height:460px"></textarea><div class="row"><span id="prompt-count" class="muted"></span><button class="primary" onclick="savePrompt()">Save</button><button class="danger" onclick="resetPrompt()">Reset</button></div></div></section>
+ <section id="appointments" class="panel"><div class="card"><h2>📅 Appointments</h2><div class="row"><input id="appt-date" type="date"><button onclick="loadAppointments()">Filter</button></div><div id="appt-list"></div></div></section>
+-<section id="calls" class="panel"><div class="card"><h2>📝 Call Logs</h2><div id="calls-list"></div><div class="row"><button onclick="loadCalls(callPage-1)">Prev</button><span id="call-page"></span><button onclick="loadCalls(callPage+1)">Next</button></div></div></section>
++<section id="calls" class="panel"><div class="card"><h2>📝 Call Logs</h2><div class="row"><button class="primary" onclick="exportCalls('xlsx')">Export Excel</button><button onclick="exportCalls('csv')">Export CSV</button></div><div id="calls-list"></div><div class="row"><button onclick="loadCalls(callPage-1)">Prev</button><span id="call-page"></span><button onclick="loadCalls(callPage+1)">Next</button></div></div></section>
+ <section id="crm" class="panel"><div class="grid cols-2"><div class="card"><h2>👥 CRM</h2><div id="crm-list"></div></div><div class="card"><h2>Contact Detail</h2><div id="crm-detail" class="muted">Select a contact.</div></div></div></section>
+ <section id="settings" class="panel"><div class="card"><h2>⚙️ Settings</h2><div id="settings-groups" class="grid cols-2"></div></div></section>
+ <section id="logs" class="panel"><div class="card"><h2>📋 Logs</h2><div class="row"><select id="log-level"><option value="">all</option><option>info</option><option>warning</option><option>error</option></select><input id="log-source" placeholder="source"><button onclick="loadLogs()">Refresh</button><button class="danger" onclick="clearLogs()">Clear</button><button onclick="logsPaused=!logsPaused;this.textContent=logsPaused?'Resume':'Pause'">Pause</button></div><div id="log-box" class="logbox"></div></div></section>
+@@ -42,6 +42,7 @@ function voiceOptions(){return `<optgroup label="Female voices"><option value="A
+ async function loadAgentProfiles(){let profiles=[];try{const raw=await api('/api/agent-profiles');profiles=Array.isArray(raw)?raw:[]}catch(e){}const opts='<option value="">Default/global</option>'+profiles.map(p=>`<option value="${p.id}">${esc(p.name)}${p.is_default?' ★':''}</option>`).join('');['f-agent-profile','bc-agent-profile','camp-agent-profile'].forEach(id=>$(id).innerHTML=opts);$('agent-list').innerHTML=table(profiles,['name','voice','model','is_default'],r=>`<button onclick="editAgentProfile('${r.id}')">Edit</button><button onclick="setDefaultAgentProfile('${r.id}','${esc(r.name)}')">★ Default</button><button class="danger" onclick="deleteAgentProfile('${r.id}','${esc(r.name)}')">Delete</button>`)}window.saveAgentProfile=async()=>{let id=$('agent-id').value;let body={name:$('agent-name').value,voice:$('agent-voice').value,model:$('agent-model').value,enabled_tools:$('agent-tools').value,system_prompt:$('agent-prompt').value,is_default:$('agent-default').checked};await api(`/api/agent-profiles${id?'/'+id:''}`,{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Profile saved');resetAgentForm();loadAgentProfiles()};window.editAgentProfile=async id=>{let p=await api('/api/agent-profiles/'+id);$('agent-id').value=p.id;$('agent-name').value=p.name;$('agent-voice').value=p.voice;$('agent-model').value=p.model;$('agent-tools').value=p.enabled_tools||'[]';$('agent-prompt').value=p.system_prompt||'';$('agent-default').checked=!!p.is_default};window.deleteAgentProfile=async id=>{if(confirm('Delete profile?')){await apiDel('/api/agent-profiles/'+id);loadAgentProfiles()}};window.setDefaultAgentProfile=async id=>{await apiPost(`/api/agent-profiles/${id}/set-default`,{});loadAgentProfiles()};window.resetAgentForm=()=>['agent-id','agent-name','agent-prompt'].forEach(id=>$(id).value='')
+ async function loadPrompt(){const p=await api('/api/prompt');$('prompt-text').value=p.prompt;$('prompt-count').textContent=p.prompt.length+' chars'}window.savePrompt=async()=>{await apiPost('/api/prompt',{prompt:$('prompt-text').value});toast('Prompt saved')};window.resetPrompt=async()=>{await apiDel('/api/prompt');loadPrompt()};$('prompt-text').oninput=()=>$('prompt-count').textContent=$('prompt-text').value.length+' chars';
+ async function loadAppointments(){const q=$('appt-date').value?'?date='+$('appt-date').value:'';$('appt-list').innerHTML=table(await api('/api/appointments'+q),['name','phone','date','time','service','status'],r=>`<button class="danger" onclick="cancelAppointment('${r.id}')">Cancel</button>`)}window.cancelAppointment=async id=>{await apiDel('/api/appointments/'+id);loadAppointments()};async function loadCalls(page=1){if(page<1)return;callPage=page;const rows=await api(`/api/calls?page=${page}&limit=20`);$('call-page').textContent='Page '+page;$('calls-list').innerHTML=table(rows,['phone_number','lead_name','outcome','duration_seconds','timestamp','recording_url'],r=>`<textarea id="notes-${r.id}">${esc(r.notes||'')}</textarea><button onclick="saveNotes('${r.id}')">Save Notes</button>`)}window.saveNotes=async id=>{await fetch(`/api/calls/${id}/notes`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({notes:$('notes-'+id).value})});toast('Notes saved')};async function loadCRM(){let r=await api('/api/crm');$('crm-list').innerHTML=table(r.data||[],['phone_number','lead_name','total_calls','booked','last_outcome'],x=>`<button onclick="loadContactDetail('${x.phone_number}')">Open</button>`)}window.loadContactDetail=async phone=>{let r=await api('/api/crm/calls?phone='+encodeURIComponent(phone));$('crm-detail').innerHTML=table(r.data||[])}
++function exportCalls(format){window.location.href='/api/export/calls.'+format}
+ const groups={LiveKit:['LIVEKIT_URL','LIVEKIT_API_KEY','LIVEKIT_API_SECRET'],Gemini:['GOOGLE_API_KEY','GEMINI_MODEL','GEMINI_TTS_VOICE','USE_GEMINI_REALTIME'],Vobiz:['VOBIZ_SIP_DOMAIN','VOBIZ_USERNAME','VOBIZ_PASSWORD','VOBIZ_OUTBOUND_NUMBER','OUTBOUND_TRUNK_ID','DEFAULT_TRANSFER_NUMBER'],Twilio:['TWILIO_ACCOUNT_SID','TWILIO_AUTH_TOKEN','TWILIO_FROM_NUMBER'],S3:['S3_ACCESS_KEY_ID','S3_SECRET_ACCESS_KEY','S3_ENDPOINT_URL','S3_REGION','S3_BUCKET'],Calcom:['CALCOM_API_KEY','CALCOM_EVENT_TYPE_ID','CALCOM_TIMEZONE'],Tools:['ENABLED_TOOLS']};async function loadSettings(){const s=await api('/api/settings');$('settings-groups').innerHTML=Object.entries(groups).map(([g,keys])=>`<div class="card"><h3>${g}</h3>${keys.map(k=>`<label>${k} <span class="badge ${s[k]?.configured?'ok':'err'}">${s[k]?.configured?'configured':'missing'}</span></label><input id="set-${k}" type="${k.includes('KEY')||k.includes('SECRET')||k.includes('TOKEN')||k.includes('PASSWORD')?'password':'text'}" value="${esc(s[k]?.value||'')}">`).join('')}<button class="primary" onclick="saveGroup('${g}')">Save ${g}</button>${g==='Vobiz'?'<button onclick="createSIPTrunk()">⚡ Create SIP Trunk</button>':''}</div>`).join('')}async function saveGroup(g){let settings={};groups[g].forEach(k=>settings[k]=$('set-'+k).value);await apiPost('/api/settings',{settings});toast(g+' saved')}window.createSIPTrunk=async()=>{let r=await api('/api/setup/trunk',{method:'POST'});toast('Trunk: '+r.trunk_id)};window.saveToolToggles=async()=>saveGroup('Tools');
+ async function loadLogs(){if(logsPaused)return;let q=`?limit=200&level=${$('log-level').value}&source=${encodeURIComponent($('log-source').value)}`;let rows=await api('/api/logs'+q);$('log-box').textContent=rows.map(l=>`[${l.timestamp}] ${l.level}/${l.source}: ${l.message}\n${l.detail||''}`).join('\n')}async function clearLogs(){await apiDel('/api/logs');loadLogs()}function scheduleLogsRefresh(){setInterval(loadLogs,5000)}
+ function esc(s){return String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}function table(rows,cols,actions){rows=Array.isArray(rows)?rows:[];if(!rows.length)return '<p class="muted">No data.</p>';cols=cols||Object.keys(rows[0]);return `<table><thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}${actions?'<th>Actions</th>':''}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${c==='recording_url'&&r[c]?`<a href="${esc(r[c])}" target="_blank">recording</a>`:esc(r[c])}</td>`).join('')}${actions?`<td>${actions(r)}</td>`:''}</tr>`).join('')}</tbody></table>`}

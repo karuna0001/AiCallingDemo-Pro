@@ -1,0 +1,408 @@
+diff --git a/requirements.txt b/requirements.txt
+index a21992e..933a787 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -18,3 +18,4 @@ certifi>=2024.0.0
+ aiohttp>=3.9.0
+ google-generativeai>=0.8.0
+ openpyxl>=3.1.0
++boto3>=1.34.0
+diff --git a/supabase_schema.sql b/supabase_schema.sql
+index 4bf2f28..02b279e 100644
+--- a/supabase_schema.sql
++++ b/supabase_schema.sql
+@@ -45,6 +45,10 @@ ALTER TABLE error_logs    DISABLE ROW LEVEL SECURITY;
+ 
+ ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_url TEXT;
+ ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS notes TEXT;
++ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_object_key text;
++ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_size_bytes bigint DEFAULT 0;
++ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_deleted boolean DEFAULT false;
++ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_deleted_at timestamptz;
+ 
+ CREATE TABLE IF NOT EXISTS campaigns (
+     id TEXT PRIMARY KEY,
+diff --git a/db.py b/db.py
+index df2dea2..35d31a0 100644
+--- a/db.py
++++ b/db.py
+@@ -39,6 +39,9 @@ DEFAULTS = {
+     "SUPABASE_URL":            os.getenv("SUPABASE_URL", ""),
+     "SUPABASE_SERVICE_KEY":    os.getenv("SUPABASE_SERVICE_KEY", ""),
+     "DEEPGRAM_API_KEY":        os.getenv("DEEPGRAM_API_KEY", ""),
++    "RECORDING_AUTO_DELETE_ENABLED": os.getenv("RECORDING_AUTO_DELETE_ENABLED", "false"),
++    "RECORDING_RETENTION_DAYS":      os.getenv("RECORDING_RETENTION_DAYS", "7"),
++    "RECORDING_CLEANUP_TIME":        os.getenv("RECORDING_CLEANUP_TIME", "02:00"),
+ }
+ 
+ DEFAULT_LEAD_STATUSES = [
+@@ -133,6 +136,7 @@ async def get_all_settings() -> dict:
+         "DEEPGRAM_API_KEY", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER",
+         "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_ENDPOINT_URL", "S3_REGION", "S3_BUCKET",
+         "CALCOM_API_KEY", "CALCOM_EVENT_TYPE_ID", "CALCOM_TIMEZONE", "ENABLED_TOOLS",
++        "RECORDING_AUTO_DELETE_ENABLED", "RECORDING_RETENTION_DAYS", "RECORDING_CLEANUP_TIME",
+     ]
+     out = {}
+     for k in known_keys:
+@@ -310,14 +314,23 @@ async def get_appointments_by_phone(phone: str) -> list:
+     return result.data or []
+ 
+ 
+-async def log_call(phone_number: str, lead_name: Optional[str], outcome: str, reason: str, duration_seconds: int, recording_url: Optional[str] = None, notes: Optional[str] = None) -> None:
++async def log_call(phone_number: str, lead_name: Optional[str], outcome: str, reason: str, duration_seconds: int, recording_url: Optional[str] = None, notes: Optional[str] = None, recording_object_key: Optional[str] = None, recording_size_bytes: int = 0) -> None:
+     db = await _adb()
+     row = {"id": str(uuid.uuid4()), "phone_number": phone_number, "lead_name": lead_name, "outcome": outcome, "reason": reason, "duration_seconds": duration_seconds, "timestamp": datetime.now().isoformat()}
+     if recording_url:
+         row["recording_url"] = recording_url
++        row["recording_deleted"] = False
++        row["recording_size_bytes"] = recording_size_bytes or 0
++    if recording_object_key:
++        row["recording_object_key"] = recording_object_key
+     if notes:
+         row["notes"] = notes
+-    await db.table("call_logs").insert(row).execute()
++    try:
++        await db.table("call_logs").insert(row).execute()
++    except Exception:
++        for key in ("recording_object_key", "recording_size_bytes", "recording_deleted"):
++            row.pop(key, None)
++        await db.table("call_logs").insert(row).execute()
+     await upsert_crm_contact_from_call(row)
+ 
+ 
+@@ -352,6 +365,46 @@ async def get_call_logs_for_export(filters: Optional[dict] = None) -> list:
+     return result.data or []
+ 
+ 
++async def get_recordings_for_cleanup(retention_days: int) -> list:
++    db = await _adb()
++    cutoff = (datetime.now() - timedelta(days=max(retention_days, 0))).isoformat()
++    result = await db.table("call_logs").select("id, recording_url, recording_object_key, recording_deleted, timestamp").execute()
++    rows = result.data or []
++    return [
++        row for row in rows
++        if row.get("recording_url") and not row.get("recording_deleted") and (row.get("timestamp") or "") < cutoff
++    ]
++
++
++async def mark_recording_deleted(call_id: str) -> bool:
++    db = await _adb()
++    result = await db.table("call_logs").update({
++        "recording_deleted": True,
++        "recording_deleted_at": datetime.now().isoformat(),
++        "recording_url": None,
++    }).eq("id", call_id).execute()
++    return len(result.data or []) > 0
++
++
++async def get_recording_storage_stats() -> dict:
++    db = await _adb()
++    result = await db.table("call_logs").select("recording_url, recording_deleted, recording_size_bytes").execute()
++    rows = result.data or []
++    total_recordings = sum(1 for r in rows if r.get("recording_url") or r.get("recording_deleted"))
++    deleted_recordings = sum(1 for r in rows if r.get("recording_deleted"))
++    active_recordings = sum(1 for r in rows if r.get("recording_url") and not r.get("recording_deleted"))
++    total_size = sum(int(r.get("recording_size_bytes") or 0) for r in rows if not r.get("recording_deleted"))
++    return {
++        "total_recordings": total_recordings,
++        "active_recordings": active_recordings,
++        "deleted_recordings": deleted_recordings,
++        "total_size_bytes": total_size,
++        "total_size_mb": round(total_size / (1024 * 1024), 2),
++        "total_size_gb": round(total_size / (1024 * 1024 * 1024), 2),
++        "size_tracking_note": "Recording size is only tracked for new recordings.",
++    }
++
++
+ async def get_calls_by_phone(phone: str) -> list:
+     db = await _adb()
+     result = await db.table("call_logs").select("*").eq("phone_number", phone).order("timestamp", desc=True).execute()
+diff --git a/server.py b/server.py
+index 15e2dba..bc466ac 100644
+--- a/server.py
++++ b/server.py
+@@ -11,7 +11,9 @@ import ssl
+ import certifi
+ import aiohttp
+ from pathlib import Path
++from urllib.parse import urlparse, unquote
+ from typing import Optional
++from zoneinfo import ZoneInfo
+ 
+ from dotenv import load_dotenv
+ from fastapi import FastAPI, HTTPException, Query, Request
+@@ -35,7 +37,8 @@ from db import (
+     get_all_agent_profiles, get_all_appointments, get_all_calls,
+     get_all_campaigns, get_all_settings, get_calls_by_phone, get_campaign,
+     get_call_logs_for_export, get_contacts, get_crm_contacts, get_lead_statuses,
+-    get_logs, get_setting, get_stats, init_db, log_error,
++    get_logs, get_recording_storage_stats, get_recordings_for_cleanup,
++    get_setting, get_stats, init_db, log_error, mark_recording_deleted,
+     save_settings, set_default_agent_profile, set_setting,
+     add_lead_status, delete_lead_status, update_agent_profile, update_call_notes,
+     update_campaign_run_stats, update_campaign_status, update_crm_contact_followup,
+@@ -83,6 +86,7 @@ async def _startup():
+     if _scheduler:
+         _scheduler.start()
+         await _reschedule_all_campaigns()
++        await _schedule_recording_cleanup()
+ 
+ 
+ @app.on_event("shutdown")
+@@ -162,6 +166,10 @@ class CrmNotesRequest(BaseModel):
+     crm_notes: str = ""
+ 
+ 
++class RecordingCleanupRequest(BaseModel):
++    confirm: Optional[str] = None
++
++
+ @app.get("/api/health")
+ async def api_health():
+     """Lightweight healthcheck — does NOT touch Supabase so it stays green during DB blips."""
+@@ -284,6 +292,15 @@ def _export_value(row: dict, key: str) -> str:
+     return "" if value is None else str(value)
+ 
+ 
++def _export_cell_value(row: dict, label: str, key: str) -> str:
++    if label == "Recording Download Link":
++        if row.get("recording_deleted"):
++            return "Recording Deleted"
++        if row.get("recording_url"):
++            return "Download Recording"
++    return _export_value(row, key)
++
++
+ @app.get("/api/export/calls.csv")
+ async def api_export_calls_csv(
+     date_from: Optional[str] = None,
+@@ -298,7 +315,7 @@ async def api_export_calls_csv(
+         writer.writerow([label for label, _ in EXPORT_COLUMNS])
+         for row in rows:
+             writer.writerow([
+-                _export_value(row, key)
++                _export_cell_value(row, label, key)
+                 for label, key in EXPORT_COLUMNS
+             ])
+         out.seek(0)
+@@ -335,11 +352,11 @@ async def api_export_calls_xlsx(
+         download_col = headers.index("Recording Download Link") + 1
+         for row in rows:
+             ws.append([
+-                "Download Recording" if label == "Recording Download Link" and row.get("recording_url") else _export_value(row, key)
++                _export_cell_value(row, label, key)
+                 for label, key in EXPORT_COLUMNS
+             ])
+             recording_url = row.get("recording_url")
+-            if recording_url:
++            if recording_url and not row.get("recording_deleted"):
+                 cell = ws.cell(row=ws.max_row, column=download_col)
+                 cell.hyperlink = recording_url
+                 cell.style = "Hyperlink"
+@@ -366,6 +383,97 @@ async def api_get_stats():
+     return await get_stats()
+ 
+ 
++async def _recording_retention_days() -> int:
++    raw = await get_setting("RECORDING_RETENTION_DAYS", "7")
++    try:
++        return max(int(raw), 1)
++    except (TypeError, ValueError):
++        return 7
++
++
++async def _recording_auto_delete_enabled() -> bool:
++    raw = (await get_setting("RECORDING_AUTO_DELETE_ENABLED", "false")).strip().lower()
++    return raw in ("1", "true", "yes", "on")
++
++
++async def _recording_cleanup_time() -> str:
++    return await get_setting("RECORDING_CLEANUP_TIME", "02:00") or "02:00"
++
++
++def _derive_recording_key(recording_url: str, bucket: str) -> Optional[str]:
++    if not recording_url:
++        return None
++    parsed = urlparse(recording_url)
++    if parsed.scheme == "s3":
++        key = parsed.path.lstrip("/")
++    else:
++        path = unquote(parsed.path or "").lstrip("/")
++        prefix = f"{bucket}/"
++        key = path[len(prefix):] if bucket and path.startswith(prefix) else path
++    if not key or key.startswith("/") or ".." in key.split("/"):
++        return None
++    return key
++
++
++async def _delete_recording_object(object_key: str) -> None:
++    import boto3
++
++    aws_key = await eff("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
++    aws_secret = await eff("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
++    bucket = await eff("S3_BUCKET") or os.getenv("AWS_BUCKET_NAME", "")
++    endpoint = await eff("S3_ENDPOINT_URL") or os.getenv("S3_ENDPOINT", "")
++    region = await eff("S3_REGION") or os.getenv("AWS_REGION", "ap-northeast-1")
++    if not (aws_key and aws_secret and bucket):
++        raise RuntimeError("S3/R2 credentials are not configured")
++    client = boto3.client(
++        "s3",
++        aws_access_key_id=aws_key,
++        aws_secret_access_key=aws_secret,
++        endpoint_url=endpoint or None,
++        region_name=region,
++    )
++    client.delete_object(Bucket=bucket, Key=object_key)
++
++
++async def _cleanup_old_recordings() -> dict:
++    retention_days = await _recording_retention_days()
++    rows = await get_recordings_for_cleanup(retention_days)
++    bucket = await eff("S3_BUCKET") or os.getenv("AWS_BUCKET_NAME", "")
++    deleted = failed = 0
++    for row in rows:
++        object_key = row.get("recording_object_key") or _derive_recording_key(row.get("recording_url", ""), bucket)
++        if not object_key:
++            failed += 1
++            continue
++        try:
++            await _delete_recording_object(object_key)
++            if await mark_recording_deleted(row["id"]):
++                deleted += 1
++            else:
++                failed += 1
++        except Exception as exc:
++            failed += 1
++            await log_error("server", "Recording delete failed", f"id={row.get('id')} key={object_key}: {exc}", "error")
++    await log_error("server", "Recording cleanup summary", f"deleted={deleted}, failed={failed}, retention_days={retention_days}", "info")
++    return {"deleted": deleted, "failed": failed}
++
++
++@app.get("/api/recordings/storage")
++async def api_recordings_storage():
++    stats = await get_recording_storage_stats()
++    retention_days = await _recording_retention_days()
++    auto_delete_enabled = await _recording_auto_delete_enabled()
++    return {**stats, "retention_days": retention_days, "auto_delete_enabled": auto_delete_enabled}
++
++
++@app.post("/api/recordings/cleanup")
++async def api_recordings_cleanup(req: Optional[RecordingCleanupRequest] = None):
++    if not req or req.confirm != "DELETE_OLD_RECORDINGS":
++        return JSONResponse(status_code=400, content={"success": False, "error": "Confirmation required"})
++    result = await _cleanup_old_recordings()
++    return {"success": True, **result, "message": "Old recordings cleaned up"}
++
++
+ @app.get("/api/appointments")
+ async def api_get_appointments(date: Optional[str] = None):
+     return await get_all_appointments(date_filter=date)
+@@ -411,6 +519,8 @@ async def api_save_settings(req: SettingsRequest):
+     for k, v in filtered.items():
+         if not os.environ.get(k):
+             os.environ[k] = str(v)
++    if any(k.startswith("RECORDING_") for k in filtered):
++        await _schedule_recording_cleanup()
+     return {"status": "saved", "count": len(filtered)}
+ 
+ 
+@@ -693,6 +803,32 @@ async def _reschedule_all_campaigns() -> None:
+         logger.warning("Could not reschedule campaigns: %s", exc)
+ 
+ 
++async def _scheduled_recording_cleanup() -> None:
++    try:
++        if await _recording_auto_delete_enabled():
++            await _cleanup_old_recordings()
++    except Exception as exc:
++        logger.exception("Scheduled recording cleanup failed: %s", exc)
++        await log_error("server", "Scheduled recording cleanup failed", str(exc), "error")
++
++
++async def _schedule_recording_cleanup() -> None:
++    if not _scheduler:
++        return
++    job_id = "recording_cleanup"
++    if _scheduler.get_job(job_id):
++        _scheduler.remove_job(job_id)
++    if not await _recording_auto_delete_enabled():
++        return
++    cleanup_time = await _recording_cleanup_time()
++    try:
++        hour, minute = map(int, cleanup_time.split(":"))
++    except (ValueError, AttributeError):
++        hour, minute = 2, 0
++    trigger = CronTrigger(hour=hour, minute=minute, timezone=ZoneInfo("Asia/Kolkata"))
++    _scheduler.add_job(_scheduled_recording_cleanup, trigger=trigger, id=job_id, replace_existing=True)
++
++
+ def _schedule_campaign(campaign_id: str, schedule_type: str, schedule_time: str) -> None:
+     if not _scheduler:
+         return
+diff --git a/agent.py b/agent.py
+index eb0a14f..b28334d 100644
+--- a/agent.py
++++ b/agent.py
+@@ -255,6 +255,8 @@ async def entrypoint(ctx: agents.JobContext):
+                 egress = await ctx.api.egress.start_room_composite_egress(req)
+                 endpoint = s3_endpoint.rstrip("/")
+                 tool_ctx.recording_url = f"{endpoint}/{aws_bucket}/{recording_path}" if endpoint else f"s3://{aws_bucket}/{recording_path}"
++                tool_ctx.recording_object_key = recording_path
++                tool_ctx.recording_size_bytes = 0
+                 await _log("info", f"Recording started: egress={egress.egress_id}")
+             except Exception as exc:
+                 await _log("warning", f"Recording start failed (non-fatal): {exc}")
+diff --git a/tools.py b/tools.py
+index ebf0619..11b117e 100644
+--- a/tools.py
++++ b/tools.py
+@@ -33,6 +33,8 @@ class AppointmentTools(llm.ToolContext):
+         self._call_start_time = time.time()
+         self._sip_domain = os.getenv("VOBIZ_SIP_DOMAIN", "")
+         self.recording_url: Optional[str] = None
++        self.recording_object_key: Optional[str] = None
++        self.recording_size_bytes: int = 0
+         super().__init__(tools=[])
+ 
+     def build_tool_list(self, enabled: list) -> list:
+@@ -72,7 +74,16 @@ class AppointmentTools(llm.ToolContext):
+         """End the call and log the outcome."""
+         duration = int(time.time() - self._call_start_time)
+         try:
+-            await log_call(self.phone_number or "unknown", self.lead_name, outcome, reason, duration, self.recording_url)
++            await log_call(
++                self.phone_number or "unknown",
++                self.lead_name,
++                outcome,
++                reason,
++                duration,
++                self.recording_url,
++                recording_object_key=self.recording_object_key,
++                recording_size_bytes=self.recording_size_bytes,
++            )
+         except Exception as exc:
+             logger.error("Failed to log call: %s", exc)
+         # Give Gemini ~1.5s to finish speaking the goodbye line before we tear down.
+diff --git a/ui/index.html b/ui/index.html
+index fae3aff..b7bb044 100644
+--- a/ui/index.html
++++ b/ui/index.html
+@@ -21,7 +21,7 @@
+ <section id="appointments" class="panel"><div class="card"><h2>📅 Appointments</h2><div class="row"><input id="appt-date" type="date"><button onclick="loadAppointments()">Filter</button></div><div id="appt-list"></div></div></section>
+ <section id="calls" class="panel"><div class="card"><h2>📝 Call Logs</h2><div class="row"><button class="primary" onclick="exportCalls('xlsx')">Export Excel</button><button onclick="exportCalls('csv')">Export CSV</button></div><div id="calls-list"></div><div class="row"><button onclick="loadCalls(callPage-1)">Prev</button><span id="call-page"></span><button onclick="loadCalls(callPage+1)">Next</button></div></div></section>
+ <section id="crm" class="panel"><div class="grid cols-2"><div class="card"><h2>👥 CRM</h2><div class="grid cols-2"><input id="crm-q" placeholder="Search name or phone"><select id="crm-status-filter"></select><select id="crm-outcome-filter"><option value="">All outcomes</option></select><label><input id="crm-due-today" type="checkbox" style="width:auto"> Due today</label></div><div class="row"><button onclick="loadCRM()">Apply Filters</button><button onclick="resetCRMFilters()">Reset</button></div><div id="crm-list"></div><hr style="border-color:var(--border);margin:18px 0"><h3>Status Manager</h3><div class="grid cols-3"><input id="new-status-name" placeholder="Status name"><input id="new-status-color" type="color" value="#00ff88"><button onclick="addLeadStatusUI()">Add Status</button></div><div id="status-list"></div></div><div class="card"><h2>Contact Detail</h2><div id="crm-detail" class="muted">Select a contact.</div></div></div></section>
+-<section id="settings" class="panel"><div class="card"><h2>⚙️ Settings</h2><div id="settings-groups" class="grid cols-2"></div></div><div class="card" style="margin-top:16px"><h2>Danger Zone / Clear Records</h2><p class="muted">These actions permanently delete selected records. Settings and agent profiles are not cleared.</p><div class="row" style="margin-top:12px"><button class="danger" onclick="clearAdminRecords('call-logs')">Clear Call Logs</button><button class="danger" onclick="clearAdminRecords('error-logs')">Clear Error Logs</button><button class="danger" onclick="clearAdminRecords('contact-memory')">Clear CRM Memory</button><button class="danger" onclick="clearAdminRecords('appointments')">Clear Appointments</button><button class="danger" onclick="clearAdminRecords('campaigns')">Clear Campaigns</button><button class="danger" onclick="clearAdminRecords('all-test-data',true)">Clear All Test Data</button></div></div></section>
++<section id="settings" class="panel"><div class="card"><h2>⚙️ Settings</h2><div id="settings-groups" class="grid cols-2"></div></div><div class="card" style="margin-top:16px"><h2>Recording Storage & Retention</h2><div class="grid cols-3"><div><label>Auto delete old recordings</label><select id="rec-auto"><option value="false">OFF</option><option value="true">ON</option></select></div><div><label>Keep recordings for days</label><input id="rec-days" type="number" min="1" value="7"></div><div><label>Cleanup time</label><input id="rec-time" type="time" value="02:00"></div></div><div class="row" style="margin-top:12px"><button class="primary" onclick="saveRecordingSettings()">Save Settings</button><button onclick="loadRecordingStorage()">Refresh Storage Usage</button><button class="danger" onclick="cleanupRecordingsNow()">Delete Old Recordings Now</button></div><div id="recording-storage" class="row" style="margin-top:12px"></div></div><div class="card" style="margin-top:16px"><h2>Danger Zone / Clear Records</h2><p class="muted">These actions permanently delete selected records. Settings and agent profiles are not cleared.</p><div class="row" style="margin-top:12px"><button class="danger" onclick="clearAdminRecords('call-logs')">Clear Call Logs</button><button class="danger" onclick="clearAdminRecords('error-logs')">Clear Error Logs</button><button class="danger" onclick="clearAdminRecords('contact-memory')">Clear CRM Memory</button><button class="danger" onclick="clearAdminRecords('appointments')">Clear Appointments</button><button class="danger" onclick="clearAdminRecords('campaigns')">Clear Campaigns</button><button class="danger" onclick="clearAdminRecords('all-test-data',true)">Clear All Test Data</button></div></div></section>
+ <section id="logs" class="panel"><div class="card"><h2>📋 Logs</h2><div class="row"><select id="log-level"><option value="">all</option><option>info</option><option>warning</option><option>error</option></select><input id="log-source" placeholder="source"><button onclick="loadLogs()">Refresh</button><button class="danger" onclick="clearLogs()">Clear</button><button onclick="logsPaused=!logsPaused;this.textContent=logsPaused?'Resume':'Pause'">Pause</button></div><div id="log-box" class="logbox"></div></div></section>
+ <section id="setup" class="panel"><div class="grid cols-2"><div class="card"><h2>🔧 Quick Start</h2><ol><li>Run <code>supabase_schema.sql</code> in Supabase SQL Editor.</li><li>Fill Settings and save credentials.</li><li>Create SIP trunk.</li><li>Create an agent profile.</li><li>Test a single call.</li></ol></div><div class="card"><h2>Cost Breakdown</h2><table><tr><th>Service</th><th>Cost/min</th></tr><tr><td>Vobiz SIP</td><td>₹1.00</td></tr><tr><td>LiveKit</td><td>₹0.17</td></tr><tr><td>Gemini Live</td><td>₹0.03</td></tr><tr><td><b>Total</b></td><td><b>≈ ₹1.20</b></td></tr></table></div></div></section>
+ </main>
+@@ -44,7 +44,8 @@ async function loadPrompt(){const p=await api('/api/prompt');$('prompt-text').va
+ async function loadAppointments(){const q=$('appt-date').value?'?date='+$('appt-date').value:'';$('appt-list').innerHTML=table(await api('/api/appointments'+q),['name','phone','date','time','service','status'],r=>`<button class="danger" onclick="cancelAppointment('${r.id}')">Cancel</button>`)}window.cancelAppointment=async id=>{await apiDel('/api/appointments/'+id);loadAppointments()};async function loadCalls(page=1){if(page<1)return;callPage=page;const rows=await api(`/api/calls?page=${page}&limit=20`);$('call-page').textContent='Page '+page;$('calls-list').innerHTML=table(rows,['phone_number','lead_name','outcome','duration_seconds','timestamp','recording_url'],r=>`<textarea id="notes-${r.id}">${esc(r.notes||'')}</textarea><button onclick="saveNotes('${r.id}')">Save Notes</button>`)}window.saveNotes=async id=>{await fetch(`/api/calls/${id}/notes`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({notes:$('notes-'+id).value})});toast('Notes saved')};async function loadLeadStatuses(){let r=await api('/api/lead-statuses');leadStatuses=r.data||[];const opts='<option value="">All CRM statuses</option>'+leadStatuses.map(s=>`<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');$('crm-status-filter').innerHTML=opts;$('status-list').innerHTML=table(leadStatuses,['name','color'],s=>`<button class="danger" onclick="deleteLeadStatus('${s.id}')">Delete</button>`)}async function loadCRM(){const selectedStatus=$('crm-status-filter').value,selectedOutcome=$('crm-outcome-filter').value;await loadLeadStatuses();$('crm-status-filter').value=selectedStatus;const p=new URLSearchParams();if($('crm-q').value)p.set('q',$('crm-q').value);if(selectedStatus)p.set('status',selectedStatus);if(selectedOutcome)p.set('outcome',selectedOutcome);if($('crm-due-today').checked)p.set('due_today','true');let r=await api('/api/crm/contacts?'+p.toString());crmContacts=r.data||[];const outcomes=[...new Set(crmContacts.map(c=>c.last_call_outcome).filter(Boolean))];$('crm-outcome-filter').innerHTML='<option value="">All outcomes</option>'+outcomes.map(o=>`<option value="${esc(o)}">${esc(o)}</option>`).join('');$('crm-outcome-filter').value=selectedOutcome;$('crm-list').innerHTML=table(crmContacts,['phone_number','lead_name','crm_status','last_call_outcome','total_calls','next_followup_at'],x=>`<button onclick="loadContactDetail('${x.phone_number}')">Open</button>`)}window.resetCRMFilters=()=>{$('crm-q').value='';$('crm-status-filter').value='';$('crm-outcome-filter').value='';$('crm-due-today').checked=false;loadCRM()};window.loadContactDetail=async phone=>{const contact=crmContacts.find(c=>c.phone_number===phone)||{phone_number:phone};let calls=await api('/api/crm/calls?phone='+encodeURIComponent(phone));let statusOptions=leadStatuses.map(s=>`<option value="${esc(s.name)}" ${s.name===(contact.crm_status||'New')?'selected':''}>${esc(s.name)}</option>`).join('');$('crm-detail').innerHTML=`<div class="grid cols-2"><div><label>CRM Status</label><select id="detail-status">${statusOptions}</select></div><div><label>Custom Status</label><input id="detail-custom" value="${esc(contact.custom_status||'')}"></div><div><label>Next Follow-up</label><input id="detail-followup" type="datetime-local" value="${esc((contact.next_followup_at||'').slice(0,16))}"></div><div class="row"><button class="primary" onclick="saveCrmStatus('${phone}')">Save Status</button><button onclick="saveCrmFollowup('${phone}')">Save Follow-up</button></div><div style="grid-column:1/-1"><label>CRM Notes</label><textarea id="detail-notes">${esc(contact.crm_notes||'')}</textarea><button onclick="saveCrmNotes('${phone}')">Save Notes</button></div></div><h3 style="margin-top:16px">Call History</h3>${table(calls.data||[])}`};window.saveCrmStatus=async phone=>{await fetch('/api/crm/contacts/'+encodeURIComponent(phone)+'/status',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({crm_status:$('detail-status').value,custom_status:$('detail-custom').value||null})});toast('CRM status saved');loadCRM()};window.saveCrmFollowup=async phone=>{await fetch('/api/crm/contacts/'+encodeURIComponent(phone)+'/followup',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({next_followup_at:$('detail-followup').value||null})});toast('Follow-up saved');loadCRM()};window.saveCrmNotes=async phone=>{await fetch('/api/crm/contacts/'+encodeURIComponent(phone)+'/notes',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({crm_notes:$('detail-notes').value})});toast('CRM notes saved');loadCRM()};window.addLeadStatusUI=async()=>{await api('/api/lead-statuses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('new-status-name').value,color:$('new-status-color').value})});$('new-status-name').value='';toast('Status added');loadCRM()};window.deleteLeadStatus=async id=>{if(confirm('Delete this status?')){await apiDel('/api/lead-statuses/'+id);toast('Status deleted');loadCRM()}}
+ function exportCalls(format){window.location.href='/api/export/calls.'+format}
+ async function clearAdminRecords(kind,all=false){const msg=all?'This will delete call logs, appointments, CRM memory, campaigns, and error logs. Continue?':'Are you sure? This action cannot be undone.';if(!confirm(msg))return;try{const r=await api('/api/admin/clear/'+kind,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:'CLEAR_RECORDS'})});toast(r.message||'Records cleared');loadStats();loadCalls();loadAppointments();loadCampaigns();loadCRM();loadLogs()}catch(e){toast(e.message,'err')}}
+-const groups={LiveKit:['LIVEKIT_URL','LIVEKIT_API_KEY','LIVEKIT_API_SECRET'],Gemini:['GOOGLE_API_KEY','GEMINI_MODEL','GEMINI_TTS_VOICE','USE_GEMINI_REALTIME'],Vobiz:['VOBIZ_SIP_DOMAIN','VOBIZ_USERNAME','VOBIZ_PASSWORD','VOBIZ_OUTBOUND_NUMBER','OUTBOUND_TRUNK_ID','DEFAULT_TRANSFER_NUMBER'],Twilio:['TWILIO_ACCOUNT_SID','TWILIO_AUTH_TOKEN','TWILIO_FROM_NUMBER'],S3:['S3_ACCESS_KEY_ID','S3_SECRET_ACCESS_KEY','S3_ENDPOINT_URL','S3_REGION','S3_BUCKET'],Calcom:['CALCOM_API_KEY','CALCOM_EVENT_TYPE_ID','CALCOM_TIMEZONE'],Tools:['ENABLED_TOOLS']};async function loadSettings(){const s=await api('/api/settings');$('settings-groups').innerHTML=Object.entries(groups).map(([g,keys])=>`<div class="card"><h3>${g}</h3>${keys.map(k=>`<label>${k} <span class="badge ${s[k]?.configured?'ok':'err'}">${s[k]?.configured?'configured':'missing'}</span></label><input id="set-${k}" type="${k.includes('KEY')||k.includes('SECRET')||k.includes('TOKEN')||k.includes('PASSWORD')?'password':'text'}" value="${esc(s[k]?.value||'')}">`).join('')}<button class="primary" onclick="saveGroup('${g}')">Save ${g}</button>${g==='Vobiz'?'<button onclick="createSIPTrunk()">⚡ Create SIP Trunk</button>':''}</div>`).join('')}async function saveGroup(g){let settings={};groups[g].forEach(k=>settings[k]=$('set-'+k).value);await apiPost('/api/settings',{settings});toast(g+' saved')}window.createSIPTrunk=async()=>{let r=await api('/api/setup/trunk',{method:'POST'});toast('Trunk: '+r.trunk_id)};window.saveToolToggles=async()=>saveGroup('Tools');
++async function loadRecordingStorage(){try{const d=await api('/api/recordings/storage');$('recording-storage').innerHTML=[`<span class="badge">Total: ${d.total_recordings}</span>`,`<span class="badge">Active: ${d.active_recordings}</span>`,`<span class="badge">Deleted: ${d.deleted_recordings}</span>`,`<span class="badge">Size: ${d.total_size_mb} MB / ${d.total_size_gb} GB</span>`,`<span class="badge">Retention: ${d.retention_days} days</span>`,`<span class="badge">Auto delete: ${d.auto_delete_enabled?'ON':'OFF'}</span>`].join('')+(d.size_tracking_note?`<p class="muted">${d.size_tracking_note}</p>`:'')}catch(e){$('recording-storage').innerHTML=`<span class="err">${esc(e.message)}</span>`}}async function saveRecordingSettings(){await apiPost('/api/settings',{settings:{RECORDING_AUTO_DELETE_ENABLED:$('rec-auto').value,RECORDING_RETENTION_DAYS:$('rec-days').value,RECORDING_CLEANUP_TIME:$('rec-time').value}});toast('Recording retention saved');loadRecordingStorage()}async function cleanupRecordingsNow(){if(!confirm('This will permanently delete old call recordings from Cloudflare R2. Continue?'))return;try{const r=await api('/api/recordings/cleanup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:'DELETE_OLD_RECORDINGS'})});toast(`${r.deleted} recordings deleted, ${r.failed} failed`);loadRecordingStorage();loadCalls()}catch(e){toast(e.message,'err')}}
++const groups={LiveKit:['LIVEKIT_URL','LIVEKIT_API_KEY','LIVEKIT_API_SECRET'],Gemini:['GOOGLE_API_KEY','GEMINI_MODEL','GEMINI_TTS_VOICE','USE_GEMINI_REALTIME'],Vobiz:['VOBIZ_SIP_DOMAIN','VOBIZ_USERNAME','VOBIZ_PASSWORD','VOBIZ_OUTBOUND_NUMBER','OUTBOUND_TRUNK_ID','DEFAULT_TRANSFER_NUMBER'],Twilio:['TWILIO_ACCOUNT_SID','TWILIO_AUTH_TOKEN','TWILIO_FROM_NUMBER'],S3:['S3_ACCESS_KEY_ID','S3_SECRET_ACCESS_KEY','S3_ENDPOINT_URL','S3_REGION','S3_BUCKET'],Calcom:['CALCOM_API_KEY','CALCOM_EVENT_TYPE_ID','CALCOM_TIMEZONE'],Tools:['ENABLED_TOOLS']};async function loadSettings(){const s=await api('/api/settings');$('settings-groups').innerHTML=Object.entries(groups).map(([g,keys])=>`<div class="card"><h3>${g}</h3>${keys.map(k=>`<label>${k} <span class="badge ${s[k]?.configured?'ok':'err'}">${s[k]?.configured?'configured':'missing'}</span></label><input id="set-${k}" type="${k.includes('KEY')||k.includes('SECRET')||k.includes('TOKEN')||k.includes('PASSWORD')?'password':'text'}" value="${esc(s[k]?.value||'')}">`).join('')}<button class="primary" onclick="saveGroup('${g}')">Save ${g}</button>${g==='Vobiz'?'<button onclick="createSIPTrunk()">⚡ Create SIP Trunk</button>':''}</div>`).join('');$('rec-auto').value=s.RECORDING_AUTO_DELETE_ENABLED?.value||'false';$('rec-days').value=s.RECORDING_RETENTION_DAYS?.value||'7';$('rec-time').value=s.RECORDING_CLEANUP_TIME?.value||'02:00';loadRecordingStorage()}async function saveGroup(g){let settings={};groups[g].forEach(k=>settings[k]=$('set-'+k).value);await apiPost('/api/settings',{settings});toast(g+' saved')}window.createSIPTrunk=async()=>{let r=await api('/api/setup/trunk',{method:'POST'});toast('Trunk: '+r.trunk_id)};window.saveToolToggles=async()=>saveGroup('Tools');
+ async function loadLogs(){if(logsPaused)return;let q=`?limit=200&level=${$('log-level').value}&source=${encodeURIComponent($('log-source').value)}`;let rows=await api('/api/logs'+q);$('log-box').textContent=rows.map(l=>`[${l.timestamp}] ${l.level}/${l.source}: ${l.message}\n${l.detail||''}`).join('\n')}async function clearLogs(){await apiDel('/api/logs');loadLogs()}function scheduleLogsRefresh(){setInterval(loadLogs,5000)}
+ function esc(s){return String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}function table(rows,cols,actions){rows=Array.isArray(rows)?rows:[];if(!rows.length)return '<p class="muted">No data.</p>';cols=cols||Object.keys(rows[0]);return `<table><thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}${actions?'<th>Actions</th>':''}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${c==='recording_url'&&r[c]?`<a href="${esc(r[c])}" target="_blank">recording</a>`:esc(r[c])}</td>`).join('')}${actions?`<td>${actions(r)}</td>`:''}</tr>`).join('')}</tbody></table>`}
+ function init(){tabs.forEach(([id,label])=>{let b=document.createElement('button');b.className='tab'+(id==='stats'?' active':'');b.dataset.tab=id;b.textContent=label;b.onclick=()=>switchTab(id);$('tabs').appendChild(b)});$('agent-voice').innerHTML=voiceOptions();loadStats();loadCalls();loadAppointments();loadLogs();loadAgentProfiles();setInterval(loadStats,10000);scheduleLogsRefresh()}document.addEventListener('DOMContentLoaded',init);

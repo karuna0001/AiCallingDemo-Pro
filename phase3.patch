@@ -1,0 +1,358 @@
+diff --git a/db.py b/db.py
+index b406d0f..df2dea2 100644
+--- a/db.py
++++ b/db.py
+@@ -41,6 +41,24 @@ DEFAULTS = {
+     "DEEPGRAM_API_KEY":        os.getenv("DEEPGRAM_API_KEY", ""),
+ }
+ 
++DEFAULT_LEAD_STATUSES = [
++    ("New", "#64748b"),
++    ("Hot Lead", "#ef4444"),
++    ("Quote Given", "#f59e0b"),
++    ("Measurement Taken", "#06b6d4"),
++    ("Home Visit Booked", "#3b82f6"),
++    ("Site Visit Booked", "#2563eb"),
++    ("Home Visit Done", "#8b5cf6"),
++    ("Site Visit Done", "#7c3aed"),
++    ("Follow-up Later", "#eab308"),
++    ("Payment Pending", "#f97316"),
++    ("Closed Won", "#22c55e"),
++    ("Closed Lost", "#6b7280"),
++    ("Not Interested", "#dc2626"),
++    ("Wrong Number", "#9ca3af"),
++    ("No Response", "#94a3b8"),
++]
++
+ 
+ def _default(key: str) -> str:
+     return os.getenv(key, DEFAULTS.get(key, ""))
+@@ -300,6 +318,7 @@ async def log_call(phone_number: str, lead_name: Optional[str], outcome: str, re
+     if notes:
+         row["notes"] = notes
+     await db.table("call_logs").insert(row).execute()
++    await upsert_crm_contact_from_call(row)
+ 
+ 
+ async def get_all_calls(page: int = 1, limit: int = 20) -> list:
+@@ -358,6 +377,146 @@ async def get_contacts() -> list:
+     return sorted(contacts.values(), key=lambda c: c["last_call"], reverse=True)
+ 
+ 
++async def get_lead_statuses() -> list:
++    db = await _adb()
++    try:
++        result = await db.table("lead_statuses").select("*").order("created_at").execute()
++        rows = result.data or []
++        if rows:
++            return rows
++        seed_rows = [{"name": name, "color": color} for name, color in DEFAULT_LEAD_STATUSES]
++        await db.table("lead_statuses").insert(seed_rows).execute()
++        result = await db.table("lead_statuses").select("*").order("created_at").execute()
++        return result.data or []
++    except Exception as exc:
++        await log_error("server", "Lead statuses unavailable", str(exc), "warning")
++        return [{"id": name, "name": name, "color": color} for name, color in DEFAULT_LEAD_STATUSES]
++
++
++async def add_lead_status(name: str, color: Optional[str] = None) -> Optional[dict]:
++    db = await _adb()
++    row = {"name": name.strip(), "color": (color or "").strip() or None}
++    result = await db.table("lead_statuses").upsert(row, on_conflict="name").execute()
++    return (result.data or [None])[0]
++
++
++async def delete_lead_status(status_id: str) -> bool:
++    db = await _adb()
++    result = await db.table("lead_statuses").delete().eq("id", status_id).execute()
++    return len(result.data or []) > 0
++
++
++async def upsert_crm_contact_from_call(call_log: dict) -> None:
++    phone = call_log.get("phone_number")
++    if not phone:
++        return
++    try:
++        db = await _adb()
++        current = await db.table("crm_contacts").select("total_calls, crm_status").eq("phone_number", phone).maybe_single().execute()
++        total_calls = int((current.data or {}).get("total_calls") or 0) + 1
++        row = {
++            "phone_number": phone,
++            "lead_name": call_log.get("lead_name"),
++            "last_call_outcome": call_log.get("outcome"),
++            "last_call_at": call_log.get("timestamp") or datetime.now().isoformat(),
++            "total_calls": total_calls,
++            "updated_at": datetime.now().isoformat(),
++        }
++        if not current.data:
++            row["crm_status"] = "New"
++        await db.table("crm_contacts").upsert(row, on_conflict="phone_number").execute()
++    except Exception as exc:
++        await log_error("server", "CRM contact upsert skipped", str(exc), "warning")
++
++
++def _crm_fallback_contact(row: dict) -> dict:
++    return {
++        "phone_number": row.get("phone_number"),
++        "lead_name": row.get("lead_name"),
++        "crm_status": row.get("crm_status") or "New",
++        "custom_status": row.get("custom_status"),
++        "next_followup_at": row.get("next_followup_at"),
++        "assigned_to": row.get("assigned_to"),
++        "crm_notes": row.get("crm_notes"),
++        "last_call_outcome": row.get("last_call_outcome") or row.get("last_outcome"),
++        "last_call_at": row.get("last_call_at") or row.get("last_call"),
++        "total_calls": row.get("total_calls") or 0,
++    }
++
++
++async def get_crm_contacts(status: Optional[str] = None, outcome: Optional[str] = None, q: Optional[str] = None, due_today: bool = False) -> list:
++    try:
++        db = await _adb()
++        query = db.table("crm_contacts").select("*").order("updated_at", desc=True)
++        if status:
++            query = query.eq("crm_status", status)
++        if outcome:
++            query = query.eq("last_call_outcome", outcome)
++        result = await query.execute()
++        rows = result.data or []
++    except Exception as exc:
++        await log_error("server", "CRM contacts unavailable, falling back to call logs", str(exc), "warning")
++        rows = []
++
++    if not rows:
++        rows = [_crm_fallback_contact(c) for c in await get_contacts()]
++    else:
++        rows = [_crm_fallback_contact(c) for c in rows]
++
++    needle = (q or "").strip().lower()
++    today = datetime.now().date().isoformat()
++    filtered = []
++    for row in rows:
++        if needle and needle not in (row.get("phone_number") or "").lower() and needle not in (row.get("lead_name") or "").lower():
++            continue
++        if status and row.get("crm_status") != status:
++            continue
++        if outcome and row.get("last_call_outcome") != outcome:
++            continue
++        if due_today and not (row.get("next_followup_at") or "").startswith(today):
++            continue
++        filtered.append(row)
++    return filtered
++
++
++async def _ensure_crm_contact(phone: str) -> None:
++    db = await _adb()
++    current = await db.table("crm_contacts").select("phone_number").eq("phone_number", phone).maybe_single().execute()
++    if current.data:
++        return
++    calls = (await db.table("call_logs").select("*").eq("phone_number", phone).order("timestamp", desc=True).execute()).data or []
++    row = {"phone_number": phone, "crm_status": "New", "updated_at": datetime.now().isoformat()}
++    if calls:
++        row.update({
++            "lead_name": calls[0].get("lead_name"),
++            "last_call_outcome": calls[0].get("outcome"),
++            "last_call_at": calls[0].get("timestamp"),
++            "total_calls": len(calls),
++        })
++    await db.table("crm_contacts").upsert(row, on_conflict="phone_number").execute()
++
++
++async def update_crm_contact_status(phone: str, crm_status: str, custom_status: Optional[str] = None) -> bool:
++    db = await _adb()
++    await _ensure_crm_contact(phone)
++    result = await db.table("crm_contacts").update({"crm_status": crm_status, "custom_status": custom_status, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
++    return len(result.data or []) > 0
++
++
++async def update_crm_contact_followup(phone: str, next_followup_at: Optional[str]) -> bool:
++    db = await _adb()
++    await _ensure_crm_contact(phone)
++    result = await db.table("crm_contacts").update({"next_followup_at": next_followup_at, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
++    return len(result.data or []) > 0
++
++
++async def update_crm_contact_notes(phone: str, crm_notes: str) -> bool:
++    db = await _adb()
++    await _ensure_crm_contact(phone)
++    result = await db.table("crm_contacts").update({"crm_notes": crm_notes, "updated_at": datetime.now().isoformat()}).eq("phone_number", phone).execute()
++    return len(result.data or []) > 0
++
++
+ async def get_stats() -> dict:
+     db = await _adb()
+     rows = (await db.table("call_logs").select("outcome, duration_seconds, timestamp").execute()).data or []
+diff --git a/server.py b/server.py
+index 39029ed..15e2dba 100644
+--- a/server.py
++++ b/server.py
+@@ -34,10 +34,12 @@ from db import (
+     delete_campaign, get_agent_profile,
+     get_all_agent_profiles, get_all_appointments, get_all_calls,
+     get_all_campaigns, get_all_settings, get_calls_by_phone, get_campaign,
+-    get_call_logs_for_export, get_contacts, get_logs, get_setting, get_stats, init_db, log_error,
++    get_call_logs_for_export, get_contacts, get_crm_contacts, get_lead_statuses,
++    get_logs, get_setting, get_stats, init_db, log_error,
+     save_settings, set_default_agent_profile, set_setting,
+-    update_agent_profile, update_call_notes, update_campaign_run_stats,
+-    update_campaign_status,
++    add_lead_status, delete_lead_status, update_agent_profile, update_call_notes,
++    update_campaign_run_stats, update_campaign_status, update_crm_contact_followup,
++    update_crm_contact_notes, update_crm_contact_status,
+ )
+ from prompts import DEFAULT_SYSTEM_PROMPT
+ 
+@@ -142,6 +144,24 @@ class ClearRecordsRequest(BaseModel):
+     confirm: Optional[str] = None
+ 
+ 
++class LeadStatusRequest(BaseModel):
++    name: str
++    color: Optional[str] = None
++
++
++class CrmStatusRequest(BaseModel):
++    crm_status: str
++    custom_status: Optional[str] = None
++
++
++class CrmFollowupRequest(BaseModel):
++    next_followup_at: Optional[str] = None
++
++
++class CrmNotesRequest(BaseModel):
++    crm_notes: str = ""
++
++
+ @app.get("/api/health")
+ async def api_health():
+     """Lightweight healthcheck — does NOT touch Supabase so it stays green during DB blips."""
+@@ -503,6 +523,61 @@ async def api_get_contact_calls(phone: str = Query(...)):
+     return {"data": await get_calls_by_phone(phone)}
+ 
+ 
++@app.get("/api/lead-statuses")
++async def api_get_lead_statuses():
++    return {"data": await get_lead_statuses()}
++
++
++@app.post("/api/lead-statuses")
++async def api_add_lead_status(req: LeadStatusRequest):
++    if not req.name.strip():
++        raise HTTPException(400, "Status name is required")
++    status = await add_lead_status(req.name, req.color)
++    return {"success": True, "data": status}
++
++
++@app.delete("/api/lead-statuses/{status_id}")
++async def api_delete_lead_status(status_id: str):
++    ok = await delete_lead_status(status_id)
++    if not ok:
++        raise HTTPException(404, "Status not found")
++    return {"success": True, "message": "Status deleted"}
++
++
++@app.get("/api/crm/contacts")
++async def api_get_crm_contacts(
++    status: Optional[str] = None,
++    outcome: Optional[str] = None,
++    q: Optional[str] = None,
++    due_today: bool = False,
++):
++    return {"data": await get_crm_contacts(status=status, outcome=outcome, q=q, due_today=due_today)}
++
++
++@app.patch("/api/crm/contacts/{phone}/status")
++async def api_update_crm_status(phone: str, req: CrmStatusRequest):
++    ok = await update_crm_contact_status(phone, req.crm_status, req.custom_status)
++    if not ok:
++        raise HTTPException(404, "CRM contact not found")
++    return {"success": True, "message": "CRM status updated"}
++
++
++@app.patch("/api/crm/contacts/{phone}/followup")
++async def api_update_crm_followup(phone: str, req: CrmFollowupRequest):
++    ok = await update_crm_contact_followup(phone, req.next_followup_at)
++    if not ok:
++        raise HTTPException(404, "CRM contact not found")
++    return {"success": True, "message": "Follow-up updated"}
++
++
++@app.patch("/api/crm/contacts/{phone}/notes")
++async def api_update_crm_notes(phone: str, req: CrmNotesRequest):
++    ok = await update_crm_contact_notes(phone, req.crm_notes)
++    if not ok:
++        raise HTTPException(404, "CRM contact not found")
++    return {"success": True, "message": "CRM notes updated"}
++
++
+ @app.get("/api/agent-profiles")
+ async def api_list_agent_profiles():
+     return await get_all_agent_profiles()
+diff --git a/supabase_schema.sql b/supabase_schema.sql
+index 582163b..4bf2f28 100644
+--- a/supabase_schema.sql
++++ b/supabase_schema.sql
+@@ -86,3 +86,32 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
+     created_at TEXT NOT NULL
+ );
+ ALTER TABLE agent_profiles DISABLE ROW LEVEL SECURITY;
++
++CREATE EXTENSION IF NOT EXISTS pgcrypto;
++
++CREATE TABLE IF NOT EXISTS lead_statuses (
++    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    name text UNIQUE NOT NULL,
++    color text,
++    created_at timestamptz DEFAULT now()
++);
++ALTER TABLE lead_statuses DISABLE ROW LEVEL SECURITY;
++
++CREATE TABLE IF NOT EXISTS crm_contacts (
++    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    phone_number text UNIQUE NOT NULL,
++    lead_name text,
++    crm_status text DEFAULT 'New',
++    custom_status text,
++    next_followup_at timestamptz,
++    assigned_to text,
++    crm_notes text,
++    last_call_outcome text,
++    last_call_at timestamptz,
++    total_calls int DEFAULT 0,
++    created_at timestamptz DEFAULT now(),
++    updated_at timestamptz DEFAULT now()
++);
++ALTER TABLE crm_contacts DISABLE ROW LEVEL SECURITY;
++CREATE INDEX IF NOT EXISTS idx_crm_contacts_status ON crm_contacts (crm_status);
++CREATE INDEX IF NOT EXISTS idx_crm_contacts_followup ON crm_contacts (next_followup_at);
+diff --git a/ui/index.html b/ui/index.html
+index d50d3ae..fae3aff 100644
+--- a/ui/index.html
++++ b/ui/index.html
+@@ -20,14 +20,14 @@
+ <section id="prompt" class="panel"><div class="card"><h2>✏️ AI Prompt</h2><textarea id="prompt-text" style="min-height:460px"></textarea><div class="row"><span id="prompt-count" class="muted"></span><button class="primary" onclick="savePrompt()">Save</button><button class="danger" onclick="resetPrompt()">Reset</button></div></div></section>
+ <section id="appointments" class="panel"><div class="card"><h2>📅 Appointments</h2><div class="row"><input id="appt-date" type="date"><button onclick="loadAppointments()">Filter</button></div><div id="appt-list"></div></div></section>
+ <section id="calls" class="panel"><div class="card"><h2>📝 Call Logs</h2><div class="row"><button class="primary" onclick="exportCalls('xlsx')">Export Excel</button><button onclick="exportCalls('csv')">Export CSV</button></div><div id="calls-list"></div><div class="row"><button onclick="loadCalls(callPage-1)">Prev</button><span id="call-page"></span><button onclick="loadCalls(callPage+1)">Next</button></div></div></section>
+-<section id="crm" class="panel"><div class="grid cols-2"><div class="card"><h2>👥 CRM</h2><div id="crm-list"></div></div><div class="card"><h2>Contact Detail</h2><div id="crm-detail" class="muted">Select a contact.</div></div></div></section>
++<section id="crm" class="panel"><div class="grid cols-2"><div class="card"><h2>👥 CRM</h2><div class="grid cols-2"><input id="crm-q" placeholder="Search name or phone"><select id="crm-status-filter"></select><select id="crm-outcome-filter"><option value="">All outcomes</option></select><label><input id="crm-due-today" type="checkbox" style="width:auto"> Due today</label></div><div class="row"><button onclick="loadCRM()">Apply Filters</button><button onclick="resetCRMFilters()">Reset</button></div><div id="crm-list"></div><hr style="border-color:var(--border);margin:18px 0"><h3>Status Manager</h3><div class="grid cols-3"><input id="new-status-name" placeholder="Status name"><input id="new-status-color" type="color" value="#00ff88"><button onclick="addLeadStatusUI()">Add Status</button></div><div id="status-list"></div></div><div class="card"><h2>Contact Detail</h2><div id="crm-detail" class="muted">Select a contact.</div></div></div></section>
+ <section id="settings" class="panel"><div class="card"><h2>⚙️ Settings</h2><div id="settings-groups" class="grid cols-2"></div></div><div class="card" style="margin-top:16px"><h2>Danger Zone / Clear Records</h2><p class="muted">These actions permanently delete selected records. Settings and agent profiles are not cleared.</p><div class="row" style="margin-top:12px"><button class="danger" onclick="clearAdminRecords('call-logs')">Clear Call Logs</button><button class="danger" onclick="clearAdminRecords('error-logs')">Clear Error Logs</button><button class="danger" onclick="clearAdminRecords('contact-memory')">Clear CRM Memory</button><button class="danger" onclick="clearAdminRecords('appointments')">Clear Appointments</button><button class="danger" onclick="clearAdminRecords('campaigns')">Clear Campaigns</button><button class="danger" onclick="clearAdminRecords('all-test-data',true)">Clear All Test Data</button></div></div></section>
+ <section id="logs" class="panel"><div class="card"><h2>📋 Logs</h2><div class="row"><select id="log-level"><option value="">all</option><option>info</option><option>warning</option><option>error</option></select><input id="log-source" placeholder="source"><button onclick="loadLogs()">Refresh</button><button class="danger" onclick="clearLogs()">Clear</button><button onclick="logsPaused=!logsPaused;this.textContent=logsPaused?'Resume':'Pause'">Pause</button></div><div id="log-box" class="logbox"></div></div></section>
+ <section id="setup" class="panel"><div class="grid cols-2"><div class="card"><h2>🔧 Quick Start</h2><ol><li>Run <code>supabase_schema.sql</code> in Supabase SQL Editor.</li><li>Fill Settings and save credentials.</li><li>Create SIP trunk.</li><li>Create an agent profile.</li><li>Test a single call.</li></ol></div><div class="card"><h2>Cost Breakdown</h2><table><tr><th>Service</th><th>Cost/min</th></tr><tr><td>Vobiz SIP</td><td>₹1.00</td></tr><tr><td>LiveKit</td><td>₹0.17</td></tr><tr><td>Gemini Live</td><td>₹0.03</td></tr><tr><td><b>Total</b></td><td><b>≈ ₹1.20</b></td></tr></table></div></div></section>
+ </main>
+ <script>
+ const tabs=[['stats','📊 Stats'],['single','📞 Single Call'],['batch','📋 Batch Call'],['campaigns','🚀 Campaigns'],['agents','🤖 Agents'],['prompt','✏️ AI Prompt'],['appointments','📅 Appointments'],['calls','📝 Call Logs'],['crm','👥 CRM'],['settings','⚙️ Settings'],['logs','📋 Logs'],['setup','🔧 Setup']];
+-const $=id=>document.getElementById(id);const api=(p,o)=>fetch(p,o).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.detail||j.error||JSON.stringify(j));return j});const apiPost=(p,b)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});const apiDel=p=>fetch(p,{method:'DELETE'});let charts={},batchContacts=[],campContacts=[],callPage=1,logsPaused=false;
++const $=id=>document.getElementById(id);const api=(p,o)=>fetch(p,o).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.detail||j.error||JSON.stringify(j));return j});const apiPost=(p,b)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});const apiDel=p=>fetch(p,{method:'DELETE'});let charts={},batchContacts=[],campContacts=[],callPage=1,logsPaused=false,leadStatuses=[],crmContacts=[];
+ function toast(msg,type='ok'){const d=document.createElement('div');d.className='toast '+(type==='err'?'err':'ok');d.textContent=msg;document.body.appendChild(d);setTimeout(()=>d.remove(),3500)}function showErr(id,msg){$(id).textContent=msg;$(id).className='err'}
+ function switchTab(name){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id===name));if(name==='stats')loadStats();if(name==='campaigns')loadCampaigns();if(name==='agents')loadAgentProfiles();if(name==='prompt')loadPrompt();if(name==='appointments')loadAppointments();if(name==='calls')loadCalls();if(name==='crm')loadCRM();if(name==='settings')loadSettings();if(name==='logs')loadLogs()}
+ function _mkChart(id,type,data,options={}){if(charts[id])charts[id].destroy();charts[id]=new Chart($(id),{type,data,options:{responsive:true,plugins:{legend:{labels:{color:'#ddd'}}},scales:type==='doughnut'?{}:{x:{ticks:{color:'#aaa'},grid:{color:'#222'}},y:{ticks:{color:'#aaa'},grid:{color:'#222'}}},...options}})}
+@@ -41,7 +41,7 @@ async function loadCampaigns(){try{const rows=await api('/api/campaigns');$('cam
+ function voiceOptions(){return `<optgroup label="Female voices"><option value="Aoede">Aoede — warm, expressive ⭐</option><option value="Achernar">Achernar — soft & clear</option><option value="Autonoe">Autonoe — natural female</option><option value="Callirrhoe">Callirrhoe — gentle female</option><option value="Despina">Despina — bright female</option><option value="Erinome">Erinome — smooth female</option><option value="Gacrux">Gacrux — rich female</option><option value="Kore">Kore — soft, calm</option><option value="Laomedeia">Laomedeia — light female</option><option value="Leda">Leda — clear female</option><option value="Pulcherrima">Pulcherrima — warm female</option><option value="Sulafat">Sulafat — smooth female</option><option value="Vindemiatrix">Vindemiatrix — professional female</option><option value="Zephyr">Zephyr — airy female</option></optgroup><optgroup label="Male voices"><option value="Achird">Achird — clear male</option><option value="Algenib">Algenib — strong male</option><option value="Algieba">Algieba — rich male</option><option value="Alnilam">Alnilam — deep male</option><option value="Charon">Charon — calm, deep</option><option value="Enceladus">Enceladus — expressive male</option><option value="Fenrir">Fenrir — confident male</option><option value="Iapetus">Iapetus — steady male</option><option value="Orus">Orus — warm male</option><option value="Perseus">Perseus — clear male</option><option value="Puck">Puck — bright, energetic</option><option value="Rasalgethi">Rasalgethi — bold male</option><option value="Sadachbia">Sadachbia — natural male</option><option value="Sadaltager">Sadaltager — smooth male</option><option value="Schedar">Schedar — professional male</option><option value="Umbriel">Umbriel — deep, calm</option><option value="Zubenelgenubi">Zubenelgenubi — resonant male</option></optgroup>`}
+ async function loadAgentProfiles(){let profiles=[];try{const raw=await api('/api/agent-profiles');profiles=Array.isArray(raw)?raw:[]}catch(e){}const opts='<option value="">Default/global</option>'+profiles.map(p=>`<option value="${p.id}">${esc(p.name)}${p.is_default?' ★':''}</option>`).join('');['f-agent-profile','bc-agent-profile','camp-agent-profile'].forEach(id=>$(id).innerHTML=opts);$('agent-list').innerHTML=table(profiles,['name','voice','model','is_default'],r=>`<button onclick="editAgentProfile('${r.id}')">Edit</button><button onclick="setDefaultAgentProfile('${r.id}','${esc(r.name)}')">★ Default</button><button class="danger" onclick="deleteAgentProfile('${r.id}','${esc(r.name)}')">Delete</button>`)}window.saveAgentProfile=async()=>{let id=$('agent-id').value;let body={name:$('agent-name').value,voice:$('agent-voice').value,model:$('agent-model').value,enabled_tools:$('agent-tools').value,system_prompt:$('agent-prompt').value,is_default:$('agent-default').checked};await api(`/api/agent-profiles${id?'/'+id:''}`,{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Profile saved');resetAgentForm();loadAgentProfiles()};window.editAgentProfile=async id=>{let p=await api('/api/agent-profiles/'+id);$('agent-id').value=p.id;$('agent-name').value=p.name;$('agent-voice').value=p.voice;$('agent-model').value=p.model;$('agent-tools').value=p.enabled_tools||'[]';$('agent-prompt').value=p.system_prompt||'';$('agent-default').checked=!!p.is_default};window.deleteAgentProfile=async id=>{if(confirm('Delete profile?')){await apiDel('/api/agent-profiles/'+id);loadAgentProfiles()}};window.setDefaultAgentProfile=async id=>{await apiPost(`/api/agent-profiles/${id}/set-default`,{});loadAgentProfiles()};window.resetAgentForm=()=>['agent-id','agent-name','agent-prompt'].forEach(id=>$(id).value='')
+ async function loadPrompt(){const p=await api('/api/prompt');$('prompt-text').value=p.prompt;$('prompt-count').textContent=p.prompt.length+' chars'}window.savePrompt=async()=>{await apiPost('/api/prompt',{prompt:$('prompt-text').value});toast('Prompt saved')};window.resetPrompt=async()=>{await apiDel('/api/prompt');loadPrompt()};$('prompt-text').oninput=()=>$('prompt-count').textContent=$('prompt-text').value.length+' chars';
+-async function loadAppointments(){const q=$('appt-date').value?'?date='+$('appt-date').value:'';$('appt-list').innerHTML=table(await api('/api/appointments'+q),['name','phone','date','time','service','status'],r=>`<button class="danger" onclick="cancelAppointment('${r.id}')">Cancel</button>`)}window.cancelAppointment=async id=>{await apiDel('/api/appointments/'+id);loadAppointments()};async function loadCalls(page=1){if(page<1)return;callPage=page;const rows=await api(`/api/calls?page=${page}&limit=20`);$('call-page').textContent='Page '+page;$('calls-list').innerHTML=table(rows,['phone_number','lead_name','outcome','duration_seconds','timestamp','recording_url'],r=>`<textarea id="notes-${r.id}">${esc(r.notes||'')}</textarea><button onclick="saveNotes('${r.id}')">Save Notes</button>`)}window.saveNotes=async id=>{await fetch(`/api/calls/${id}/notes`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({notes:$('notes-'+id).value})});toast('Notes saved')};async function loadCRM(){let r=await api('/api/crm');$('crm-list').innerHTML=table(r.data||[],['phone_number','lead_name','total_calls','booked','last_outcome'],x=>`<button onclick="loadContactDetail('${x.phone_number}')">Open</button>`)}window.loadContactDetail=async phone=>{let r=await api('/api/crm/calls?phone='+encodeURIComponent(phone));$('crm-detail').innerHTML=table(r.data||[])}
++async function loadAppointments(){const q=$('appt-date').value?'?date='+$('appt-date').value:'';$('appt-list').innerHTML=table(await api('/api/appointments'+q),['name','phone','date','time','service','status'],r=>`<button class="danger" onclick="cancelAppointment('${r.id}')">Cancel</button>`)}window.cancelAppointment=async id=>{await apiDel('/api/appointments/'+id);loadAppointments()};async function loadCalls(page=1){if(page<1)return;callPage=page;const rows=await api(`/api/calls?page=${page}&limit=20`);$('call-page').textContent='Page '+page;$('calls-list').innerHTML=table(rows,['phone_number','lead_name','outcome','duration_seconds','timestamp','recording_url'],r=>`<textarea id="notes-${r.id}">${esc(r.notes||'')}</textarea><button onclick="saveNotes('${r.id}')">Save Notes</button>`)}window.saveNotes=async id=>{await fetch(`/api/calls/${id}/notes`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({notes:$('notes-'+id).value})});toast('Notes saved')};async function loadLeadStatuses(){let r=await api('/api/lead-statuses');leadStatuses=r.data||[];const opts='<option value="">All CRM statuses</option>'+leadStatuses.map(s=>`<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');$('crm-status-filter').innerHTML=opts;$('status-list').innerHTML=table(leadStatuses,['name','color'],s=>`<button class="danger" onclick="deleteLeadStatus('${s.id}')">Delete</button>`)}async function loadCRM(){const selectedStatus=$('crm-status-filter').value,selectedOutcome=$('crm-outcome-filter').value;await loadLeadStatuses();$('crm-status-filter').value=selectedStatus;const p=new URLSearchParams();if($('crm-q').value)p.set('q',$('crm-q').value);if(selectedStatus)p.set('status',selectedStatus);if(selectedOutcome)p.set('outcome',selectedOutcome);if($('crm-due-today').checked)p.set('due_today','true');let r=await api('/api/crm/contacts?'+p.toString());crmContacts=r.data||[];const outcomes=[...new Set(crmContacts.map(c=>c.last_call_outcome).filter(Boolean))];$('crm-outcome-filter').innerHTML='<option value="">All outcomes</option>'+outcomes.map(o=>`<option value="${esc(o)}">${esc(o)}</option>`).join('');$('crm-outcome-filter').value=selectedOutcome;$('crm-list').innerHTML=table(crmContacts,['phone_number','lead_name','crm_status','last_call_outcome','total_calls','next_followup_at'],x=>`<button onclick="loadContactDetail('${x.phone_number}')">Open</button>`)}window.resetCRMFilters=()=>{$('crm-q').value='';$('crm-status-filter').value='';$('crm-outcome-filter').value='';$('crm-due-today').checked=false;loadCRM()};window.loadContactDetail=async phone=>{const contact=crmContacts.find(c=>c.phone_number===phone)||{phone_number:phone};let calls=await api('/api/crm/calls?phone='+encodeURIComponent(phone));let statusOptions=leadStatuses.map(s=>`<option value="${esc(s.name)}" ${s.name===(contact.crm_status||'New')?'selected':''}>${esc(s.name)}</option>`).join('');$('crm-detail').innerHTML=`<div class="grid cols-2"><div><label>CRM Status</label><select id="detail-status">${statusOptions}</select></div><div><label>Custom Status</label><input id="detail-custom" value="${esc(contact.custom_status||'')}"></div><div><label>Next Follow-up</label><input id="detail-followup" type="datetime-local" value="${esc((contact.next_followup_at||'').slice(0,16))}"></div><div class="row"><button class="primary" onclick="saveCrmStatus('${phone}')">Save Status</button><button onclick="saveCrmFollowup('${phone}')">Save Follow-up</button></div><div style="grid-column:1/-1"><label>CRM Notes</label><textarea id="detail-notes">${esc(contact.crm_notes||'')}</textarea><button onclick="saveCrmNotes('${phone}')">Save Notes</button></div></div><h3 style="margin-top:16px">Call History</h3>${table(calls.data||[])}`};window.saveCrmStatus=async phone=>{await fetch('/api/crm/contacts/'+encodeURIComponent(phone)+'/status',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({crm_status:$('detail-status').value,custom_status:$('detail-custom').value||null})});toast('CRM status saved');loadCRM()};window.saveCrmFollowup=async phone=>{await fetch('/api/crm/contacts/'+encodeURIComponent(phone)+'/followup',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({next_followup_at:$('detail-followup').value||null})});toast('Follow-up saved');loadCRM()};window.saveCrmNotes=async phone=>{await fetch('/api/crm/contacts/'+encodeURIComponent(phone)+'/notes',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({crm_notes:$('detail-notes').value})});toast('CRM notes saved');loadCRM()};window.addLeadStatusUI=async()=>{await api('/api/lead-statuses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('new-status-name').value,color:$('new-status-color').value})});$('new-status-name').value='';toast('Status added');loadCRM()};window.deleteLeadStatus=async id=>{if(confirm('Delete this status?')){await apiDel('/api/lead-statuses/'+id);toast('Status deleted');loadCRM()}}
+ function exportCalls(format){window.location.href='/api/export/calls.'+format}
+ async function clearAdminRecords(kind,all=false){const msg=all?'This will delete call logs, appointments, CRM memory, campaigns, and error logs. Continue?':'Are you sure? This action cannot be undone.';if(!confirm(msg))return;try{const r=await api('/api/admin/clear/'+kind,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:'CLEAR_RECORDS'})});toast(r.message||'Records cleared');loadStats();loadCalls();loadAppointments();loadCampaigns();loadCRM();loadLogs()}catch(e){toast(e.message,'err')}}
+ const groups={LiveKit:['LIVEKIT_URL','LIVEKIT_API_KEY','LIVEKIT_API_SECRET'],Gemini:['GOOGLE_API_KEY','GEMINI_MODEL','GEMINI_TTS_VOICE','USE_GEMINI_REALTIME'],Vobiz:['VOBIZ_SIP_DOMAIN','VOBIZ_USERNAME','VOBIZ_PASSWORD','VOBIZ_OUTBOUND_NUMBER','OUTBOUND_TRUNK_ID','DEFAULT_TRANSFER_NUMBER'],Twilio:['TWILIO_ACCOUNT_SID','TWILIO_AUTH_TOKEN','TWILIO_FROM_NUMBER'],S3:['S3_ACCESS_KEY_ID','S3_SECRET_ACCESS_KEY','S3_ENDPOINT_URL','S3_REGION','S3_BUCKET'],Calcom:['CALCOM_API_KEY','CALCOM_EVENT_TYPE_ID','CALCOM_TIMEZONE'],Tools:['ENABLED_TOOLS']};async function loadSettings(){const s=await api('/api/settings');$('settings-groups').innerHTML=Object.entries(groups).map(([g,keys])=>`<div class="card"><h3>${g}</h3>${keys.map(k=>`<label>${k} <span class="badge ${s[k]?.configured?'ok':'err'}">${s[k]?.configured?'configured':'missing'}</span></label><input id="set-${k}" type="${k.includes('KEY')||k.includes('SECRET')||k.includes('TOKEN')||k.includes('PASSWORD')?'password':'text'}" value="${esc(s[k]?.value||'')}">`).join('')}<button class="primary" onclick="saveGroup('${g}')">Save ${g}</button>${g==='Vobiz'?'<button onclick="createSIPTrunk()">⚡ Create SIP Trunk</button>':''}</div>`).join('')}async function saveGroup(g){let settings={};groups[g].forEach(k=>settings[k]=$('set-'+k).value);await apiPost('/api/settings',{settings});toast(g+' saved')}window.createSIPTrunk=async()=>{let r=await api('/api/setup/trunk',{method:'POST'});toast('Trunk: '+r.trunk_id)};window.saveToolToggles=async()=>saveGroup('Tools');

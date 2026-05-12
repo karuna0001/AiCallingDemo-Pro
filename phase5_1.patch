@@ -1,0 +1,96 @@
+diff --git a/server.py b/server.py
+index 815243a..269c40f 100644
+--- a/server.py
++++ b/server.py
+@@ -214,21 +214,32 @@ async def api_health():
+             val = os.getenv(env_key, "")
+             if val:
+                 return val
+-        if os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_KEY"):
+-            try:
+-                return await get_setting(key, "")
+-            except Exception:
+-                return ""
+         return ""
+ 
++    async def supabase_status(url: str, key: str) -> tuple[bool, Optional[str]]:
++        if not (url and key):
++            return False, None
++        try:
++            timeout = aiohttp.ClientTimeout(total=3)
++            headers = {"apikey": key, "Authorization": f"Bearer {key}"}
++            async with aiohttp.ClientSession(timeout=timeout) as session:
++                async with session.get(f"{url.rstrip('/')}/rest/v1/", headers=headers) as resp:
++                    if resp.status in (401, 403):
++                        return False, "Invalid API key"
++                    return True, None
++        except Exception:
++            return True, None
++
+     livekit_url = await status_value("LIVEKIT_URL")
+     livekit_key = await status_value("LIVEKIT_API_KEY")
+     livekit_secret = await status_value("LIVEKIT_API_SECRET")
+     google_key = await status_value("GOOGLE_API_KEY")
++    supabase_url = await status_value("SUPABASE_URL")
++    supabase_key = await status_value("SUPABASE_SERVICE_KEY")
+     trunk_id = await status_value("OUTBOUND_TRUNK_ID")
+     gemini_model = await status_value("GEMINI_MODEL")
+     gemini_voice = await status_value("GEMINI_TTS_VOICE")
+-    prompt_saved = await status_value("system_prompt")
++    prompt_saved = await status_value("SYSTEM_PROMPT", "system_prompt")
+     s3_key = await status_value("S3_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")
+     s3_secret = await status_value("S3_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY")
+     s3_bucket = await status_value("S3_BUCKET", "AWS_BUCKET_NAME")
+@@ -237,20 +248,24 @@ async def api_health():
+         recording_retention_days = max(int(await status_value("RECORDING_RETENTION_DAYS") or "7"), 1)
+     except ValueError:
+         recording_retention_days = 7
+-    return {
++    supabase_configured, supabase_error = await supabase_status(supabase_url, supabase_key)
++    response = {
+         "status": "ok",
+         "livekit_configured": bool(livekit_url and livekit_key and livekit_secret),
+         "gemini_configured": bool(google_key),
+-        "supabase_configured": bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_KEY")),
++        "supabase_configured": supabase_configured,
+         "trunk_configured": bool(trunk_id),
+         "gemini_model_configured": bool(gemini_model),
+         "gemini_tts_voice_configured": bool(gemini_voice),
+         "prompt_configured": bool(prompt_saved),
+-        "prompt_mode": "custom" if prompt_saved else "default",
++        "prompt_mode": "custom" if prompt_saved else "unknown",
+         "s3_configured": bool(s3_key and s3_secret and s3_bucket),
+         "recording_auto_delete_enabled": recording_auto_delete,
+         "recording_retention_days": recording_retention_days,
+     }
++    if supabase_error:
++        response["supabase_error"] = supabase_error
++    return response
+ 
+ 
+ @app.get("/", response_class=HTMLResponse)
+diff --git a/ui/index.html b/ui/index.html
+index 86337b1..60e3576 100644
+--- a/ui/index.html
++++ b/ui/index.html
+@@ -13,7 +13,7 @@
+ <body>
+ <header><h1>OutboundAI <small>production outbound voice dashboard</small></h1><nav id="tabs"></nav></header>
+ <main>
+-<section id="stats" class="panel active"><div class="grid cols-4"><div class="card"><div>Total Calls</div><div id="k-total" class="kpi">0</div></div><div class="card"><div>Booked</div><div id="k-booked" class="kpi">0</div></div><div class="card"><div>Not Interested</div><div id="k-ni" class="kpi">0</div></div><div class="card"><div>Booking Rate</div><div id="k-rate" class="kpi">0%</div></div></div><div class="card" style="margin-top:16px"><b>Live Config</b><div id="live-config" class="row" style="margin-top:10px"></div></div><div class="grid cols-3" style="margin-top:16px"><div class="card"><canvas id="chart-outcomes"></canvas></div><div class="card"><canvas id="chart-timeline"></canvas></div><div class="card"><canvas id="chart-duration"></canvas></div></div></section>
++<section id="stats" class="panel active"><div class="grid cols-4"><div class="card"><div>Total Calls</div><div id="k-total" class="kpi">0</div></div><div class="card"><div>Booked</div><div id="k-booked" class="kpi">0</div></div><div class="card"><div>Not Interested</div><div id="k-ni" class="kpi">0</div></div><div class="card"><div>Booking Rate</div><div id="k-rate" class="kpi">0%</div></div></div><p id="stats-error" class="err" style="margin-top:10px"></p><div class="card" style="margin-top:16px"><b>Live Config</b><div id="live-config" class="row" style="margin-top:10px"></div></div><div class="grid cols-3" style="margin-top:16px"><div class="card"><canvas id="chart-outcomes"></canvas></div><div class="card"><canvas id="chart-timeline"></canvas></div><div class="card"><canvas id="chart-duration"></canvas></div></div></section>
+ <section id="single" class="panel"><div class="card"><h2>📞 Single Call</h2><form id="call-form" class="grid cols-2"><div><label>Phone (E.164)</label><input id="f-phone" required placeholder="+919876543210"></div><div><label>Agent Profile</label><select id="f-agent-profile"></select></div><div><label>Lead Name</label><input id="f-lead" value="there"></div><div><label>Business Name</label><input id="f-business" value="our company"></div><div><label>Service Type</label><input id="f-service" value="our service"></div><div><label><input id="f-custom-on" type="checkbox" style="width:auto"> Custom prompt</label></div><div class="cols-2" style="grid-column:1/-1"><textarea id="f-prompt" class="hidden"></textarea></div><button class="primary" type="submit">Dispatch Call</button></form><p id="call-msg" class="muted"></p></div></section>
+ <section id="batch" class="panel"><div class="card"><h2>📋 Batch Call</h2><div class="grid cols-2"><div><label>Agent Profile</label><select id="bc-agent-profile"></select></div><div><label>Delay seconds</label><input id="bc-delay" type="number" value="3"></div><div><label>CSV File</label><input id="bc-file" type="file" accept=".csv,text/csv"></div><div><label>CSV Text</label><textarea id="bc-text" placeholder="phone,lead_name,business_name,service_type"></textarea></div></div><div class="row"><button onclick="parseBatch()">Parse CSV</button><button class="primary" onclick="startBatch()">Start Batch</button></div><div class="progress"><div id="bc-bar" class="bar"></div></div><div id="bc-preview"></div></div></section>
+ <section id="campaigns" class="panel"><div class="card"><h2>🚀 Campaigns</h2><div class="grid cols-3"><div><label>Name</label><input id="camp-name"></div><div><label>Schedule</label><select id="camp-schedule"><option>once</option><option>daily</option><option>weekdays</option></select></div><div><label>Time</label><input id="camp-time" type="time" value="09:00"></div><div><label>Delay</label><input id="camp-delay" type="number" value="3"></div><div><label>Agent Profile</label><select id="camp-agent-profile"></select></div><div><label>CSV File</label><input id="camp-file" type="file" accept=".csv,text/csv"></div><div style="grid-column:1/-1"><label>Contacts CSV/Text</label><textarea id="camp-text" placeholder="phone,lead_name,business_name,service_type"></textarea></div><div style="grid-column:1/-1"><label><input id="camp-custom-on" type="checkbox" style="width:auto"> Custom prompt</label><textarea id="camp-prompt" class="hidden"></textarea></div></div><button class="primary" onclick="createCampaign()">Create Campaign</button><div id="campaign-list"></div></div></section>
+@@ -33,8 +33,9 @@ function toast(msg,type='ok'){const d=document.createElement('div');d.className=
+ function switchTab(name){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id===name));if(name==='stats')loadStats();if(name==='campaigns')loadCampaigns();if(name==='agents')loadAgentProfiles();if(name==='prompt')loadPrompt();if(name==='appointments')loadAppointments();if(name==='calls')loadCalls();if(name==='crm')loadCRM();if(name==='settings')loadSettings();if(name==='logs')loadLogs()}
+ function _mkChart(id,type,data,options={}){if(charts[id])charts[id].destroy();charts[id]=new Chart($(id),{type,data,options:{responsive:true,plugins:{legend:{labels:{color:'#ddd'}}},scales:type==='doughnut'?{}:{x:{ticks:{color:'#aaa'},grid:{color:'#222'}},y:{ticks:{color:'#aaa'},grid:{color:'#222'}}},...options}})}
+ function _renderCharts(d){const outcomes=d.outcomes||{};_mkChart('chart-outcomes','doughnut',{labels:Object.keys(outcomes),datasets:[{data:Object.values(outcomes),backgroundColor:['#00ff88','#00ccff','#ffaa00','#ff4d4d','#888']}]});_mkChart('chart-timeline','line',{labels:(d.timeline||[]).map(x=>x.date.slice(5)),datasets:[{label:'Calls',data:(d.timeline||[]).map(x=>x.count),borderColor:'#00ccff',backgroundColor:'#00ccff33'}]});const dur=d.duration_by_outcome||{};_mkChart('chart-duration','bar',{labels:Object.keys(dur),datasets:[{label:'Avg sec',data:Object.values(dur),backgroundColor:'#00ff88'}]})}
+-async function loadStats(){try{const d=await api('/api/stats');$('k-total').textContent=d.total_calls||0;$('k-booked').textContent=d.booked||0;$('k-ni').textContent=d.not_interested||0;$('k-rate').textContent=(d.booking_rate_percent||0)+'%';_renderCharts(d);loadLiveConfig()}catch(e){toast(e.message,'err')}}
+-async function loadLiveConfig(){try{const h=await api('/api/health');const badge=(label,ok,good='configured',bad='missing')=>`<span class="badge ${ok?'ok':'err'}">${label}: ${ok?good:bad}</span>`;$('live-config').innerHTML=[badge('LIVEKIT_URL',h.livekit_configured),badge('GOOGLE_API_KEY',h.gemini_configured),badge('OUTBOUND_TRUNK_ID',h.trunk_configured),badge('SUPABASE_SERVICE_KEY',h.supabase_configured),badge('GEMINI_MODEL',h.gemini_model_configured),badge('GEMINI_TTS_VOICE',h.gemini_tts_voice_configured),`<span class="badge ${h.prompt_mode==='custom'?'ok':'warnc'}">Prompt: ${esc(h.prompt_mode||'default')}</span>`,badge('S3/R2 Storage',h.s3_configured),`<span class="badge ${h.recording_auto_delete_enabled?'ok':'warnc'}">Recording Retention: ${h.recording_auto_delete_enabled?'ON':'OFF'}</span>`,`<span class="badge">Retention Days: ${esc(h.recording_retention_days||7)}</span>`].join('')}catch(e){$('live-config').innerHTML='<span class="err">Unable to load config status</span>'}}
++function loadCharts(d){try{_renderCharts(d)}catch(e){$('stats-error').textContent='Charts unavailable: '+e.message}}
++async function loadStats(){loadHealthConfig();try{const d=await api('/api/stats');$('stats-error').textContent='';$('k-total').textContent=d.total_calls||0;$('k-booked').textContent=d.booked||0;$('k-ni').textContent=d.not_interested||0;$('k-rate').textContent=(d.booking_rate_percent||0)+'%';loadCharts(d)}catch(e){$('stats-error').textContent='Stats unavailable: '+e.message}}
++async function loadHealthConfig(){try{const h=await api('/api/health');const badge=(label,ok,good='configured',bad='missing')=>`<span class="badge ${ok?'ok':'err'}">${label}: ${ok?good:bad}</span>`;const supabaseText=h.supabase_error==='Invalid API key'?'invalid':'configured';$('live-config').innerHTML=[badge('LIVEKIT_URL',h.livekit_configured),badge('GOOGLE_API_KEY',h.gemini_configured),`<span class="badge ${h.supabase_configured?'ok':'err'}">SUPABASE_SERVICE_KEY: ${h.supabase_configured?supabaseText:(h.supabase_error==='Invalid API key'?'invalid':'missing')}</span>`,badge('OUTBOUND_TRUNK_ID',h.trunk_configured),badge('GEMINI_MODEL',h.gemini_model_configured),badge('GEMINI_TTS_VOICE',h.gemini_tts_voice_configured),`<span class="badge ${h.prompt_mode==='custom'?'ok':'warnc'}">Prompt: ${esc(h.prompt_mode||'unknown')}</span>`,badge('S3/R2 Storage',h.s3_configured),`<span class="badge ${h.recording_auto_delete_enabled?'ok':'warnc'}">Recording Retention: ${h.recording_auto_delete_enabled?'ON':'OFF'}</span>`,`<span class="badge">Retention Days: ${esc(h.recording_retention_days||7)}</span>`].join('')}catch(e){$('live-config').innerHTML='<span class="err">Unable to load config status</span>'}}
+ $('call-form').onsubmit=async e=>{e.preventDefault();try{const body={phone:$('f-phone').value,lead_name:$('f-lead').value,business_name:$('f-business').value,service_type:$('f-service').value,agent_profile_id:$('f-agent-profile').value||null,system_prompt:$('f-custom-on').checked?$('f-prompt').value:null};const r=await api('/api/call',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('call-msg').textContent='Dispatched: '+r.room;toast('Call dispatched')}catch(e){showErr('call-msg',e.message)}};$('f-custom-on').onchange=e=>$('f-prompt').classList.toggle('hidden',!e.target.checked);$('camp-custom-on').onchange=e=>$('camp-prompt').classList.toggle('hidden',!e.target.checked);
+ function csvParse(text){const lines=text.trim().split(/\r?\n/).filter(Boolean);if(!lines.length)return[];let headers=lines[0].split(',').map(x=>x.trim());let start=headers.includes('phone')?1:0;if(start===0)headers=['phone','lead_name','business_name','service_type'];return lines.slice(start).map(l=>{let v=l.split(',').map(x=>x.trim());let o={};headers.forEach((h,i)=>o[h]=v[i]||'');return o}).filter(x=>x.phone)}
+ async function readFile(id, textId){const f=$(id).files[0];if(f)$(textId).value=await f.text()}async function parseBatch(){await readFile('bc-file','bc-text');batchContacts=csvParse($('bc-text').value);$('bc-preview').innerHTML=table(batchContacts.slice(0,20));toast(`Parsed ${batchContacts.length}`)}async function startBatch(){if(!batchContacts.length)await parseBatch();let delay=+$('bc-delay').value||3;for(let i=0;i<batchContacts.length;i++){let c=batchContacts[i];await api('/api/call',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:c.phone,lead_name:c.lead_name||'there',business_name:c.business_name||'our company',service_type:c.service_type||'our service',agent_profile_id:$('bc-agent-profile').value||null})}).catch(e=>toast(e.message,'err'));$('bc-bar').style.width=((i+1)/batchContacts.length*100)+'%';if(i<batchContacts.length-1)await new Promise(r=>setTimeout(r,delay*1000))}toast('Batch complete')}

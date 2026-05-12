@@ -60,11 +60,184 @@
 <section id="crm" class="panel"><div class="grid cols-2"><div class="card"><h2>👥 CRM</h2><div id="crm-summary" class="grid cols-4"></div><div id="crm-quick-filters" class="row" style="margin:10px 0;gap:8px;flex-wrap:wrap"></div><h3>Upload Leads</h3><div class="row"><input id="lead-upload-file" type="file" accept=".csv,.xlsx"><button class="primary" onclick="uploadLeads()">Upload</button><button onclick="location.href='/api/crm/sample-leads.csv'">Download Sample CSV</button></div><p id="lead-upload-result" class="muted"></p><h3>Manual Add Lead</h3><div class="grid cols-3"><input id="lead-name" placeholder="Lead Name"><input id="lead-phone" placeholder="Phone Number"><input id="lead-email" placeholder="Email"><input id="lead-city" placeholder="City"><input id="lead-location" placeholder="Location"><input id="lead-requirement" placeholder="Requirement"><input id="lead-budget" placeholder="Budget"><input id="lead-source" placeholder="Source"><input id="lead-business" placeholder="Business Name"><input id="lead-campaign" placeholder="Campaign Name"><input id="lead-service" placeholder="Service Type"><textarea id="lead-notes" placeholder="Notes"></textarea></div><button class="primary" onclick="addManualLead()">Add Lead</button><h3>Filters</h3><div class="grid cols-3"><input id="crm-q" placeholder="Search name or phone"><select id="crm-status-filter"></select><select id="crm-outcome-filter"><option value="">All outcomes</option></select><input id="crm-source-filter" placeholder="Source"><input id="crm-business-filter" placeholder="Business Name"><input id="crm-campaign-filter" placeholder="Campaign Name"><input id="crm-city-filter" placeholder="City"><label><input id="crm-due-today" type="checkbox" style="width:auto"> Due today</label></div><div class="row"><button onclick="loadCRM()">Apply Filter</button><button onclick="resetCRMFilters()">Reset</button><button onclick="exportCrmLeads('xlsx')">Download Filtered Leads Excel</button><button onclick="exportCrmLeads('csv')">Download Filtered Leads CSV</button></div><div class="row"><button class="primary" onclick="callSelectedLeads()">Start Calling Selected Leads</button><button onclick="markSelectedStatus('Hot Lead')">Mark Selected as Hot Lead</button><button onclick="markSelectedStatus('Not Interested')">Mark Selected as Not Interested</button></div><div id="crm-list"></div><hr style="border-color:var(--border);margin:18px 0"><h3>Status Manager</h3><div class="grid cols-3"><input id="new-status-name" placeholder="Status name"><input id="new-status-color" type="color" value="#00ff88"><button onclick="addLeadStatusUI()">Add Status</button></div><div id="status-list"></div></div><div class="card"><h2>Lead Detail</h2><div id="crm-detail" class="muted">Select a contact.</div></div></div></section>
 <section id="settings" class="panel"><div class="card"><h2>⚙️ Settings</h2><div id="settings-groups" class="grid cols-2"></div></div><div class="card" style="margin-top:16px"><h2>📞 Outbound Calling Schedule</h2><div class="grid cols-2" style="gap:12px"><div><label>Timezone</label><input id="ob-tz" type="text" placeholder="Asia/Kolkata" value="Asia/Kolkata"></div><div><label>Calling Enabled</label><select id="ob-enabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></div><div><label>Start Time</label><input id="ob-start" type="time" value="10:00"></div><div><label>End Time</label><input id="ob-end" type="time" value="19:00"></div></div><div style="margin-top:12px"><label style="font-weight:600">Allowed Days</label><div id="ob-days" class="row" style="gap:10px;flex-wrap:wrap;margin-top:6px"></div></div><div style="margin-top:14px"><button class="primary" onclick="saveOutboundSchedule()">Save Schedule Settings</button></div><div id="ob-status" style="margin-top:12px;padding:10px;border-radius:8px;display:none"></div></div><div class="card" style="margin-top:16px"><h2>Recording Storage &amp; Retention</h2><div class="grid cols-3"><div><label>Auto delete old recordings</label><select id="rec-auto"><option value="false">OFF</option><option value="true">ON</option></select></div><div><label>Keep recordings for days</label><input id="rec-days" type="number" min="1" value="7"></div><div><label>Cleanup time</label><input id="rec-time" type="time" value="02:00"></div></div><div class="row" style="margin-top:12px"><button class="primary" onclick="saveRecordingSettings()">Save Settings</button><button onclick="loadRecordingStorage()">Refresh Storage Usage</button><button class="danger" onclick="cleanupRecordingsNow()">Delete Old Recordings Now</button></div><div id="recording-storage" class="row" style="margin-top:12px"></div></div><div class="card" style="margin-top:16px"><h2>Danger Zone / Clear Records</h2><p class="muted">These actions permanently delete selected records. Settings and agent profiles are not cleared.</p><div class="row" style="margin-top:12px"><button class="danger" onclick="clearAdminRecords('call-logs')">Clear Call Logs</button><button class="danger" onclick="clearAdminRecords('error-logs')">Clear Error Logs</button><button class="danger" onclick="clearAdminRecords('contact-memory')">Clear CRM Memory</button><button class="danger" onclick="clearAdminRecords('appointments')">Clear Appointments</button><button class="danger" onclick="clearAdminRecords('campaigns')">Clear Campaigns</button><button class="danger" onclick="clearAdminRecords('all-test-data',true)">Clear All Test Data</button></div></div></section>
 <section id="logs" class="panel"><div class="card"><h2>📋 Logs</h2><div class="row"><select id="log-level"><option value="">all</option><option>info</option><option>warning</option><option>error</option></select><input id="log-source" placeholder="source"><button onclick="loadLogs()">Refresh</button><button class="danger" onclick="clearLogs()">Clear</button><button onclick="logsPaused=!logsPaused;this.textContent=logsPaused?'Resume':'Pause'">Pause</button></div><div id="log-box" class="logbox"></div></div></section>
+<section id="kb" class="panel">
+<div class="card">
+  <h2>📚 Knowledge Base / Company Details</h2>
+  <p class="muted" style="margin-bottom:10px">AI voice agent uses this information to answer customer questions about your business.</p>
+  <div class="row" style="gap:8px;margin-bottom:14px;flex-wrap:wrap">
+    <button onclick="kbLoadSample()" style="border:1.5px dashed #555;background:transparent;color:#aaa">📋 Load Sample Data</button>
+    <button onclick="kbRefreshPreview()">🔍 Preview AI Context</button>
+  </div>
+  <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:14px" id="kb-tabs-nav">
+    <button class="kb-tab-btn active" onclick="kbSwitchTab('company')">🏢 Company</button>
+    <button class="kb-tab-btn" onclick="kbSwitchTab('contact')">📞 Contact</button>
+    <button class="kb-tab-btn" onclick="kbSwitchTab('hours')">🕐 Hours</button>
+    <button class="kb-tab-btn" onclick="kbSwitchTab('locations')">📍 Locations</button>
+    <button class="kb-tab-btn" onclick="kbSwitchTab('services')">🛠 Services</button>
+    <button class="kb-tab-btn" onclick="kbSwitchTab('packages')">📦 Packages</button>
+    <button class="kb-tab-btn" onclick="kbSwitchTab('faqs')">❓ FAQs</button>
+    <button class="kb-tab-btn" onclick="kbSwitchTab('policies')">📄 Policies</button>
+    <button class="kb-tab-btn" onclick="kbSwitchTab('appt')">📅 Appointments</button>
+    <button class="kb-tab-btn" onclick="kbSwitchTab('transfer')">👤 Transfer</button>
+    <button class="kb-tab-btn" onclick="kbSwitchTab('preview')">👁 AI Preview</button>
+  </div>
+  <style>.kb-tab-btn{background:#1a1a2e;border:1px solid #333;color:#ccc;border-radius:6px;padding:5px 12px;cursor:pointer;font-size:0.85rem}.kb-tab-btn.active{background:#7c6af7;border-color:#7c6af7;color:#fff}.kb-panel{display:none}.kb-panel.active{display:block}</style>
+
+  <!-- Company Profile -->
+  <div class="kb-panel active" id="kbp-company">
+    <h3 style="margin-bottom:10px">🏢 Company Profile</h3>
+    <div class="grid cols-2" style="gap:10px">
+      <div><label>Business Name</label><input id="kb-business_name" placeholder="e.g. Ladder Hub Services"></div>
+      <div><label>Legal Name</label><input id="kb-legal_name" placeholder="Legal registered name"></div>
+      <div><label>Industry Type</label><select id="kb-industry_type"><option value="">Select industry</option><option>Interior Services</option><option>Builder / Real Estate</option><option>Doctor / Clinic</option><option>Home Loan</option><option>Credit Card</option><option>Education</option><option>Insurance</option><option>Local Services</option><option>Other</option></select></div>
+      <div><label>Owner Name</label><input id="kb-owner_name" placeholder="Owner or contact person"></div>
+      <div><label>Website</label><input id="kb-cp-website" placeholder="https://..."></div>
+      <div><label>Email</label><input id="kb-cp-email" placeholder="info@company.com"></div>
+      <div><label>Phone</label><input id="kb-cp-phone" placeholder="+91..."></div>
+      <div><label>WhatsApp Number</label><input id="kb-cp-whatsapp" placeholder="+91..."></div>
+      <div style="grid-column:1/-1"><label>Short Description</label><input id="kb-short_description" placeholder="One line about your business"></div>
+      <div style="grid-column:1/-1"><label>About Us</label><textarea id="kb-about_us" style="min-height:100px" placeholder="Describe your business, values, experience..."></textarea></div>
+    </div>
+    <div class="row" style="margin-top:10px"><button class="primary" onclick="kbSaveSection('company_profile')">💾 Save Company Profile</button></div>
+    <p id="kb-company-msg" class="muted" style="min-height:1.2em;margin-top:4px"></p>
+  </div>
+
+  <!-- Contact Details -->
+  <div class="kb-panel" id="kbp-contact">
+    <h3 style="margin-bottom:10px">📞 Contact Details</h3>
+    <div class="grid cols-2" style="gap:10px">
+      <div><label>Primary Phone</label><input id="kb-primary_phone" placeholder="+91..."></div>
+      <div><label>Support Phone</label><input id="kb-support_phone" placeholder="+91..."></div>
+      <div><label>WhatsApp Number</label><input id="kb-cd-whatsapp" placeholder="+91..."></div>
+      <div><label>Email</label><input id="kb-cd-email" placeholder="support@company.com"></div>
+      <div><label>Website</label><input id="kb-cd-website" placeholder="https://..."></div>
+      <div><label>City</label><input id="kb-city" placeholder="Mumbai"></div>
+      <div><label>State</label><input id="kb-state" placeholder="Maharashtra"></div>
+      <div><label>Country</label><input id="kb-country" placeholder="India"></div>
+      <div style="grid-column:1/-1"><label>Address</label><input id="kb-address" placeholder="Full office/branch address"></div>
+      <div style="grid-column:1/-1"><label>Google Maps Link</label><input id="kb-google_maps_link" placeholder="https://maps.google.com/..."></div>
+    </div>
+    <div class="row" style="margin-top:10px"><button class="primary" onclick="kbSaveSection('contact_details')">💾 Save Contact Details</button></div>
+    <p id="kb-contact-msg" class="muted" style="min-height:1.2em;margin-top:4px"></p>
+  </div>
+
+  <!-- Working Hours -->
+  <div class="kb-panel" id="kbp-hours">
+    <h3 style="margin-bottom:10px">🕐 Working Hours</h3>
+    <div class="grid cols-2" style="gap:10px">
+      <div><label>Timezone</label><input id="kb-timezone" placeholder="Asia/Kolkata"></div>
+      <div><label>Opening Time</label><input id="kb-opening_time" type="time"></div>
+      <div><label>Closing Time</label><input id="kb-closing_time" type="time"></div>
+      <div><label>Emergency Support</label><select id="kb-emergency_support_available"><option value="false">No</option><option value="true">Yes</option></select></div>
+    </div>
+    <div style="margin:10px 0"><label style="font-weight:600">Opening Days</label><div id="kb-days-checkboxes" class="row" style="gap:10px;flex-wrap:wrap;margin-top:6px"></div></div>
+    <div><label>Holiday Notes</label><textarea id="kb-holiday_notes" style="min-height:60px" placeholder="e.g. Closed on all national holidays"></textarea></div>
+    <div class="row" style="margin-top:10px"><button class="primary" onclick="kbSaveSection('working_hours')">💾 Save Working Hours</button></div>
+    <p id="kb-hours-msg" class="muted" style="min-height:1.2em;margin-top:4px"></p>
+  </div>
+
+  <!-- Locations -->
+  <div class="kb-panel" id="kbp-locations">
+    <h3 style="margin-bottom:10px">📍 Locations / Branches</h3>
+    <button onclick="kbAddLocation()">+ Add Branch</button>
+    <div id="kb-locations-list" style="margin-top:12px"></div>
+    <div class="row" style="margin-top:10px"><button class="primary" onclick="kbSaveSection('locations')">💾 Save Locations</button></div>
+    <p id="kb-locations-msg" class="muted" style="min-height:1.2em;margin-top:4px"></p>
+  </div>
+
+  <!-- Services -->
+  <div class="kb-panel" id="kbp-services">
+    <h3 style="margin-bottom:10px">🛠 Products / Services</h3>
+    <button onclick="kbAddService()">+ Add Service</button>
+    <div id="kb-services-list" style="margin-top:12px"></div>
+    <div class="row" style="margin-top:10px"><button class="primary" onclick="kbSaveSection('services')">💾 Save Services</button></div>
+    <p id="kb-services-msg" class="muted" style="min-height:1.2em;margin-top:4px"></p>
+  </div>
+
+  <!-- Packages -->
+  <div class="kb-panel" id="kbp-packages">
+    <h3 style="margin-bottom:10px">📦 Pricing / Packages</h3>
+    <button onclick="kbAddPackage()">+ Add Package</button>
+    <div id="kb-packages-list" style="margin-top:12px"></div>
+    <div class="row" style="margin-top:10px"><button class="primary" onclick="kbSaveSection('packages')">💾 Save Packages</button></div>
+    <p id="kb-packages-msg" class="muted" style="min-height:1.2em;margin-top:4px"></p>
+  </div>
+
+  <!-- FAQs -->
+  <div class="kb-panel" id="kbp-faqs">
+    <h3 style="margin-bottom:10px">❓ FAQs</h3>
+    <div class="row" style="gap:8px;margin-bottom:8px">
+      <button onclick="kbAddFaq()">+ Add FAQ</button>
+      <input id="kb-faq-search" placeholder="Search FAQs..." style="flex:1" oninput="kbFilterFaqs()">
+    </div>
+    <div id="kb-faqs-list" style="margin-top:4px"></div>
+    <div class="row" style="margin-top:10px"><button class="primary" onclick="kbSaveSection('faqs')">💾 Save FAQs</button></div>
+    <p id="kb-faqs-msg" class="muted" style="min-height:1.2em;margin-top:4px"></p>
+  </div>
+
+  <!-- Policies -->
+  <div class="kb-panel" id="kbp-policies">
+    <h3 style="margin-bottom:10px">📄 Policies</h3>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <div><label>Cancellation Policy</label><textarea id="kb-cancellation_policy" style="min-height:70px"></textarea></div>
+      <div><label>Refund Policy</label><textarea id="kb-refund_policy" style="min-height:70px"></textarea></div>
+      <div><label>Privacy Policy</label><textarea id="kb-privacy_policy" style="min-height:70px"></textarea></div>
+      <div><label>Appointment Policy</label><textarea id="kb-appointment_policy" style="min-height:70px"></textarea></div>
+      <div><label>Payment Policy</label><textarea id="kb-payment_policy" style="min-height:70px"></textarea></div>
+      <div><label>Terms Notes</label><textarea id="kb-terms_notes" style="min-height:70px"></textarea></div>
+    </div>
+    <div class="row" style="margin-top:10px"><button class="primary" onclick="kbSaveSection('policies')">💾 Save Policies</button></div>
+    <p id="kb-policies-msg" class="muted" style="min-height:1.2em;margin-top:4px"></p>
+  </div>
+
+  <!-- Appointment Rules -->
+  <div class="kb-panel" id="kbp-appt">
+    <h3 style="margin-bottom:10px">📅 Appointment Rules</h3>
+    <div class="grid cols-2" style="gap:10px">
+      <div><label>Appointment Required</label><select id="kb-appointment_required"><option value="false">No</option><option value="true">Yes</option></select></div>
+      <div><label>Allow Same-day Booking</label><select id="kb-allow_same_day_booking"><option value="true">Yes</option><option value="false">No</option></select></div>
+      <div><label>Duration (minutes)</label><input id="kb-appointment_duration_minutes" type="number" value="30"></div>
+      <div><label>Buffer (minutes)</label><input id="kb-appointment_buffer_minutes" type="number" value="15"></div>
+      <div><label>Default Visit Type</label><select id="kb-default_visit_type"><option value="phone_consultation">Phone Consultation</option><option value="online_meeting">Online Meeting</option><option value="showroom">Showroom Visit</option><option value="site_visit">Site Visit</option></select></div>
+      <div><label>Confirmation Required</label><select id="kb-confirmation_required"><option value="true">Yes</option><option value="false">No</option></select></div>
+      <div><label>Reminder Before (hours)</label><input id="kb-reminder_before_hours" type="number" value="24"></div>
+    </div>
+    <div class="row" style="margin-top:10px"><button class="primary" onclick="kbSaveSection('appointment_rules')">💾 Save Appointment Rules</button></div>
+    <p id="kb-appt-msg" class="muted" style="min-height:1.2em;margin-top:4px"></p>
+  </div>
+
+  <!-- Human Transfer Rules -->
+  <div class="kb-panel" id="kbp-transfer">
+    <h3 style="margin-bottom:10px">👤 Human Transfer Rules</h3>
+    <div class="grid cols-2" style="gap:10px">
+      <div><label>Transfer Enabled</label><select id="kb-transfer_enabled"><option value="false">No</option><option value="true">Yes</option></select></div>
+      <div><label>Transfer Number</label><input id="kb-transfer_number" placeholder="+91..."></div>
+      <div><label>Working Hours Only</label><select id="kb-working_hours_only"><option value="true">Yes</option><option value="false">No</option></select></div>
+    </div>
+    <div style="margin-top:8px"><label>Transfer Conditions</label><textarea id="kb-transfer_conditions" style="min-height:80px" placeholder="e.g. When customer requests human, or when AI cannot answer..."></textarea></div>
+    <div class="row" style="margin-top:10px"><button class="primary" onclick="kbSaveSection('transfer_rules')">💾 Save Transfer Rules</button></div>
+    <p id="kb-transfer-msg" class="muted" style="min-height:1.2em;margin-top:4px"></p>
+  </div>
+
+  <!-- AI Preview -->
+  <div class="kb-panel" id="kbp-preview">
+    <h3 style="margin-bottom:10px">👁 AI Knowledge Preview</h3>
+    <p class="muted" style="margin-bottom:8px">This is the exact text that will be prepended to the AI prompt during calls.</p>
+    <div class="row" style="gap:8px;margin-bottom:10px">
+      <button onclick="kbRefreshPreview()">🔄 Refresh Preview</button>
+      <div style="display:flex;gap:6px;flex:1"><input id="kb-search-q" placeholder="Test search: e.g. What is your price?" style="flex:1"><button onclick="kbTestSearch()">🔍 Test Search</button></div>
+    </div>
+    <div id="kb-search-results" style="margin-bottom:10px"></div>
+    <pre id="kb-preview-text" style="background:#0d0d1a;border:1px solid #333;border-radius:6px;padding:12px;white-space:pre-wrap;font-size:0.8rem;color:#ccc;max-height:500px;overflow:auto">Click "Refresh Preview" to see AI context</pre>
+    <p id="kb-preview-chars" class="muted" style="margin-top:4px"></p>
+  </div>
+</div>
+</section>
 <section id="setup" class="panel"><div class="grid cols-2"><div class="card"><h2>🔧 Quick Start</h2><ol><li>Run <code>supabase_schema.sql</code> in Supabase SQL Editor.</li><li>Fill Settings and save credentials.</li><li>Create SIP trunk.</li><li>Create an agent profile.</li><li>Test a single call.</li></ol></div><div class="card"><h2>Cost Breakdown</h2><table><tr><th>Service</th><th>Cost/min</th></tr><tr><td>Vobiz SIP</td><td>₹1.00</td></tr><tr><td>LiveKit</td><td>₹0.17</td></tr><tr><td>Gemini Live</td><td>₹0.03</td></tr><tr><td><b>Total</b></td><td><b>≈ ₹1.20</b></td></tr></table></div></div></section>
 </main>
 <div id="modal-backdrop" class="modal-backdrop" onclick="if(event.target===this)closeModal()"><div class="modal-panel"><button class="modal-close" onclick="closeModal()" aria-label="Close">✕</button><div id="modal-body"></div></div></div>
 <script>
-const tabs=[['stats','📊 Stats'],['single','📞 Single Call'],['batch','📋 Batch Call'],['batch-monitor','📡 Batch Monitor'],['campaigns','🚀 Campaigns'],['scheduled','📅 Scheduled Calls'],['agents','🤖 Agents'],['prompt','✏️ AI Prompt'],['appointments','� Appointments'],['calls','📝 Call Logs'],['crm','👥 CRM'],['settings','⚙️ Settings'],['logs','📋 Logs'],['setup','🔧 Setup']];
+const tabs=[['stats','📊 Stats'],['single','📞 Single Call'],['batch','📋 Batch Call'],['batch-monitor','📡 Batch Monitor'],['campaigns','🚀 Campaigns'],['scheduled','📅 Scheduled Calls'],['agents','🤖 Agents'],['prompt','✏️ AI Prompt'],['kb','📚 Knowledge Base'],['appointments','� Appointments'],['calls','📝 Call Logs'],['crm','👥 CRM'],['settings','⚙️ Settings'],['logs','📋 Logs'],['setup','🔧 Setup']];
 const $=id=>document.getElementById(id);const api=(p,o)=>fetch(p,o).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok){if(r.status===401&&p!=='/api/auth/me')showLogin('Session expired. Please login again.');throw Error(j.detail||j.error||JSON.stringify(j))}return j});const apiPost=(p,b)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});const apiDel=p=>fetch(p,{method:'DELETE'});let charts={},batchContacts=[],campContacts=[],callPage=1,logsPaused=false,leadStatuses=[],crmContacts=[];
 function toast(msg,type='ok'){const d=document.createElement('div');d.className='toast '+(type==='err'?'err':'ok');d.textContent=msg;document.body.appendChild(d);setTimeout(()=>d.remove(),3500)}function showErr(id,msg){$(id).textContent=msg;$(id).className='err'}
 function showLogin(msg=''){$('login-error').textContent=msg;document.body.classList.remove('authenticated')}
@@ -72,7 +245,7 @@ function showDashboard(){document.body.classList.add('authenticated');loadStats(
 async function checkAuth(){try{const r=await api('/api/auth/me');if(r.authenticated){showDashboard()}else{showLogin(r.error||'')}}catch(e){showLogin(e.message)}}
 async function logout(){await fetch('/api/auth/logout',{method:'POST'});showLogin('')}
 $('login-form').onsubmit=async e=>{e.preventDefault();$('login-error').textContent='';try{await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('login-username').value,password:$('login-password').value})});$('login-password').value='';showDashboard()}catch(err){showLogin(err.message)}};
-function switchTab(name){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id===name));if(name==='stats')loadStats();if(name==='campaigns'){loadCampaigns();_startCampaignProgressPoll()}if(name==='batch-monitor')refreshBatchMonitor();if(name==='scheduled')loadScheduledCalls();if(name==='agents')loadAgentProfiles();if(name==='prompt'){initPromptManager();loadPrompt();}if(name==='appointments')loadAppointments();if(name==='calls')loadCalls();if(name==='crm')loadCRM();if(name==='settings'){loadSettings();loadOutboundSchedule();}if(name==='logs')loadLogs()}
+function switchTab(name){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id===name));if(name==='stats')loadStats();if(name==='campaigns'){loadCampaigns();_startCampaignProgressPoll()}if(name==='batch-monitor')refreshBatchMonitor();if(name==='scheduled')loadScheduledCalls();if(name==='agents')loadAgentProfiles();if(name==='prompt'){initPromptManager();loadPrompt();}if(name==='kb')initKB();if(name==='appointments')loadAppointments();if(name==='calls')loadCalls();if(name==='crm')loadCRM();if(name==='settings'){loadSettings();loadOutboundSchedule();}if(name==='logs')loadLogs()}
 function _mkChart(id,type,data,options={}){if(charts[id])charts[id].destroy();charts[id]=new Chart($(id),{type,data,options:{responsive:true,plugins:{legend:{labels:{color:'#ddd'}}},scales:type==='doughnut'?{}:{x:{ticks:{color:'#aaa'},grid:{color:'#222'}},y:{ticks:{color:'#aaa'},grid:{color:'#222'}}},...options}})}
 function _renderCharts(d){const outcomes=d.outcomes||{};_mkChart('chart-outcomes','doughnut',{labels:Object.keys(outcomes),datasets:[{data:Object.values(outcomes),backgroundColor:['#00ff88','#00ccff','#ffaa00','#ff4d4d','#888']}]});_mkChart('chart-timeline','line',{labels:(d.timeline||[]).map(x=>x.date.slice(5)),datasets:[{label:'Calls',data:(d.timeline||[]).map(x=>x.count),borderColor:'#00ccff',backgroundColor:'#00ccff33'}]});const dur=d.duration_by_outcome||{};_mkChart('chart-duration','bar',{labels:Object.keys(dur),datasets:[{label:'Avg sec',data:Object.values(dur),backgroundColor:'#00ff88'}]})}
 function loadCharts(d){try{_renderCharts(d)}catch(e){$('stats-error').textContent='Charts unavailable: '+e.message}}
@@ -84,6 +257,116 @@ async function readFile(id, textId){const f=$(id).files[0];if(f)$(textId).value=
 async function createCampaign(){await readFile('camp-file','camp-text');campContacts=csvParse($('camp-text').value);try{await api('/api/campaigns',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('camp-name').value,contacts:campContacts,schedule_type:$('camp-schedule').value,schedule_time:$('camp-time').value,call_delay_seconds:+$('camp-delay').value||3,agent_profile_id:$('camp-agent-profile').value||null,system_prompt:$('camp-custom-on').checked?$('camp-prompt').value:null})});toast('Campaign created');loadCampaigns()}catch(e){toast(e.message,'err')}}window.runCampaign=async id=>{await apiPost(`/api/campaigns/${id}/run`,{});toast('Campaign running')};window.toggleCampaignStatus=async(id,s)=>{await fetch(`/api/campaigns/${id}/status`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:s})});loadCampaigns()};window.deleteCampaign=async id=>{if(confirm('Delete campaign?')){await apiDel(`/api/campaigns/${id}`);loadCampaigns()}}
 function voiceOptions(){return `<optgroup label="Female voices"><option value="Aoede">Aoede — warm, expressive ⭐</option><option value="Achernar">Achernar — soft & clear</option><option value="Autonoe">Autonoe — natural female</option><option value="Callirrhoe">Callirrhoe — gentle female</option><option value="Despina">Despina — bright female</option><option value="Erinome">Erinome — smooth female</option><option value="Gacrux">Gacrux — rich female</option><option value="Kore">Kore — soft, calm</option><option value="Laomedeia">Laomedeia — light female</option><option value="Leda">Leda — clear female</option><option value="Pulcherrima">Pulcherrima — warm female</option><option value="Sulafat">Sulafat — smooth female</option><option value="Vindemiatrix">Vindemiatrix — professional female</option><option value="Zephyr">Zephyr — airy female</option></optgroup><optgroup label="Male voices"><option value="Achird">Achird — clear male</option><option value="Algenib">Algenib — strong male</option><option value="Algieba">Algieba — rich male</option><option value="Alnilam">Alnilam — deep male</option><option value="Charon">Charon — calm, deep</option><option value="Enceladus">Enceladus — expressive male</option><option value="Fenrir">Fenrir — confident male</option><option value="Iapetus">Iapetus — steady male</option><option value="Orus">Orus — warm male</option><option value="Perseus">Perseus — clear male</option><option value="Puck">Puck — bright, energetic</option><option value="Rasalgethi">Rasalgethi — bold male</option><option value="Sadachbia">Sadachbia — natural male</option><option value="Sadaltager">Sadaltager — smooth male</option><option value="Schedar">Schedar — professional male</option><option value="Umbriel">Umbriel — deep, calm</option><option value="Zubenelgenubi">Zubenelgenubi — resonant male</option></optgroup>`}
 async function loadAgentProfiles(){let profiles=[];try{const raw=await api('/api/agent-profiles');profiles=Array.isArray(raw)?raw:[]}catch(e){}const opts='<option value="">Default/global</option>'+profiles.map(p=>`<option value="${p.id}">${esc(p.name)}${p.is_default?' ★':''}</option>`).join('');['f-agent-profile','bc-agent-profile','camp-agent-profile'].forEach(id=>$(id).innerHTML=opts);$('agent-list').innerHTML=table(profiles,['name','voice','model','is_default'],r=>`<button onclick="editAgentProfile('${r.id}')">Edit</button><button onclick="setDefaultAgentProfile('${r.id}','${esc(r.name)}')">★ Default</button><button class="danger" onclick="deleteAgentProfile('${r.id}','${esc(r.name)}')">Delete</button>`)}window.saveAgentProfile=async()=>{let id=$('agent-id').value;let body={name:$('agent-name').value,voice:$('agent-voice').value,model:$('agent-model').value,enabled_tools:$('agent-tools').value,system_prompt:$('agent-prompt').value,is_default:$('agent-default').checked};await api(`/api/agent-profiles${id?'/'+id:''}`,{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Profile saved');resetAgentForm();loadAgentProfiles()};window.editAgentProfile=async id=>{let p=await api('/api/agent-profiles/'+id);$('agent-id').value=p.id;$('agent-name').value=p.name;$('agent-voice').value=p.voice;$('agent-model').value=p.model;$('agent-tools').value=p.enabled_tools||'[]';$('agent-prompt').value=p.system_prompt||'';$('agent-default').checked=!!p.is_default};window.deleteAgentProfile=async id=>{if(confirm('Delete profile?')){await apiDel('/api/agent-profiles/'+id);loadAgentProfiles()}};window.setDefaultAgentProfile=async id=>{await apiPost(`/api/agent-profiles/${id}/set-default`,{});loadAgentProfiles()};window.resetAgentForm=()=>['agent-id','agent-name','agent-prompt'].forEach(id=>$(id).value='')
+// ── Knowledge Base ───────────────────────────────────────────────────────────
+let _kb={};const _KB_DAYS=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+async function initKB(){try{_kb=await api('/api/knowledge-base');kbPopulateAll()}catch(e){toast('KB load failed: '+e.message,'err')}}
+function kbSwitchTab(name){document.querySelectorAll('.kb-tab-btn').forEach(b=>b.classList.toggle('active',b.getAttribute('onclick').includes("'"+name+"'")));document.querySelectorAll('.kb-panel').forEach(p=>p.classList.toggle('active',p.id==='kbp-'+name))}
+function kbPopulateAll(){
+  const cp=_kb.company_profile||{};
+  const setVal=(id,v)=>{const el=$(id);if(!el)return;if(el.tagName==='SELECT'){el.value=v||''}else{el.value=v||''}};
+  setVal('kb-business_name',cp.business_name);setVal('kb-legal_name',cp.legal_name);
+  setVal('kb-industry_type',cp.industry_type);setVal('kb-owner_name',cp.owner_name);
+  setVal('kb-cp-website',cp.website);setVal('kb-cp-email',cp.email);
+  setVal('kb-cp-phone',cp.phone);setVal('kb-cp-whatsapp',cp.whatsapp_number);
+  setVal('kb-short_description',cp.short_description);setVal('kb-about_us',cp.about_us);
+  const cd=_kb.contact_details||{};
+  setVal('kb-primary_phone',cd.primary_phone);setVal('kb-support_phone',cd.support_phone);
+  setVal('kb-cd-whatsapp',cd.whatsapp_number);setVal('kb-cd-email',cd.email);
+  setVal('kb-cd-website',cd.website);setVal('kb-address',cd.address);
+  setVal('kb-city',cd.city);setVal('kb-state',cd.state);setVal('kb-country',cd.country);
+  setVal('kb-google_maps_link',cd.google_maps_link);
+  const wh=_kb.working_hours||{};
+  setVal('kb-timezone',wh.timezone||'Asia/Kolkata');setVal('kb-opening_time',wh.opening_time||'09:00');
+  setVal('kb-closing_time',wh.closing_time||'18:00');
+  setVal('kb-emergency_support_available',wh.emergency_support_available?'true':'false');
+  setVal('kb-holiday_notes',wh.holiday_notes);
+  const openDays=Array.isArray(wh.opening_days)?wh.opening_days:[];
+  const dc=$('kb-days-checkboxes');
+  if(dc){dc.innerHTML=_KB_DAYS.map(d=>`<label style="display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" value="${d}" ${openDays.includes(d)?'checked':''}> ${d}</label>`).join('')}
+  const pol=_kb.policies||{};
+  ['cancellation_policy','refund_policy','privacy_policy','appointment_policy','payment_policy','terms_notes'].forEach(k=>setVal('kb-'+k,pol[k]));
+  const ar=_kb.appointment_rules||{};
+  setVal('kb-appointment_required',ar.appointment_required?'true':'false');
+  setVal('kb-allow_same_day_booking',ar.allow_same_day_booking!==false?'true':'false');
+  setVal('kb-appointment_duration_minutes',ar.appointment_duration_minutes||30);
+  setVal('kb-appointment_buffer_minutes',ar.appointment_buffer_minutes||15);
+  setVal('kb-default_visit_type',ar.default_visit_type||'phone_consultation');
+  setVal('kb-confirmation_required',ar.confirmation_required!==false?'true':'false');
+  setVal('kb-reminder_before_hours',ar.reminder_before_hours||24);
+  const tr=_kb.transfer_rules||{};
+  setVal('kb-transfer_enabled',tr.transfer_enabled?'true':'false');
+  setVal('kb-transfer_number',tr.transfer_number);
+  setVal('kb-working_hours_only',tr.working_hours_only!==false?'true':'false');
+  setVal('kb-transfer_conditions',tr.transfer_conditions);
+  kbRenderLocations();kbRenderServices();kbRenderPackages();kbRenderFaqs();
+}
+async function kbSaveSection(section){
+  let data={};
+  if(section==='company_profile'){data={business_name:$('kb-business_name').value,legal_name:$('kb-legal_name').value,industry_type:$('kb-industry_type').value,owner_name:$('kb-owner_name').value,website:$('kb-cp-website').value,email:$('kb-cp-email').value,phone:$('kb-cp-phone').value,whatsapp_number:$('kb-cp-whatsapp').value,short_description:$('kb-short_description').value,about_us:$('kb-about_us').value}}
+  else if(section==='contact_details'){data={primary_phone:$('kb-primary_phone').value,support_phone:$('kb-support_phone').value,whatsapp_number:$('kb-cd-whatsapp').value,email:$('kb-cd-email').value,website:$('kb-cd-website').value,address:$('kb-address').value,city:$('kb-city').value,state:$('kb-state').value,country:$('kb-country').value,google_maps_link:$('kb-google_maps_link').value}}
+  else if(section==='working_hours'){const checked=Array.from(document.querySelectorAll('#kb-days-checkboxes input:checked')).map(c=>c.value);data={timezone:$('kb-timezone').value,opening_days:checked,opening_time:$('kb-opening_time').value,closing_time:$('kb-closing_time').value,holiday_notes:$('kb-holiday_notes').value,emergency_support_available:$('kb-emergency_support_available').value==='true'}}
+  else if(section==='policies'){data={cancellation_policy:$('kb-cancellation_policy').value,refund_policy:$('kb-refund_policy').value,privacy_policy:$('kb-privacy_policy').value,appointment_policy:$('kb-appointment_policy').value,payment_policy:$('kb-payment_policy').value,terms_notes:$('kb-terms_notes').value}}
+  else if(section==='appointment_rules'){data={appointment_required:$('kb-appointment_required').value==='true',allow_same_day_booking:$('kb-allow_same_day_booking').value==='true',appointment_duration_minutes:+$('kb-appointment_duration_minutes').value||30,appointment_buffer_minutes:+$('kb-appointment_buffer_minutes').value||15,default_visit_type:$('kb-default_visit_type').value,confirmation_required:$('kb-confirmation_required').value==='true',reminder_before_hours:+$('kb-reminder_before_hours').value||24}}
+  else if(section==='transfer_rules'){data={transfer_enabled:$('kb-transfer_enabled').value==='true',transfer_number:$('kb-transfer_number').value,transfer_conditions:$('kb-transfer_conditions').value,working_hours_only:$('kb-working_hours_only').value==='true'}}
+  else if(section==='locations'){data=_kb.locations||[]}
+  else if(section==='services'){data=_kb.services||[]}
+  else if(section==='packages'){data=_kb.packages||[]}
+  else if(section==='faqs'){data=_kb.faqs||[]}
+  const msgMap={company_profile:'kb-company-msg',contact_details:'kb-contact-msg',working_hours:'kb-hours-msg',policies:'kb-policies-msg',appointment_rules:'kb-appt-msg',transfer_rules:'kb-transfer-msg',locations:'kb-locations-msg',services:'kb-services-msg',packages:'kb-packages-msg',faqs:'kb-faqs-msg'};
+  try{
+    await api('/api/knowledge-base/'+section,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    _kb[section]=data;
+    const msgEl=$(msgMap[section]);if(msgEl){msgEl.textContent='Saved.';msgEl.className='ok';setTimeout(()=>{msgEl.textContent='';msgEl.className='muted'},3000)}
+    toast('Saved: '+section.replace(/_/g,' '));
+  }catch(e){toast(e.message,'err');}
+}
+// ── Locations ─
+function kbRenderLocations(){const c=$('kb-locations-list');if(!c)return;const locs=_kb.locations||[];if(!locs.length){c.innerHTML='<p class="muted">No branches added yet.</p>';return}c.innerHTML=locs.map((l,i)=>`<div class="card" style="margin-bottom:8px;padding:10px"><div class="row" style="justify-content:space-between"><b>${esc(l.branch_name||'Branch '+(i+1))}</b><button class="danger" style="padding:2px 8px" onclick="kbDeleteLocation(${i})">✕</button></div><div class="grid cols-2" style="gap:6px;margin-top:6px"><div><label style="font-size:0.8rem">Name</label><input value="${esc(l.branch_name||'')}" oninput="_kb.locations[${i}].branch_name=this.value"></div><div><label style="font-size:0.8rem">City</label><input value="${esc(l.city||'')}" oninput="_kb.locations[${i}].city=this.value"></div><div><label style="font-size:0.8rem">Phone</label><input value="${esc(l.phone||'')}" oninput="_kb.locations[${i}].phone=this.value"></div><div><label style="font-size:0.8rem">Maps Link</label><input value="${esc(l.google_maps_link||'')}" oninput="_kb.locations[${i}].google_maps_link=this.value"></div><div style="grid-column:1/-1"><label style="font-size:0.8rem">Address</label><input value="${esc(l.address||'')}" oninput="_kb.locations[${i}].address=this.value"></div></div></div>`).join('')}
+function kbAddLocation(){if(!_kb.locations)_kb.locations=[];_kb.locations.push({branch_name:'',address:'',city:'',phone:'',google_maps_link:'',working_hours:''});kbRenderLocations()}
+function kbDeleteLocation(i){_kb.locations.splice(i,1);kbRenderLocations()}
+// ── Services ─
+function kbRenderServices(){const c=$('kb-services-list');if(!c)return;const svcs=_kb.services||[];if(!svcs.length){c.innerHTML='<p class="muted">No services added yet.</p>';return}c.innerHTML=svcs.map((s,i)=>`<div class="card" style="margin-bottom:8px;padding:10px"><div class="row" style="justify-content:space-between"><b>${esc(s.name||'Service '+(i+1))}</b><button class="danger" style="padding:2px 8px" onclick="kbDeleteService(${i})">✕</button></div><div class="grid cols-2" style="gap:6px;margin-top:6px"><div><label style="font-size:0.8rem">Name</label><input value="${esc(s.name||'')}" oninput="_kb.services[${i}].name=this.value"></div><div><label style="font-size:0.8rem">Category</label><input value="${esc(s.category||'')}" oninput="_kb.services[${i}].category=this.value"></div><div><label style="font-size:0.8rem">Price From</label><input value="${esc(s.price_from||'')}" oninput="_kb.services[${i}].price_from=this.value"></div><div><label style="font-size:0.8rem">Price To</label><input value="${esc(s.price_to||'')}" oninput="_kb.services[${i}].price_to=this.value"></div><div><label style="font-size:0.8rem">Duration</label><input value="${esc(s.duration||'')}" oninput="_kb.services[${i}].duration=this.value"></div><div><label style="font-size:0.8rem">Active</label><select oninput="_kb.services[${i}].active=this.value==='true'"><option value="true" ${s.active!==false?'selected':''}>Yes</option><option value="false" ${s.active===false?'selected':''}>No</option></select></div><div style="grid-column:1/-1"><label style="font-size:0.8rem">Description</label><textarea style="min-height:50px" oninput="_kb.services[${i}].description=this.value">${esc(s.description||'')}</textarea></div></div></div>`).join('')}
+function kbAddService(){if(!_kb.services)_kb.services=[];_kb.services.push({name:'',category:'',description:'',price_from:'',price_to:'',duration:'',service_area:'',eligibility_notes:'',active:true});kbRenderServices()}
+function kbDeleteService(i){_kb.services.splice(i,1);kbRenderServices()}
+// ── Packages ─
+function kbRenderPackages(){const c=$('kb-packages-list');if(!c)return;const pkgs=_kb.packages||[];if(!pkgs.length){c.innerHTML='<p class="muted">No packages added yet.</p>';return}c.innerHTML=pkgs.map((p,i)=>`<div class="card" style="margin-bottom:8px;padding:10px"><div class="row" style="justify-content:space-between"><b>${esc(p.package_name||'Package '+(i+1))}</b><button class="danger" style="padding:2px 8px" onclick="kbDeletePackage(${i})">✕</button></div><div class="grid cols-2" style="gap:6px;margin-top:6px"><div><label style="font-size:0.8rem">Package Name</label><input value="${esc(p.package_name||'')}" oninput="_kb.packages[${i}].package_name=this.value"></div><div><label style="font-size:0.8rem">Price</label><input value="${esc(p.price||'')}" oninput="_kb.packages[${i}].price=this.value"></div><div><label style="font-size:0.8rem">Validity</label><input value="${esc(p.validity||'')}" oninput="_kb.packages[${i}].validity=this.value"></div><div><label style="font-size:0.8rem">Active</label><select oninput="_kb.packages[${i}].active=this.value==='true'"><option value="true" ${p.active!==false?'selected':''}>Yes</option><option value="false" ${p.active===false?'selected':''}>No</option></select></div><div style="grid-column:1/-1"><label style="font-size:0.8rem">Description</label><textarea style="min-height:50px" oninput="_kb.packages[${i}].description=this.value">${esc(p.description||'')}</textarea></div><div style="grid-column:1/-1"><label style="font-size:0.8rem">Included Items</label><input value="${esc(p.included_items||'')}" oninput="_kb.packages[${i}].included_items=this.value"></div><div style="grid-column:1/-1"><label style="font-size:0.8rem">Excluded Items</label><input value="${esc(p.excluded_items||'')}" oninput="_kb.packages[${i}].excluded_items=this.value"></div></div></div>`).join('')}
+function kbAddPackage(){if(!_kb.packages)_kb.packages=[];_kb.packages.push({package_name:'',price:'',description:'',included_items:'',excluded_items:'',validity:'',active:true});kbRenderPackages()}
+function kbDeletePackage(i){_kb.packages.splice(i,1);kbRenderPackages()}
+// ── FAQs ─
+let _kbFaqFilter='';
+function kbRenderFaqs(){const c=$('kb-faqs-list');if(!c)return;const faqs=(_kb.faqs||[]).filter(f=>!_kbFaqFilter||((f.question||'').toLowerCase().includes(_kbFaqFilter)||((f.answer||'').toLowerCase().includes(_kbFaqFilter))));if(!faqs.length){c.innerHTML='<p class="muted">No FAQs'+(  _kbFaqFilter?' matching filter':'')+' yet.</p>';return}const allIdxMap=faqs.map(f=>(_kb.faqs||[]).indexOf(f));c.innerHTML=faqs.map((f,fi)=>{const i=allIdxMap[fi];return`<div class="card" style="margin-bottom:6px;padding:8px"><div class="row" style="justify-content:space-between;align-items:flex-start"><div style="flex:1"><input value="${esc(f.question||'')}" placeholder="Question" style="width:100%;margin-bottom:4px" oninput="_kb.faqs[${i}].question=this.value"><textarea style="min-height:50px;width:100%" placeholder="Answer" oninput="_kb.faqs[${i}].answer=this.value">${esc(f.answer||'')}</textarea><div class="row" style="gap:6px;margin-top:4px"><input value="${esc(f.category||'')}" placeholder="Category" style="width:120px" oninput="_kb.faqs[${i}].category=this.value"><input value="${esc(f.language||'English')}" placeholder="Language" style="width:100px" oninput="_kb.faqs[${i}].language=this.value"><label style="display:flex;align-items:center;gap:4px"><input type="checkbox" ${f.active!==false?'checked':''} oninput="_kb.faqs[${i}].active=this.checked"> Active</label></div></div><button class="danger" style="padding:2px 8px;margin-left:8px;align-self:flex-start" onclick="kbDeleteFaq(${i})">✕</button></div></div>`}).join('')}
+function kbFilterFaqs(){_kbFaqFilter=($('kb-faq-search')?.value||'').toLowerCase().trim();kbRenderFaqs()}
+function kbAddFaq(){if(!_kb.faqs)_kb.faqs=[];_kb.faqs.push({question:'',answer:'',category:'',language:'English',active:true});kbRenderFaqs()}
+function kbDeleteFaq(i){_kb.faqs.splice(i,1);kbRenderFaqs()}
+// ── Preview & Search ─
+async function kbRefreshPreview(){
+  try{
+    const r=await api('/api/knowledge-base/preview');
+    const el=$('kb-preview-text');const cl=$('kb-preview-chars');
+    if(el){el.textContent=r.preview||'(No KB data yet — fill in Company Profile, Services, FAQs etc.)';}
+    if(cl){cl.textContent=r.char_count+' chars';}
+    kbSwitchTab('preview');
+    toast('Preview refreshed');
+  }catch(e){toast(e.message,'err');}
+}
+async function kbTestSearch(){
+  const q=($('kb-search-q')?.value||'').trim();if(!q)return;
+  try{
+    const r=await api('/api/knowledge-base/search?q='+encodeURIComponent(q));
+    const c=$('kb-search-results');
+    if(!r.results||!r.results.length){c.innerHTML='<p class="muted">No matches found.</p>';return}
+    c.innerHTML='<b>Results:</b><div style="margin-top:6px">'+r.results.map(x=>`<div style="background:#111;border-radius:6px;padding:8px;margin-bottom:6px"><div style="font-size:0.8rem;color:#7c6af7">${esc(x.section)}</div><b>${esc(x.title)}</b><p style="margin:4px 0 0;font-size:0.85rem;color:#ccc">${esc(x.answer||'')}</p></div>`).join('')+'</div>';
+  }catch(e){toast(e.message,'err');}
+}
+async function kbLoadSample(){
+  if(!confirm('Load sample data? This will overwrite existing KB data.'))return;
+  try{
+    await api('/api/knowledge-base/sample',{method:'POST'});
+    _kb=await api('/api/knowledge-base');
+    kbPopulateAll();
+    toast('Sample data loaded');
+  }catch(e){toast(e.message,'err');}
+}
 // ── Legacy global prompt ────────────────────────────────────────────────────
 async function loadPrompt(){const p=await api('/api/prompt');$('prompt-text').value=p.prompt;$('prompt-count').textContent=p.prompt.length+' chars'}window.savePrompt=async()=>{await api('/api/prompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:$('prompt-text').value})});toast('Global prompt saved')};window.resetPrompt=async()=>{await api('/api/prompt',{method:'DELETE'});loadPrompt();toast('Global prompt reset')};$('prompt-text') && ($('prompt-text').oninput=()=>$('prompt-count').textContent=($('prompt-text').value||'').length+' chars');
 // ── AI Prompt Manager ────────────────────────────────────────────────────────

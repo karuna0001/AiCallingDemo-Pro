@@ -1,4 +1,4 @@
-import json as _json_mod
+﻿import json as _json_mod
 import logging
 import os
 import re
@@ -1199,3 +1199,183 @@ async def set_default_agent_profile(profile_id: str) -> None:
     db = await _adb()
     await db.table("agent_profiles").update({"is_default": 0}).neq("id", "placeholder").execute()
     await db.table("agent_profiles").update({"is_default": 1}).eq("id", profile_id).execute()
+
+
+# ── Knowledge Base helpers ────────────────────────────────────────────────────
+
+_KB_SETTING_KEY = "KNOWLEDGE_BASE_JSON"
+
+_KB_SECTIONS = [
+    "company_profile",
+    "contact_details",
+    "working_hours",
+    "locations",
+    "services",
+    "packages",
+    "faqs",
+    "policies",
+    "appointment_rules",
+    "transfer_rules",
+]
+
+
+def _kb_default() -> dict:
+    return {
+        "company_profile": {
+            "business_name": "",
+            "legal_name": "",
+            "short_description": "",
+            "about_us": "",
+            "industry_type": "",
+            "owner_name": "",
+            "website": "",
+            "email": "",
+            "phone": "",
+            "whatsapp_number": "",
+        },
+        "contact_details": {
+            "primary_phone": "",
+            "support_phone": "",
+            "whatsapp_number": "",
+            "email": "",
+            "website": "",
+            "address": "",
+            "city": "",
+            "state": "",
+            "country": "",
+            "google_maps_link": "",
+        },
+        "working_hours": {
+            "timezone": "Asia/Kolkata",
+            "opening_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+            "opening_time": "09:00",
+            "closing_time": "18:00",
+            "holiday_notes": "",
+            "emergency_support_available": False,
+        },
+        "locations": [],
+        "services": [],
+        "packages": [],
+        "faqs": [],
+        "policies": {
+            "cancellation_policy": "",
+            "refund_policy": "",
+            "privacy_policy": "",
+            "appointment_policy": "",
+            "payment_policy": "",
+            "terms_notes": "",
+        },
+        "appointment_rules": {
+            "appointment_required": False,
+            "allow_same_day_booking": True,
+            "appointment_duration_minutes": 30,
+            "appointment_buffer_minutes": 15,
+            "default_visit_type": "phone_consultation",
+            "confirmation_required": True,
+            "reminder_before_hours": 24,
+        },
+        "transfer_rules": {
+            "transfer_enabled": False,
+            "transfer_number": "",
+            "transfer_conditions": "",
+            "working_hours_only": True,
+        },
+    }
+
+
+def _safe_json_loads(text: str, fallback=None):
+    if not text:
+        return fallback
+    try:
+        return _json_mod.loads(text)
+    except Exception:
+        return fallback
+
+
+async def get_knowledge_base() -> dict:
+    raw = await get_setting(_KB_SETTING_KEY, "")
+    stored = _safe_json_loads(raw, {})
+    base = _kb_default()
+    if isinstance(stored, dict):
+        for section in _KB_SECTIONS:
+            if section in stored:
+                base[section] = stored[section]
+    return base
+
+
+async def save_knowledge_base(data: dict) -> dict:
+    base = await get_knowledge_base()
+    if isinstance(data, dict):
+        for section in _KB_SECTIONS:
+            if section in data:
+                base[section] = data[section]
+    await set_setting(_KB_SETTING_KEY, _json_mod.dumps(base, ensure_ascii=False))
+    return base
+
+
+async def get_kb_section(section_name: str):
+    if section_name not in _KB_SECTIONS:
+        return None
+    kb = await get_knowledge_base()
+    return kb.get(section_name)
+
+
+async def save_kb_section(section_name: str, data) -> dict:
+    if section_name not in _KB_SECTIONS:
+        raise ValueError(f"Unknown KB section: {section_name}")
+    kb = await get_knowledge_base()
+    kb[section_name] = data
+    await set_setting(_KB_SETTING_KEY, _json_mod.dumps(kb, ensure_ascii=False))
+    return kb
+
+
+def get_active_services(kb: dict) -> list:
+    return [s for s in (kb.get("services") or []) if s.get("active", True)]
+
+
+def get_active_packages(kb: dict) -> list:
+    return [p for p in (kb.get("packages") or []) if p.get("active", True)]
+
+
+def get_active_faqs(kb: dict) -> list:
+    return [f for f in (kb.get("faqs") or []) if f.get("active", True)]
+
+
+def get_company_contact_summary(kb: dict) -> str:
+    cp = kb.get("company_profile", {})
+    cd = kb.get("contact_details", {})
+    parts = []
+    if cp.get("business_name"):
+        parts.append(f"Business: {cp['business_name']}")
+    if cp.get("industry_type"):
+        parts.append(f"Industry: {cp['industry_type']}")
+    phone = cd.get("primary_phone") or cp.get("phone") or ""
+    if phone:
+        parts.append(f"Phone: {phone}")
+    email = cd.get("email") or cp.get("email") or ""
+    if email:
+        parts.append(f"Email: {email}")
+    website = cd.get("website") or cp.get("website") or ""
+    if website:
+        parts.append(f"Website: {website}")
+    addr_parts = [cd.get("address"), cd.get("city"), cd.get("state"), cd.get("country")]
+    addr = ", ".join(x for x in addr_parts if x)
+    if addr:
+        parts.append(f"Address: {addr}")
+    return " | ".join(parts)
+
+
+def get_appointment_rules_summary(kb: dict) -> str:
+    ar = kb.get("appointment_rules", {})
+    lines = []
+    if ar.get("appointment_required"):
+        lines.append("Appointment required: Yes")
+    if ar.get("allow_same_day_booking"):
+        lines.append("Same-day booking: Allowed")
+    if ar.get("appointment_duration_minutes"):
+        lines.append(f"Duration: {ar['appointment_duration_minutes']} min")
+    if ar.get("default_visit_type"):
+        lines.append(f"Visit type: {ar['default_visit_type']}")
+    if ar.get("confirmation_required"):
+        lines.append("Confirmation required: Yes")
+    return "; ".join(lines)
