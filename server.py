@@ -207,7 +207,7 @@ async def _startup():
         try:
             from apscheduler.triggers.interval import IntervalTrigger
             _scheduler.add_job(
-                lambda: asyncio.create_task(run_due_automation_actions()),
+                _run_due_automation_actions_sync,
                 trigger=IntervalTrigger(seconds=60),
                 id="automation_runner",
                 replace_existing=True,
@@ -2840,6 +2840,32 @@ async def _reschedule_all_campaigns() -> None:
         logger.warning("Could not reschedule campaigns: %s", exc)
 
 
+def _run_campaign_sync(campaign_id: str) -> None:
+    """Sync wrapper for APScheduler campaign cron job."""
+    try:
+        asyncio.run(_run_campaign(campaign_id))
+    except Exception as exc:
+        logger.exception("Scheduled campaign run failed (id=%s): %s", campaign_id, exc)
+
+
+def _run_due_automation_actions_sync() -> None:
+    """Sync wrapper for APScheduler — bridges thread context to async."""
+    logger.info("Running due automation actions")
+    try:
+        asyncio.run(run_due_automation_actions())
+        logger.info("Due automation actions completed")
+    except Exception as exc:
+        logger.exception("Due automation actions failed: %s", exc)
+
+
+def _scheduled_recording_cleanup_sync() -> None:
+    """Sync wrapper for APScheduler recording cleanup."""
+    try:
+        asyncio.run(_scheduled_recording_cleanup())
+    except Exception as exc:
+        logger.exception("Scheduled recording cleanup (sync wrapper) failed: %s", exc)
+
+
 async def _scheduled_recording_cleanup() -> None:
     try:
         if await _recording_auto_delete_enabled():
@@ -2863,7 +2889,7 @@ async def _schedule_recording_cleanup() -> None:
     except (ValueError, AttributeError):
         hour, minute = 2, 0
     trigger = CronTrigger(hour=hour, minute=minute, timezone=ZoneInfo("Asia/Kolkata"))
-    _scheduler.add_job(_scheduled_recording_cleanup, trigger=trigger, id=job_id, replace_existing=True)
+    _scheduler.add_job(_scheduled_recording_cleanup_sync, trigger=trigger, id=job_id, replace_existing=True)
 
 
 def _schedule_campaign(campaign_id: str, schedule_type: str, schedule_time: str) -> None:
@@ -2877,7 +2903,7 @@ def _schedule_campaign(campaign_id: str, schedule_type: str, schedule_time: str)
     except (ValueError, AttributeError):
         hour, minute = 9, 0
     trigger = CronTrigger(hour=hour, minute=minute) if schedule_type == "daily" else CronTrigger(day_of_week="mon-fri", hour=hour, minute=minute)
-    _scheduler.add_job(_run_campaign, trigger=trigger, args=[campaign_id], id=job_id, replace_existing=True)
+    _scheduler.add_job(_run_campaign_sync, trigger=trigger, args=[campaign_id], id=job_id, replace_existing=True)
 
 
 @app.post("/api/campaigns")
