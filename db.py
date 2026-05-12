@@ -1,4 +1,4 @@
-﻿import json as _json_mod
+import json as _json_mod
 import logging
 import os
 import re

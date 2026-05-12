@@ -233,6 +233,10 @@ async def entrypoint(ctx: agents.JobContext):
 
     await session.start(**session_kwargs)
     await _log("info", "Agent session started")
+    # Give the realtime audio pipeline a moment to initialise before we push
+    # TTS — avoids the 10-second dead-air observed when say() is called too
+    # quickly after session.start().
+    await asyncio.sleep(0.2)
 
     if phone_number:
         aws_key = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
@@ -261,26 +265,24 @@ async def entrypoint(ctx: agents.JobContext):
             except Exception as exc:
                 await _log("warning", f"Recording start failed (non-fatal): {exc}")
 
-    greeting_mode = (os.getenv("OUTBOUND_GREETING_MODE") or "").strip().lower()
-    fixed_greeting = (os.getenv("OUTBOUND_FIXED_GREETING") or "").strip()
+    greeting_mode = (os.getenv("OUTBOUND_GREETING_MODE") or "fixed").strip().lower()
+    fixed_greeting = (os.getenv("OUTBOUND_FIXED_GREETING") or "Hi, this is AI assistant. Am I speaking with you?").strip()
     active_model = os.getenv("GEMINI_MODEL", "")
     spoke_fixed_greeting = False
     if greeting_mode == "fixed" and fixed_greeting and phone_number:
-        # Speak the fixed greeting the *instant* the callee picks up, instead of
-        # waiting on the realtime model to generate its first turn. Significantly
-        # reduces dead-air at the start of a call.
+        await _log("info", f"Fixed outbound greeting enabled — will speak immediately: {fixed_greeting!r}")
         try:
             if hasattr(session, "say"):
                 await session.say(fixed_greeting, allow_interruptions=True)
             else:
-                await session.generate_reply(instructions=f"Say exactly this greeting and nothing else: {fixed_greeting}")
+                await session.generate_reply(instructions=f"Say exactly this greeting verbatim and nothing else: {fixed_greeting}")
             spoke_fixed_greeting = True
-            await _log("info", f"Spoke fixed outbound greeting: {fixed_greeting!r}")
+            await _log("info", "Fixed greeting spoken — continuing AI realtime session")
         except Exception as exc:
             await _log("warning", f"Fixed greeting failed, falling back to AI greeting: {exc}")
 
     if spoke_fixed_greeting:
-        pass  # AI will continue the conversation from here.
+        pass  # Gemini realtime continues the conversation from here normally.
     elif "3.1" in active_model or "2.5" in active_model:
         await _log("info", "Gemini native-audio: model will greet autonomously from system prompt")
     else:

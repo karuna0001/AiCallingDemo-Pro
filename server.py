@@ -314,6 +314,22 @@ class RecordingCleanupRequest(BaseModel):
     confirm: Optional[str] = None
 
 
+class BatchCallRequest(BaseModel):
+    contacts: list  # [{phone, lead_name, business_name, service_type}]
+    call_delay_seconds: int = 5
+    agent_profile_id: Optional[str] = None
+    system_prompt: Optional[str] = None
+    batch_name: Optional[str] = None
+
+
+class OutboundScheduleRequest(BaseModel):
+    OUTBOUND_TIMEZONE: Optional[str] = None
+    OUTBOUND_START_TIME: Optional[str] = None
+    OUTBOUND_END_TIME: Optional[str] = None
+    OUTBOUND_ALLOWED_DAYS: Optional[str] = None
+    OUTBOUND_CALLING_ENABLED: Optional[str] = None
+
+
 @app.post("/api/auth/login")
 async def api_auth_login(req: AuthRequest, request: Request):
     config_error = _admin_config_error()
@@ -947,7 +963,10 @@ def _parse_hhmm(hhmm: str) -> tuple:
 
 
 async def _is_outbound_allowed() -> bool:
-    """Return True if current local time is within the outbound calling window."""
+    """Return True if outbound calling is enabled and within the configured window."""
+    enabled_raw = (await eff("OUTBOUND_CALLING_ENABLED") or "true").strip().lower()
+    if enabled_raw in ("0", "false", "no", "off"):
+        return False
     tz_name, start_str, end_str, allowed_days = await _outbound_window()
     try:
         from zoneinfo import ZoneInfo
@@ -1433,6 +1452,270 @@ async def api_set_default_profile(profile_id: str):
     return {"status": "default set"}
 
 
+# ── Batch call in-memory store ──────────────────────────────────────
+# Batches are ephemeral (process-lifetime). The per-item results are also
+# written back to CRM contacts so nothing is lost if the process restarts.
+_batch_store: "dict[str, dict]" = {}
+_active_batch_tasks: "dict[str, asyncio.Task]" = {}
+
+_BATCH_ITEM_OUTCOME_TO_CRM_STATUS = {
+    "answered": "Contacted",
+    "completed": "Contacted",
+    "no_answer": "No Answer",
+    "busy": "Busy",
+    "failed": "Failed",
+}
+
+
+def _batch_summary(b: dict) -> dict:
+    items = b.get("items", [])
+    counts: dict = {s: 0 for s in ("pending", "calling", "answered", "no_answer", "busy", "failed", "completed", "cancelled")}
+    current_phone = current_name = None
+    for it in items:
+        st = it.get("status", "pending")
+        counts[st] = counts.get(st, 0) + 1
+        if st == "calling":
+            current_phone = it.get("phone")
+            current_name = it.get("lead_name")
+    return {
+        "batch_id": b["batch_id"],
+        "batch_name": b.get("batch_name", ""),
+        "status": b.get("status", "pending"),
+        "total_count": len(items),
+        **counts,
+        "current_phone": current_phone,
+        "current_lead_name": current_name,
+        "started_at": b.get("started_at"),
+        "completed_at": b.get("completed_at"),
+        "next_allowed_at": b.get("next_allowed_at"),
+        "items": items,
+    }
+
+
+async def _run_batch(batch_id: str) -> None:
+    b = _batch_store.get(batch_id)
+    if not b:
+        return
+    b["status"] = "running"
+    b["started_at"] = datetime.now().isoformat()
+    items = b["items"]
+
+    profile = None
+    if b.get("agent_profile_id"):
+        profile = await get_agent_profile(b["agent_profile_id"])
+
+    url = await eff("LIVEKIT_URL")
+    key = await eff("LIVEKIT_API_KEY")
+    secret = await eff("LIVEKIT_API_SECRET")
+    if not (url and key and secret):
+        b["status"] = "failed"
+        return
+
+    delay_seconds = b.get("call_delay_seconds", 5)
+
+    from livekit import api as lk_api_module
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_ctx))
+    try:
+        lk = lk_api_module.LiveKitAPI(url=url, api_key=key, api_secret=secret, session=session)
+        for idx, item in enumerate(items):
+            if item.get("status") not in (None, "pending"):
+                continue  # already done — skip on resume
+
+            # Calling-window guard
+            if not await _is_outbound_allowed():
+                b["status"] = "waiting_schedule"
+                err = await _outbound_window_error()
+                b["next_allowed_at"] = err.get("next_allowed_at")
+                opened = await _wait_for_batch_window(batch_id)
+                if not opened:
+                    break
+                b["status"] = "running"
+                b["next_allowed_at"] = None
+
+            # Pause / stop check
+            current = b.get("status")
+            if current == "paused":
+                break
+            if current in ("stopped", "completed"):
+                for it in items[idx:]:
+                    if it.get("status") in (None, "pending"):
+                        it["status"] = "cancelled"
+                break
+
+            phone = (item.get("phone") or "").strip()
+            if not phone.startswith("+"):
+                item["status"] = "failed"
+                item["outcome"] = "invalid_phone"
+                continue
+
+            item["status"] = "calling"
+            item["started_at"] = datetime.now().isoformat()
+
+            room_name = f"batch-{batch_id[:8]}-{phone.replace('+','')}-{random.randint(100,999)}"
+            item["room_name"] = room_name
+            dispatched_at = time.time()
+            contact = {
+                "phone": phone,
+                "lead_name": item.get("lead_name", "there"),
+                "business_name": item.get("business_name", "our company"),
+                "service_type": item.get("service_type", "our service"),
+            }
+            dispatched = await _dispatch_one(lk, lk_api_module, contact, room_name, b.get("system_prompt"), profile)
+            if not dispatched:
+                item["status"] = "failed"
+                item["outcome"] = "dispatch_failed"
+                item["ended_at"] = datetime.now().isoformat()
+                continue
+
+            # Sequential: wait for room to drain
+            room_result = await _wait_for_room_finished(lk, lk_api_module, room_name)
+            if room_result == "no_answer":
+                item["status"] = "no_answer"
+                item["outcome"] = "no_answer"
+            elif room_result == "timeout":
+                item["status"] = "failed"
+                item["outcome"] = "timeout"
+            else:
+                outcome = await _classify_call_outcome(phone, dispatched_at, room_name)
+                item["status"] = _BATCH_ITEM_OUTCOME_TO_CRM_STATUS.get(outcome, "completed").lower().replace(" ", "_")
+                # Normalise to valid batch item status
+                if item["status"] not in ("answered", "no_answer", "busy", "failed", "completed", "cancelled"):
+                    item["status"] = "completed"
+                item["outcome"] = outcome
+            item["ended_at"] = datetime.now().isoformat()
+
+            # Update CRM status for this lead
+            try:
+                crm_status = _BATCH_ITEM_OUTCOME_TO_CRM_STATUS.get(item.get("outcome", ""), "")
+                if crm_status and phone:
+                    await update_crm_contact_status(normalize_phone(phone), crm_status, None)
+            except Exception as exc:
+                logger.warning("Batch CRM status update failed for %s: %s", phone, exc)
+
+            # Check pause/stop after each call
+            if b.get("status") in ("paused", "stopped"):
+                break
+
+            if idx < len(items) - 1 and delay_seconds:
+                await asyncio.sleep(delay_seconds)
+
+        await lk.aclose()
+    except Exception as exc:
+        logger.error("Batch run error: %s", exc)
+        b["status"] = "failed"
+    finally:
+        await session.close()
+        _active_batch_tasks.pop(batch_id, None)
+
+    # Mark completed only when all items are terminal
+    if b.get("status") not in ("paused", "stopped", "failed", "waiting_schedule"):
+        all_done = all(it.get("status") not in (None, "pending", "calling") for it in items)
+        b["status"] = "completed" if all_done else b.get("status", "completed")
+    if b.get("status") == "completed":
+        b["completed_at"] = datetime.now().isoformat()
+
+
+async def _wait_for_batch_window(batch_id: str, poll_seconds: int = 120) -> bool:
+    """Wait until outbound window opens, checking batch stop/pause between polls."""
+    while not await _is_outbound_allowed():
+        b = _batch_store.get(batch_id)
+        if not b or b.get("status") in ("paused", "stopped", "completed"):
+            return False
+        tz_name, start_str, *_ = await _outbound_window()
+        logger.info("Batch %s: outside outbound window (%s), sleeping %ds", batch_id, start_str, poll_seconds)
+        await asyncio.sleep(poll_seconds)
+    return True
+
+
+def _start_batch_task(batch_id: str) -> None:
+    existing = _active_batch_tasks.get(batch_id)
+    if existing and not existing.done():
+        return
+    task = asyncio.create_task(_run_batch(batch_id))
+    _active_batch_tasks[batch_id] = task
+
+
+@app.post("/api/batch-calls")
+async def api_create_batch(req: BatchCallRequest):
+    if not await _is_outbound_allowed():
+        raise HTTPException(403, await _outbound_window_error())
+    if not req.contacts:
+        raise HTTPException(400, "contacts list cannot be empty")
+    batch_id = str(uuid.uuid4())
+    items = []
+    seen: set = set()
+    for c in req.contacts:
+        phone = (c.get("phone") or "").strip()
+        if not phone or phone in seen:
+            continue
+        seen.add(phone)
+        items.append({
+            "phone": phone,
+            "lead_name": c.get("lead_name") or c.get("name") or "there",
+            "business_name": c.get("business_name") or "our company",
+            "service_type": c.get("service_type") or "our service",
+            "status": "pending",
+            "outcome": None,
+            "room_name": None,
+            "started_at": None,
+            "ended_at": None,
+        })
+    if not items:
+        raise HTTPException(400, "No valid contacts after deduplication")
+    b = {
+        "batch_id": batch_id,
+        "batch_name": req.batch_name or f"Batch {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "status": "pending",
+        "items": items,
+        "call_delay_seconds": req.call_delay_seconds,
+        "agent_profile_id": req.agent_profile_id,
+        "system_prompt": req.system_prompt,
+        "started_at": None,
+        "completed_at": None,
+        "next_allowed_at": None,
+    }
+    _batch_store[batch_id] = b
+    _start_batch_task(batch_id)
+    return _batch_summary(b)
+
+
+@app.get("/api/batch-calls")
+async def api_list_batches():
+    return [_batch_summary(b) for b in _batch_store.values()]
+
+
+@app.get("/api/batch-calls/{batch_id}")
+async def api_get_batch(batch_id: str):
+    b = _batch_store.get(batch_id)
+    if not b:
+        raise HTTPException(404, "Batch not found")
+    return _batch_summary(b)
+
+
+@app.patch("/api/batch-calls/{batch_id}/status")
+async def api_update_batch_status(batch_id: str, req: StatusRequest):
+    b = _batch_store.get(batch_id)
+    if not b:
+        raise HTTPException(404, "Batch not found")
+    allowed = {"paused", "running", "stopped"}
+    if req.status not in allowed:
+        raise HTTPException(400, f"status must be one of: {', '.join(sorted(allowed))}")
+    if req.status == "stopped":
+        b["status"] = "stopped"
+        for it in b["items"]:
+            if it.get("status") in (None, "pending"):
+                it["status"] = "cancelled"
+    elif req.status == "paused":
+        b["status"] = "paused"
+    elif req.status == "running":
+        b["status"] = "running"
+        _start_batch_task(batch_id)  # resumes — runner skips non-pending items
+    return _batch_summary(b)
+
+
 # ── Campaign sequencing ─────────────────────────────────────────────
 # These statuses live in each ``contact`` dict inside ``contacts_json`` and are
 # persisted back to Supabase after every transition so pause/resume/stop
@@ -1848,14 +2131,24 @@ async def api_campaign_progress(campaign_id: str):
         contacts = json.loads(campaign.get("contacts_json") or "[]")
     except Exception:
         contacts = []
-    counts = {"pending": 0, "in_progress": 0, "completed": 0, "answered": 0, "no_answer": 0, "busy": 0, "failed": 0, "skipped": 0, "cancelled": 0}
+    counts: dict = {s: 0 for s in ("pending", "in_progress", "calling", "completed", "answered", "no_answer", "busy", "failed", "skipped", "cancelled")}
+    current_phone = current_name = None
     for c in contacts:
-        counts[_norm_lead_status(c.get("status"))] = counts.get(_norm_lead_status(c.get("status")), 0) + 1
+        st = _norm_lead_status(c.get("status"))
+        counts[st] = counts.get(st, 0) + 1
+        if st in ("in_progress", "calling"):
+            current_phone = c.get("phone")
+            current_name = c.get("lead_name")
     return {
         "campaign_id": campaign_id,
+        "name": campaign.get("name"),
         "status": campaign.get("status"),
         "total_leads": len(contacts),
+        "total_count": len(contacts),
+        "current_phone": current_phone,
+        "current_lead_name": current_name,
         "counts": counts,
+        **counts,
         "leads": [
             {
                 "phone": c.get("phone"),
@@ -1863,6 +2156,7 @@ async def api_campaign_progress(campaign_id: str):
                 "status": _norm_lead_status(c.get("status")),
                 "started_at": c.get("started_at"),
                 "finished_at": c.get("finished_at"),
+                "room_name": c.get("room_name"),
                 "failure_reason": c.get("failure_reason") or c.get("skip_reason"),
             } for c in contacts
         ],
@@ -1909,3 +2203,176 @@ async def api_update_campaign_status(campaign_id: str, req: StatusRequest):
             _start_campaign_task(campaign_id)
 
     return {"status": req.status}
+
+
+# ── Scheduled Calls (Due Today) ─────────────────────────────────────────
+
+@app.get("/api/scheduled-calls")
+async def api_scheduled_calls(timezone: Optional[str] = None):
+    """Return CRM leads grouped by their scheduled follow-up state."""
+    tz = timezone or (await eff("OUTBOUND_TIMEZONE")) or "Asia/Kolkata"
+    today_str = _tz_today(tz)
+    all_leads = await get_crm_contacts(timezone=tz)
+    window_ok = await _is_outbound_allowed()
+    win_err = None if window_ok else await _outbound_window_error()
+
+    due_today, upcoming, overdue, completed_today = [], [], [], []
+    for lead in all_leads:
+        status = (lead.get("crm_status") or "New")
+        if status in CRM_TERMINAL_STATUSES:
+            continue
+        fup = (lead.get("next_followup_at") or "")[:10]
+        if not fup:
+            continue
+        if fup == today_str:
+            due_today.append(lead)
+        elif fup < today_str:
+            overdue.append(lead)
+        elif fup > today_str:
+            upcoming.append(lead)
+
+    return {
+        "window_allowed": window_ok,
+        "window_error": win_err,
+        "today": today_str,
+        "timezone": tz,
+        "due_today": due_today,
+        "overdue": overdue,
+        "upcoming": upcoming,
+        "completed_today": completed_today,
+        "counts": {
+            "due_today": len(due_today),
+            "overdue": len(overdue),
+            "upcoming": len(upcoming),
+        },
+    }
+
+
+@app.post("/api/scheduled-calls/start-due-today")
+async def api_start_due_today(timezone: Optional[str] = Query(None)):
+    """Create + start a batch from today’s Due Today CRM leads."""
+    if not await _is_outbound_allowed():
+        raise HTTPException(403, await _outbound_window_error())
+    tz = timezone or (await eff("OUTBOUND_TIMEZONE")) or "Asia/Kolkata"
+    today_str = _tz_today(tz)
+    all_leads = await get_crm_contacts(due_today=True, timezone=tz)
+    if not all_leads:
+        raise HTTPException(404, "No Due Today leads found")
+    contacts = [
+        {
+            "phone": lead["phone_number"],
+            "lead_name": lead.get("lead_name") or "there",
+            "business_name": lead.get("business_name") or "our company",
+            "service_type": lead.get("service_type") or "our service",
+        }
+        for lead in all_leads
+        if lead.get("phone_number")
+    ]
+    batch_name = f"Due Today Calls - {today_str}"
+    # Create via the existing batch machinery
+    batch_id = str(uuid.uuid4())
+    items = []
+    seen: set = set()
+    for c in contacts:
+        phone = (c.get("phone") or "").strip()
+        if not phone or phone in seen:
+            continue
+        seen.add(phone)
+        items.append({
+            "phone": phone,
+            "lead_name": c.get("lead_name", "there"),
+            "business_name": c.get("business_name", "our company"),
+            "service_type": c.get("service_type", "our service"),
+            "status": "pending", "outcome": None, "room_name": None,
+            "started_at": None, "ended_at": None,
+        })
+    if not items:
+        raise HTTPException(404, "No valid leads to call")
+    b = {
+        "batch_id": batch_id, "batch_name": batch_name, "status": "pending",
+        "items": items, "call_delay_seconds": 10, "agent_profile_id": None,
+        "system_prompt": None, "started_at": None, "completed_at": None, "next_allowed_at": None,
+    }
+    _batch_store[batch_id] = b
+    _start_batch_task(batch_id)
+    return {"batch_id": batch_id, "batch_name": batch_name, "total": len(items), **_batch_summary(b)}
+
+
+# ── Outbound Schedule Settings ─────────────────────────────────────────
+
+_SCHEDULE_KEYS = (
+    "OUTBOUND_TIMEZONE", "OUTBOUND_START_TIME", "OUTBOUND_END_TIME",
+    "OUTBOUND_ALLOWED_DAYS", "OUTBOUND_CALLING_ENABLED",
+)
+
+
+@app.get("/api/outbound/schedule/settings")
+async def api_get_outbound_schedule_settings():
+    result = {}
+    for key in _SCHEDULE_KEYS:
+        result[key] = await eff(key)
+    # Apply defaults for missing values
+    result.setdefault("OUTBOUND_TIMEZONE", "Asia/Kolkata")
+    if not result["OUTBOUND_TIMEZONE"]:
+        result["OUTBOUND_TIMEZONE"] = "Asia/Kolkata"
+    result.setdefault("OUTBOUND_START_TIME", "10:00")
+    if not result["OUTBOUND_START_TIME"]:
+        result["OUTBOUND_START_TIME"] = "10:00"
+    result.setdefault("OUTBOUND_END_TIME", "19:00")
+    if not result["OUTBOUND_END_TIME"]:
+        result["OUTBOUND_END_TIME"] = "19:00"
+    result.setdefault("OUTBOUND_ALLOWED_DAYS", "mon,tue,wed,thu,fri,sat")
+    if not result["OUTBOUND_ALLOWED_DAYS"]:
+        result["OUTBOUND_ALLOWED_DAYS"] = "mon,tue,wed,thu,fri,sat"
+    result.setdefault("OUTBOUND_CALLING_ENABLED", "true")
+    if not result["OUTBOUND_CALLING_ENABLED"]:
+        result["OUTBOUND_CALLING_ENABLED"] = "true"
+    return result
+
+
+@app.post("/api/outbound/schedule/settings")
+async def api_save_outbound_schedule_settings(req: OutboundScheduleRequest):
+    data = {k: v for k, v in req.dict().items() if v is not None and v != ""}
+    if not data:
+        raise HTTPException(400, "No settings provided")
+    await save_settings(data)
+    # Propagate to os.environ so the running process picks them up immediately
+    # without needing a restart (only fills gaps, honours existing VPS env vars).
+    for k, v in data.items():
+        if not os.environ.get(k):
+            os.environ[k] = v
+    # Return the updated schedule status
+    return await api_get_outbound_schedule_status()
+
+
+@app.get("/api/outbound/schedule/status")
+async def api_get_outbound_schedule_status():
+    tz_name, start_str, end_str, allowed_days = await _outbound_window()
+    enabled_raw = (await eff("OUTBOUND_CALLING_ENABLED") or "true").strip().lower()
+    calling_enabled = enabled_raw not in ("0", "false", "no", "off")
+    allowed = calling_enabled and await _is_outbound_allowed()
+    reason = ""
+    if not calling_enabled:
+        reason = "Outbound calling is disabled (OUTBOUND_CALLING_ENABLED=false)"
+    elif not allowed:
+        try:
+            from zoneinfo import ZoneInfo
+            now_tz = datetime.now(tz=ZoneInfo(tz_name))
+        except Exception:
+            now_tz = datetime.now()
+        day_abbr = now_tz.strftime("%a").lower()
+        if day_abbr not in allowed_days:
+            reason = f"Today ({now_tz.strftime('%A')}) is not an allowed calling day"
+        else:
+            reason = f"Current time is outside allowed window ({start_str}–{end_str} {tz_name})"
+    win_err = await _outbound_window_error() if not allowed else None
+    return {
+        "allowed": allowed,
+        "calling_enabled": calling_enabled,
+        "reason": reason if not allowed else "Within allowed outbound calling window",
+        "timezone": tz_name,
+        "start_time": start_str,
+        "end_time": end_str,
+        "allowed_days": sorted(allowed_days),
+        "next_allowed_at": win_err.get("next_allowed_at") if win_err else None,
+    }
