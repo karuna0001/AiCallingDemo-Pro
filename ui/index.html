@@ -291,18 +291,100 @@
 </section>
 
 <section id="whatsapp" class="panel">
-<div class="card">
-  <h2>💬 WhatsApp Settings</h2>
-  <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:14px">
-    <button class="kb-tab-btn active" onclick="waSwitchTab('settings')">⚙️ Settings</button>
-    <button class="kb-tab-btn" onclick="waSwitchTab('templates')">📝 Templates</button>
-    <button class="kb-tab-btn" onclick="waSwitchTab('send')">📤 Send Test</button>
-    <button class="kb-tab-btn" onclick="waSwitchTab('logs')">📋 Logs</button>
-    <button class="kb-tab-btn" onclick="waSwitchTab('health')">❤️ Health</button>
-  </div>
+<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:10px">
+  <button class="kb-tab-btn active" onclick="waSwitchTab('inbox')">💬 Inbox</button>
+  <button class="kb-tab-btn" onclick="waSwitchTab('settings')">⚙️ Settings</button>
+  <button class="kb-tab-btn" onclick="waSwitchTab('templates')">📝 Templates</button>
+  <button class="kb-tab-btn" onclick="waSwitchTab('send')">📤 Send Test</button>
+  <button class="kb-tab-btn" onclick="waSwitchTab('logs')">📋 Logs</button>
+  <button class="kb-tab-btn" onclick="waSwitchTab('health')">❤️ Health</button>
+</div>
 
-  <!-- Settings -->
-  <div class="kb-panel active" id="wap-settings">
+<!-- INBOX -->
+<div class="kb-panel active" id="wap-inbox">
+  <div style="display:grid;grid-template-columns:320px 1fr;gap:0;height:calc(100vh - 200px);min-height:500px;border:1px solid var(--border);border-radius:var(--r);overflow:hidden">
+    <!-- Left: conversation list -->
+    <div style="background:#111;border-right:1px solid var(--border);display:flex;flex-direction:column">
+      <div style="padding:10px;border-bottom:1px solid var(--border)">
+        <input id="wa-inbox-search" placeholder="Search phone..." style="width:100%;margin-bottom:6px" oninput="loadWaConversations()">
+        <div style="display:flex;gap:4px;flex-wrap:wrap">
+          <button class="tab active" id="wa-filter-all" style="padding:4px 10px;border-radius:999px;font-size:0.75rem" onclick="waSetFilter('all',this)">All</button>
+          <button class="tab" id="wa-filter-open" style="padding:4px 10px;border-radius:999px;font-size:0.75rem" onclick="waSetFilter('open',this)">Open</button>
+          <button class="tab" id="wa-filter-closed" style="padding:4px 10px;border-radius:999px;font-size:0.75rem" onclick="waSetFilter('closed',this)">Closed</button>
+          <button class="tab" id="wa-filter-unread" style="padding:4px 10px;border-radius:999px;font-size:0.75rem" onclick="waSetFilter('unread',this)">Unread</button>
+        </div>
+      </div>
+      <div id="wa-conv-list" style="overflow-y:auto;flex:1;padding:0">
+        <p class="muted" style="padding:16px;text-align:center">No WhatsApp conversations yet.</p>
+      </div>
+      <div style="padding:8px;border-top:1px solid var(--border)">
+        <button style="width:100%;font-size:0.8rem" onclick="loadWaConversations()">🔄 Refresh</button>
+      </div>
+    </div>
+    <!-- Right: chat window -->
+    <div id="wa-chat-panel" style="background:#0d0d0d;display:flex;flex-direction:column">
+      <div id="wa-chat-empty" style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text2)">
+        <div style="text-align:center"><div style="font-size:48px;margin-bottom:12px">💬</div><p>Select a conversation to open chat</p></div>
+      </div>
+      <div id="wa-chat-active" style="display:none;flex-direction:column;height:100%">
+        <!-- Header -->
+        <div id="wa-chat-header" style="padding:12px 16px;border-bottom:1px solid var(--border);background:#111;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+          <div>
+            <div id="wa-chat-name" style="font-weight:700;font-size:1rem"></div>
+            <div id="wa-chat-phone" style="font-size:0.8rem;color:var(--text2)"></div>
+            <div id="wa-chat-crm-status" style="font-size:0.78rem;color:#00ff88;margin-top:2px"></div>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+            <button id="wa-ai-toggle-btn" style="font-size:0.78rem;padding:4px 10px" onclick="waToggleAI()">🤖 AI: ON</button>
+            <button style="font-size:0.78rem;padding:4px 10px" onclick="waOpenCRM()">👤 CRM</button>
+            <button style="font-size:0.78rem;padding:4px 10px" onclick="waTakeover()">🙋 Take Over</button>
+            <button style="font-size:0.78rem;padding:4px 10px;background:#2a0b0b;color:#ffd0d0;border-color:#ff4d4d" onclick="waCloseConv()">✕ Close</button>
+          </div>
+          <div style="width:100%;display:flex;gap:6px;align-items:center">
+            <label style="font-size:0.78rem;color:var(--text2)">Assign:</label>
+            <input id="wa-assign-input" placeholder="Agent name" style="font-size:0.78rem;padding:4px 8px;flex:1;max-width:200px">
+            <button style="font-size:0.78rem;padding:4px 10px" onclick="waAssign()">Assign</button>
+          </div>
+        </div>
+        <!-- Messages -->
+        <div id="wa-messages" style="flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:8px"></div>
+        <!-- Reply box -->
+        <div style="padding:12px;border-top:1px solid var(--border);background:#111">
+          <div id="wa-window-warning" style="display:none;background:#2d2208;color:#ffe3aa;border:1px solid #ffaa00;border-radius:6px;padding:8px 12px;font-size:0.82rem;margin-bottom:8px">
+            ⚠️ 24-hour customer service window may be closed. Use a template instead.
+          </div>
+          <textarea id="wa-reply-input" rows="2" placeholder="Type a message..." style="width:100%;margin-bottom:8px;resize:vertical"></textarea>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="primary" onclick="waSendMessage()" style="font-size:0.85rem">📤 Send</button>
+            <button onclick="waShowTemplateModal()" style="font-size:0.85rem">📋 Send Template</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Template modal -->
+<div id="wa-template-modal" style="display:none;position:fixed;inset:0;background:#000c;z-index:200;align-items:center;justify-content:center">
+  <div class="card" style="width:min(420px,95vw);padding:20px">
+    <h3 style="margin-bottom:12px">📋 Send Template</h3>
+    <label>Template Name</label>
+    <input id="wa-modal-template" placeholder="welcome_template" style="margin-bottom:8px">
+    <label>Language</label>
+    <input id="wa-modal-lang" value="en" style="margin-bottom:8px">
+    <label>Parameters (comma-separated, optional)</label>
+    <input id="wa-modal-params" placeholder="Name, Company, Service" style="margin-bottom:12px">
+    <div style="display:flex;gap:8px">
+      <button class="primary" onclick="waSendTemplate()">Send</button>
+      <button onclick="$('wa-template-modal').style.display='none'">Cancel</button>
+    </div>
+    <p id="wa-modal-msg" class="muted" style="margin-top:8px;min-height:1.2em"></p>
+  </div>
+</div>
+
+<!-- Settings -->
+<div class="kb-panel" id="wap-settings">
+  <div class="card">
     <h3 style="margin-bottom:10px">⚙️ WhatsApp Provider Settings</h3>
     <div class="grid cols-2" style="gap:10px">
       <div><label>WhatsApp Enabled</label><select id="wa-WHATSAPP_ENABLED"><option value="false">Disabled</option><option value="true">Enabled</option></select></div>
@@ -312,15 +394,17 @@
       <div><label>Phone Number ID</label><input id="wa-WHATSAPP_PHONE_NUMBER_ID" placeholder="Meta Phone Number ID"></div>
       <div><label>Business Account ID</label><input id="wa-WHATSAPP_BUSINESS_ACCOUNT_ID" placeholder="Meta Business Account ID"></div>
       <div style="grid-column:1/-1"><label>Access Token <span class="muted" style="font-size:0.8rem">(stored securely — shown masked)</span></label><input id="wa-WHATSAPP_ACCESS_TOKEN" placeholder="Enter new token to update..."></div>
-      <div style="grid-column:1/-1"><label>Webhook Verify Token</label><input id="wa-WHATSAPP_VERIFY_TOKEN" placeholder="Your custom webhook verify token (Phase 8)"></div>
+      <div style="grid-column:1/-1"><label>Webhook Verify Token</label><input id="wa-WHATSAPP_VERIFY_TOKEN" placeholder="Your custom webhook verify token"></div>
     </div>
     <div class="row" style="margin-top:12px;gap:8px"><button class="primary" onclick="saveWaSettings()">💾 Save Settings</button><button onclick="loadWaHealth()">❤️ Check Health</button></div>
     <p id="wa-settings-msg" class="muted" style="min-height:1.2em;margin-top:6px"></p>
     <div id="wa-health-box" style="margin-top:10px"></div>
   </div>
+</div>
 
-  <!-- Templates -->
-  <div class="kb-panel" id="wap-templates">
+<!-- Templates -->
+<div class="kb-panel" id="wap-templates">
+  <div class="card">
     <h3 style="margin-bottom:10px">📝 WhatsApp Template Names</h3>
     <p class="muted" style="margin-bottom:10px;font-size:0.85rem">Enter the exact template names as approved in your Meta Business Manager.</p>
     <div class="grid cols-2" style="gap:10px">
@@ -337,9 +421,11 @@
     <div class="row" style="margin-top:12px"><button class="primary" onclick="saveWaSettings()">💾 Save Templates</button></div>
     <p id="wa-templates-msg" class="muted" style="min-height:1.2em;margin-top:6px"></p>
   </div>
+</div>
 
-  <!-- Send Test -->
-  <div class="kb-panel" id="wap-send">
+<!-- Send Test -->
+<div class="kb-panel" id="wap-send">
+  <div class="card">
     <h3 style="margin-bottom:10px">📤 Send Test WhatsApp</h3>
     <div class="grid cols-2" style="gap:10px">
       <div><label>Phone</label><input id="wa-send-phone" placeholder="+919876543210"></div>
@@ -350,9 +436,11 @@
     <div class="row" style="margin-top:12px;gap:8px"><button class="primary" onclick="sendWaTest()">📤 Send WhatsApp</button></div>
     <pre id="wa-send-result" style="background:#0d0d1a;border:1px solid #333;border-radius:6px;padding:12px;margin-top:10px;white-space:pre-wrap;font-size:0.85rem;color:#ccc;min-height:60px"></pre>
   </div>
+</div>
 
-  <!-- Logs -->
-  <div class="kb-panel" id="wap-logs">
+<!-- Logs -->
+<div class="kb-panel" id="wap-logs">
+  <div class="card">
     <h3 style="margin-bottom:10px">📋 WhatsApp Logs</h3>
     <div class="row" style="gap:8px;margin-bottom:10px">
       <input id="wa-log-phone" placeholder="Filter by phone">
@@ -360,9 +448,11 @@
     </div>
     <div id="wa-logs-list"></div>
   </div>
+</div>
 
-  <!-- Health -->
-  <div class="kb-panel" id="wap-health">
+<!-- Health -->
+<div class="kb-panel" id="wap-health">
+  <div class="card">
     <h3 style="margin-bottom:10px">❤️ WhatsApp Health Check</h3>
     <button onclick="loadWaHealth(true)">🔄 Refresh Health</button>
     <div id="wa-health-detail" style="margin-top:12px"></div>
@@ -601,7 +691,7 @@ async function fetchLeadDetail(phoneEnc){return api('/api/crm/contacts/'+phoneEn
 window.quickStatusChange=async(phoneEnc,status)=>{if(!status)return;try{await api('/api/crm/contacts/'+phoneEnc+'/status',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({crm_status:status})});toast('Status updated');loadCRM()}catch(e){toast(e.message||'Update failed','err')}};
 // ── Unified Lead Detail modal ─────────────────────────────────────────────────────────────────
 window.switchLeadSection=name=>{document.querySelectorAll('.lead-tab').forEach(t=>t.classList.toggle('active',t.dataset.section===name));document.querySelectorAll('.lead-section').forEach(s=>s.classList.toggle('active',s.id==='lead-sec-'+name))};
-window.openLeadModal=async phoneEnc=>{try{const d=await fetchLeadDetail(phoneEnc);const c=d.contact||{};const calls=d.calls||[];const appts=d.appointments||[];const rec=d.latest_recording_url||'';const fup=(c.next_followup_at||'').slice(0,16);const activity=buildActivityFromNotes(c.crm_notes||'',calls,appts);showModal(`<h2 style="padding-right:36px">👤 ${esc(c.lead_name||'Lead')} <small class="muted">${esc(c.phone_number||'')}</small></h2><div class="lead-tabs"><button class="lead-tab active" data-section="details" onclick="switchLeadSection('details')">Lead Details</button><button class="lead-tab" data-section="notes" onclick="switchLeadSection('notes')">Notes & Follow-up</button><button class="lead-tab" data-section="calls" onclick="switchLeadSection('calls')">Call History (${calls.length})</button><button class="lead-tab" data-section="activity" onclick="switchLeadSection('activity')">Activity</button></div><div id="lead-sec-details" class="lead-section active"><div class="grid cols-2"><div><label>Lead Name</label><input id="ed-lead_name" value="${esc(c.lead_name||'')}"></div><div><label>Phone Number</label><input id="ed-phone_number" value="${esc(c.phone_number||'')}" readonly disabled><div class="locked-hint">🔒 Mobile number is locked to avoid duplicate CRM records.</div></div><div><label>Email</label><input id="ed-email" value="${esc(c.email||'')}"></div><div><label>City</label><input id="ed-city" value="${esc(c.city||'')}"></div><div><label>Location</label><input id="ed-location" value="${esc(c.location||'')}"></div><div><label>Source</label><input id="ed-source" value="${esc(c.source||'')}"></div><div><label>Service Type</label><input id="ed-service_type" value="${esc(c.service_type||'')}"></div><div><label>Requirement</label><input id="ed-requirement" value="${esc(c.requirement||'')}"></div><div><label>Budget</label><input id="ed-budget" value="${esc(c.budget||'')}"></div><div><label>Business Name</label><input id="ed-business_name" value="${esc(c.business_name||'')}"></div><div><label>Campaign Name</label><input id="ed-campaign_name" value="${esc(c.campaign_name||'')}"></div><div><label>Assigned To</label><input id="ed-assigned_to" value="${esc(c.assigned_to||'')}"></div><div><label>CRM Status</label><select id="ed-crm_status">${crmStatusOptions(c.crm_status||'New')}</select></div><div><label>Custom Status</label><input id="ed-custom_status" value="${esc(c.custom_status||'')}"></div></div></div><div id="lead-sec-notes" class="lead-section"><div class="grid cols-2"><div><label>Next Follow-up</label><input id="ed-next_followup_at" type="datetime-local" value="${esc(fup)}"></div><div><label>Quick status (saved with Save Changes)</label><select id="ed-crm_status_mirror" onchange="document.getElementById('ed-crm_status').value=this.value">${crmStatusOptions(c.crm_status||'New')}</select></div><div style="grid-column:1/-1"><label>CRM Notes</label><textarea id="ed-crm_notes" style="min-height:180px">${esc(c.crm_notes||'')}</textarea></div></div></div><div id="lead-sec-calls" class="lead-section"><div class="grid cols-3"><div class="card"><div>Total Calls</div><div class="kpi">${calls.length}</div></div><div class="card"><div>Last Outcome</div><div class="kpi" style="font-size:18px">${esc(c.last_call_outcome||'—')}</div></div><div class="card"><div>Last Call</div><div class="kpi" style="font-size:18px">${esc((c.last_call_at||'').replace('T',' ').slice(0,16)||'—')}</div></div></div>${rec?`<div style="margin:10px 0;padding:10px;background:#111;border-radius:8px"><b>🎵 Latest Recording:</b><br><audio controls src="${esc(rec)}" style="width:100%;margin-top:6px"></audio><br><a href="${esc(rec)}" target="_blank" style="font-size:0.8rem;color:#888">Open in new tab</a></div>`:''}<h3 style="margin-top:14px">Recent Calls</h3>${calls.length?_renderCallHistory(calls.slice(0,20)):'<p class="muted">No calls yet.</p>'}<h3 style="margin-top:14px">Appointments (${appts.length})</h3>${appts.length?table(appts,['date','time','service','status']):'<p class="muted">No appointments.</p>'}</div><div id="lead-sec-activity" class="lead-section">${activity}</div><p id="edit-lead-error" class="err" style="margin-top:6px"></p><div class="modal-actions"><button class="primary" onclick="saveLeadModal('${phoneEnc}')">💾 Save Changes</button><button onclick="callOneLead('${esc(c.phone_number||'')}')">📞 Call Now</button><button onclick="window.open('https://wa.me/${String(c.phone_number||'').replace('+','')}')">💬 WhatsApp</button><button onclick="closeModal()">Close</button></div>`)}catch(e){toast(e.message||'Failed to load lead','err')}};
+window.openLeadModal=async phoneEnc=>{try{const d=await fetchLeadDetail(phoneEnc);const c=d.contact||{};const calls=d.calls||[];const appts=d.appointments||[];const rec=d.latest_recording_url||'';const fup=(c.next_followup_at||'').slice(0,16);const activity=buildActivityFromNotes(c.crm_notes||'',calls,appts);showModal(`<h2 style="padding-right:36px">👤 ${esc(c.lead_name||'Lead')} <small class="muted">${esc(c.phone_number||'')}</small></h2><div class="lead-tabs"><button class="lead-tab active" data-section="details" onclick="switchLeadSection('details')">Lead Details</button><button class="lead-tab" data-section="notes" onclick="switchLeadSection('notes')">Notes & Follow-up</button><button class="lead-tab" data-section="calls" onclick="switchLeadSection('calls')">Call History (${calls.length})</button><button class="lead-tab" data-section="activity" onclick="switchLeadSection('activity')">Activity</button><button class="lead-tab" data-section="whatsapp" onclick="switchLeadSection('whatsapp');_loadCrmWaSection('${esc(c.phone_number||'')}')">💬 WhatsApp</button></div><div id="lead-sec-details" class="lead-section active"><div class="grid cols-2"><div><label>Lead Name</label><input id="ed-lead_name" value="${esc(c.lead_name||'')}"></div><div><label>Phone Number</label><input id="ed-phone_number" value="${esc(c.phone_number||'')}" readonly disabled><div class="locked-hint">🔒 Mobile number is locked to avoid duplicate CRM records.</div></div><div><label>Email</label><input id="ed-email" value="${esc(c.email||'')}"></div><div><label>City</label><input id="ed-city" value="${esc(c.city||'')}"></div><div><label>Location</label><input id="ed-location" value="${esc(c.location||'')}"></div><div><label>Source</label><input id="ed-source" value="${esc(c.source||'')}"></div><div><label>Service Type</label><input id="ed-service_type" value="${esc(c.service_type||'')}"></div><div><label>Requirement</label><input id="ed-requirement" value="${esc(c.requirement||'')}"></div><div><label>Budget</label><input id="ed-budget" value="${esc(c.budget||'')}"></div><div><label>Business Name</label><input id="ed-business_name" value="${esc(c.business_name||'')}"></div><div><label>Campaign Name</label><input id="ed-campaign_name" value="${esc(c.campaign_name||'')}"></div><div><label>Assigned To</label><input id="ed-assigned_to" value="${esc(c.assigned_to||'')}"></div><div><label>CRM Status</label><select id="ed-crm_status">${crmStatusOptions(c.crm_status||'New')}</select></div><div><label>Custom Status</label><input id="ed-custom_status" value="${esc(c.custom_status||'')}"></div></div></div><div id="lead-sec-notes" class="lead-section"><div class="grid cols-2"><div><label>Next Follow-up</label><input id="ed-next_followup_at" type="datetime-local" value="${esc(fup)}"></div><div><label>Quick status (saved with Save Changes)</label><select id="ed-crm_status_mirror" onchange="document.getElementById('ed-crm_status').value=this.value">${crmStatusOptions(c.crm_status||'New')}</select></div><div style="grid-column:1/-1"><label>CRM Notes</label><textarea id="ed-crm_notes" style="min-height:180px">${esc(c.crm_notes||'')}</textarea></div></div></div><div id="lead-sec-calls" class="lead-section"><div class="grid cols-3"><div class="card"><div>Total Calls</div><div class="kpi">${calls.length}</div></div><div class="card"><div>Last Outcome</div><div class="kpi" style="font-size:18px">${esc(c.last_call_outcome||'—')}</div></div><div class="card"><div>Last Call</div><div class="kpi" style="font-size:18px">${esc((c.last_call_at||'').replace('T',' ').slice(0,16)||'—')}</div></div></div>${rec?`<div style="margin:10px 0;padding:10px;background:#111;border-radius:8px"><b>🎵 Latest Recording:</b><br><audio controls src="${esc(rec)}" style="width:100%;margin-top:6px"></audio><br><a href="${esc(rec)}" target="_blank" style="font-size:0.8rem;color:#888">Open in new tab</a></div>`:''}<h3 style="margin-top:14px">Recent Calls</h3>${calls.length?_renderCallHistory(calls.slice(0,20)):'<p class="muted">No calls yet.</p>'}<h3 style="margin-top:14px">Appointments (${appts.length})</h3>${appts.length?table(appts,['date','time','service','status']):'<p class="muted">No appointments.</p>'}</div><div id="lead-sec-activity" class="lead-section">${activity}</div><div id="lead-sec-whatsapp" class="lead-section"><div id="crm-wa-section"><p class="muted">Loading WhatsApp conversations...</p></div><div class="row" style="gap:8px;margin-top:10px"><button onclick="_openWaChatFromCRM('${esc(c.phone_number||'')}')">💬 Open WhatsApp Chat</button><button onclick="waShowTemplateModal()">📋 Send Template</button></div></div><p id="edit-lead-error" class="err" style="margin-top:6px"></p><div class="modal-actions"><button class="primary" onclick="saveLeadModal('${phoneEnc}')">💾 Save Changes</button><button onclick="callOneLead('${esc(c.phone_number||'')}')">📞 Call Now</button><button onclick="window.open('https://wa.me/${String(c.phone_number||'').replace('+','')}')">💬 WhatsApp</button><button onclick="closeModal()">Close</button></div>`)}catch(e){toast(e.message||'Failed to load lead','err')}};
 function buildActivityFromNotes(notes,calls,appts){const lines=(notes||'').split('\n').filter(Boolean).map(l=>`<div style="padding:6px 0;border-bottom:1px solid #1c1c1c">📝 ${esc(l)}</div>`);const callLines=(calls||[]).slice(0,20).map(c=>`<div style="padding:6px 0;border-bottom:1px solid #1c1c1c">📞 ${esc((c.timestamp||'').replace('T',' ').slice(0,16))} — ${esc(c.outcome||'—')} (${esc(c.duration_seconds||0)}s)</div>`);const apptLines=(appts||[]).map(a=>`<div style="padding:6px 0;border-bottom:1px solid #1c1c1c">📅 ${esc(a.date||'')} ${esc(a.time||'')} — ${esc(a.service||'')} [${esc(a.status||'')}]</div>`);const all=[...apptLines,...callLines,...lines];return all.length?`<div>${all.join('')}</div>`:'<p class="muted">No activity yet.</p>'}
 window.saveLeadModal=async phoneEnc=>{const f={},ids=['lead_name','email','city','location','source','service_type','requirement','budget','business_name','campaign_name','crm_status','custom_status','crm_notes','next_followup_at','assigned_to'];ids.forEach(k=>{const el=$('ed-'+k);if(el)f[k]=el.value});// phone_number is NEVER sent — mobile is the immutable unique identity.
 delete f.phone_number;if(f.next_followup_at===''){f.next_followup_at=null}try{await api('/api/crm/contacts/'+phoneEnc,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(f)});toast('Lead updated');loadCRM();closeModal()}catch(e){$('edit-lead-error').textContent=e.message||'Save failed'}};
@@ -762,15 +852,34 @@ async function loadAutomationQueue(){const status=$('auto-queue-status').value;c
 window.cancelAction=async id=>{try{await api('/api/automation/actions/'+id+'/status',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'cancelled'})});loadAutomationQueue();toast('Action cancelled')}catch(e){toast(e.message,'err')}}
 async function runDueActions(){try{const r=await api('/api/automation/actions/run-due',{method:'POST'});toast('Ran due actions: '+r.processed+' processed');loadAutomationQueue()}catch(e){toast(e.message,'err')}}
 // ── WhatsApp ──────────────────────────────────────────────────────────────────
+// ── Phase 8 WhatsApp Inbox state ──────────────────────────────────
+let _waConvs=[],_waActiveConvId=null,_waFilter='all',_waMsgInterval=null,_waConvInterval=null;
 let _waSettings={};
 const _WA_SETTINGS_KEYS=['WHATSAPP_ENABLED','WHATSAPP_PROVIDER','WHATSAPP_GRAPH_VERSION','WHATSAPP_DEFAULT_LANGUAGE','WHATSAPP_PHONE_NUMBER_ID','WHATSAPP_BUSINESS_ACCOUNT_ID','WHATSAPP_ACCESS_TOKEN','WHATSAPP_VERIFY_TOKEN'];
 const _WA_TEMPLATE_KEYS=['WHATSAPP_WELCOME_TEMPLATE','WHATSAPP_MISSED_CALL_TEMPLATE','WHATSAPP_BUSY_CALL_TEMPLATE','WHATSAPP_FAILED_CALL_TEMPLATE','WHATSAPP_CALLBACK_TEMPLATE','WHATSAPP_APPOINTMENT_TEMPLATE','WHATSAPP_SHOWROOM_VISIT_TEMPLATE','WHATSAPP_RE_ENQUIRY_TEMPLATE','WHATSAPP_FOLLOWUP_TEMPLATE'];
-function waSwitchTab(name){document.querySelectorAll('#whatsapp .kb-tab-btn').forEach(b=>b.classList.toggle('active',b.getAttribute('onclick').includes("'"+name+"'")));document.querySelectorAll('#whatsapp .kb-panel').forEach(p=>p.classList.toggle('active',p.id==='wap-'+name));if(name==='logs')loadWaLogs();if(name==='health')loadWaHealth(true)}
-async function initWhatsApp(){try{_waSettings=await api('/api/whatsapp/settings');[..._WA_SETTINGS_KEYS,..._WA_TEMPLATE_KEYS].forEach(k=>{const el=$('wa-'+k);if(!el)return;if(el.tagName==='SELECT')el.value=_waSettings[k]||'';else el.value=_waSettings[k]||''})}catch(e){toast('WA settings load failed: '+e.message,'err')}}
+function waSwitchTab(name){document.querySelectorAll('#whatsapp .kb-tab-btn').forEach(b=>b.classList.toggle('active',b.getAttribute('onclick').includes("'"+name+"'")));document.querySelectorAll('#whatsapp .kb-panel').forEach(p=>p.classList.toggle('active',p.id==='wap-'+name));if(name==='inbox'){loadWaConversations();_startWaPolling();}if(name==='logs')loadWaLogs();if(name==='health')loadWaHealth(true)}
+async function initWhatsApp(){try{_waSettings=await api('/api/whatsapp/settings');[..._WA_SETTINGS_KEYS,..._WA_TEMPLATE_KEYS].forEach(k=>{const el=$('wa-'+k);if(!el)return;if(el.tagName==='SELECT')el.value=_waSettings[k]||'';else el.value=_waSettings[k]||''})}catch(e){toast('WA settings load failed: '+e.message,'err')}loadWaConversations();_startWaPolling()}
+function _startWaPolling(){if(_waConvInterval)clearInterval(_waConvInterval);_waConvInterval=setInterval(()=>{if(document.body.classList.contains('authenticated'))loadWaConversations()},10000);if(_waMsgInterval)clearInterval(_waMsgInterval);_waMsgInterval=setInterval(()=>{if(_waActiveConvId&&document.body.classList.contains('authenticated'))_loadWaMessages(_waActiveConvId,false)},5000)}
+async function loadWaConversations(){const search=($('wa-inbox-search')||{}).value||'';const status=_waFilter==='all'?null:_waFilter==='unread'?null:_waFilter;let url='/api/whatsapp/conversations?limit=60';if(status)url+='&status='+encodeURIComponent(status);if(search)url+='&search='+encodeURIComponent(search);try{const r=await api(url);_waConvs=r.conversations||[];const el=$('wa-conv-list');if(!el)return;if(!_waConvs.length){el.innerHTML='<p class="muted" style="padding:16px;text-align:center">No WhatsApp conversations yet.</p>';return;}let filtered=_waConvs;if(_waFilter==='unread')filtered=_waConvs.filter(c=>c.unread_count>0);el.innerHTML=filtered.map(c=>{const active=c.id===_waActiveConvId?'background:#1a2a1a;':'';const unread=c.unread_count>0?`<span style="background:#00ff88;color:#000;border-radius:999px;padding:0 7px;font-size:0.72rem;font-weight:700">${c.unread_count}</span>`:'' ;const ai=c.ai_enabled?'<span style="font-size:0.68rem;color:#00ccff">🤖AI</span>':'<span style="font-size:0.68rem;color:#888">AI off</span>';const t=(c.last_message_at||'').slice(11,16);return`<div onclick="waOpenConversation('${c.id}')" style="padding:12px 14px;border-bottom:1px solid #1a1a1a;cursor:pointer;${active}"><div style="display:flex;justify-content:space-between;align-items:center"><span style="font-weight:600;font-size:0.9rem">${esc(c.contact_name||c.phone_number)}</span><span style="font-size:0.75rem;color:#666">${esc(t)}</span></div><div style="font-size:0.78rem;color:#999;margin-top:2px;display:flex;justify-content:space-between"><span>${esc((c.last_message||'No messages').slice(0,40))}</span><span style="display:flex;gap:4px;align-items:center">${ai}${unread}</span></div></div>`}).join('')}catch(e){console.error('loadWaConversations:',e)}}
+function waSetFilter(f,btn){_waFilter=f;document.querySelectorAll('#wap-inbox .tab').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');loadWaConversations()}
+async function waOpenConversation(id){_waActiveConvId=id;const conv=_waConvs.find(c=>c.id===id);$('wa-chat-empty').style.display='none';$('wa-chat-active').style.display='flex';if(conv){$('wa-chat-name').textContent=conv.contact_name||conv.phone_number;$('wa-chat-phone').textContent=conv.phone_number;$('wa-chat-crm-status').textContent=conv.status==='opted_out'?'🚫 Opted out':conv.status==='closed'?'Closed':'Open';$('wa-assign-input').value=conv.assigned_to||'';const aiBtn=$('wa-ai-toggle-btn');if(aiBtn){aiBtn.textContent=conv.ai_enabled?'🤖 AI: ON':'🤖 AI: OFF';aiBtn.style.borderColor=conv.ai_enabled?'#00ff88':'#555';}}await _loadWaMessages(id,true);// reset unread
+await api(`/api/whatsapp/conversations/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({unread_count:0})}).catch(()=>{});loadWaConversations()}
+async function _loadWaMessages(id,scrollBottom=true){try{const r=await api(`/api/whatsapp/conversations/${id}/messages?limit=60`);const msgs=r.messages||[];const el=$('wa-messages');if(!el)return;el.innerHTML=msgs.map(m=>{const isIn=m.direction==='inbound';const bg=isIn?'#1a2a1a':m.ai_generated?'#0d1f2d':'#1a1a2e';const align=isIn?'flex-start':'flex-end';const badge=m.ai_generated?'<span style="font-size:0.65rem;color:#00ccff;margin-left:6px">🤖AI</span>':m.human_sent?'<span style="font-size:0.65rem;color:#00ff88;margin-left:6px">👤</span>':'';const tplBadge=m.message_type==='template'?'<span style="font-size:0.65rem;color:#ffaa00;margin-left:6px">📋TPL</span>':'';const t=(m.created_at||'').slice(11,16);return`<div style="display:flex;justify-content:${align}"><div style="max-width:75%;background:${bg};padding:8px 12px;border-radius:10px;font-size:0.88rem">${esc(m.message_text||'[media]')}<div style="font-size:0.7rem;color:#555;margin-top:4px;text-align:right">${t}${badge}${tplBadge}</div></div></div>`}).join('');if(scrollBottom)el.scrollTop=el.scrollHeight;}catch(e){console.error('_loadWaMessages:',e)}}
+async function waSendMessage(){const txt=($('wa-reply-input')||{}).value||'';if(!txt.trim()||!_waActiveConvId)return;try{await api(`/api/whatsapp/conversations/${_waActiveConvId}/send`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:txt.trim()})});$('wa-reply-input').value='';await _loadWaMessages(_waActiveConvId,true);loadWaConversations()}catch(e){const msg=e.message||'Send failed';if(msg.toLowerCase().includes('window')){$('wa-window-warning').style.display='block';}toast(msg,'err')}}
+function waShowTemplateModal(){if(!_waActiveConvId){toast('Select a conversation first','err');return;}$('wa-template-modal').style.display='flex';$('wa-modal-msg').textContent=''}
+async function waSendTemplate(){const tpl=($('wa-modal-template')||{}).value||'';const lang=($('wa-modal-lang')||{}).value||'en';const paramsRaw=($('wa-modal-params')||{}).value||'';const parameters=paramsRaw?paramsRaw.split(',').map(s=>s.trim()).filter(Boolean):null;if(!tpl){toast('Template name required','err');return;}try{await api(`/api/whatsapp/conversations/${_waActiveConvId}/send-template`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({template_name:tpl,language:lang,parameters})});$('wa-template-modal').style.display='none';toast('Template sent');await _loadWaMessages(_waActiveConvId,true);loadWaConversations()}catch(e){const m=$('wa-modal-msg');if(m){m.textContent=e.message||'Send failed';m.className='err';}toast(e.message||'Send failed','err')}}
+async function waToggleAI(){if(!_waActiveConvId)return;const conv=_waConvs.find(c=>c.id===_waActiveConvId);const newVal=!(conv&&conv.ai_enabled);try{await api(`/api/whatsapp/conversations/${_waActiveConvId}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({ai_enabled:newVal})});const btn=$('wa-ai-toggle-btn');if(btn){btn.textContent=newVal?'🤖 AI: ON':'🤖 AI: OFF';btn.style.borderColor=newVal?'#00ff88':'#555';}if(conv)conv.ai_enabled=newVal;toast(newVal?'AI reply ON':'AI reply OFF')}catch(e){toast(e.message,'err')}}
+async function waTakeover(){if(!_waActiveConvId)return;try{await api(`/api/whatsapp/conversations/${_waActiveConvId}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({ai_enabled:false})});const btn=$('wa-ai-toggle-btn');if(btn){btn.textContent='🤖 AI: OFF';btn.style.borderColor='#555';}const conv=_waConvs.find(c=>c.id===_waActiveConvId);if(conv)conv.ai_enabled=false;toast('Took over — AI disabled')}catch(e){toast(e.message,'err')}}
+async function waCloseConv(){if(!_waActiveConvId)return;if(!confirm('Close this conversation?'))return;try{await api(`/api/whatsapp/conversations/${_waActiveConvId}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'closed'})});toast('Conversation closed');$('wa-chat-crm-status').textContent='Closed';loadWaConversations()}catch(e){toast(e.message,'err')}}
+async function waAssign(){if(!_waActiveConvId)return;const name=($('wa-assign-input')||{}).value||'';try{await api(`/api/whatsapp/conversations/${_waActiveConvId}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({assigned_to:name})});toast('Assigned to '+name)}catch(e){toast(e.message,'err')}}
+async function waOpenCRM(){const conv=_waConvs.find(c=>c.id===_waActiveConvId);if(!conv)return;const phone=conv.phone_number;switchTab('crm');setTimeout(()=>{const el=$('crm-q');if(el){el.value=phone;loadCRM();}},400)}
 async function saveWaSettings(){const settings={};[..._WA_SETTINGS_KEYS,..._WA_TEMPLATE_KEYS].forEach(k=>{const el=$('wa-'+k);if(el)settings[k]=el.value});try{await api('/api/whatsapp/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({settings})});toast('WhatsApp settings saved');['wa-settings-msg','wa-templates-msg'].forEach(id=>{const m=$(id);if(m){m.textContent='Saved.';m.className='ok';setTimeout(()=>{m.textContent='';m.className='muted'},3000)}})}catch(e){toast(e.message,'err')}}
 async function loadWaHealth(showDetail=false){try{const h=await api('/api/whatsapp/health');const box=$('wa-health-box'),detail=$('wa-health-detail');const statusBadge=`<span class="badge ${h.status==='ok'?'ok':'err'}">${h.status}</span>`;const html=`<div class="row" style="gap:8px;flex-wrap:wrap">${statusBadge}<span class="badge ${h.enabled?'ok':'warnc'}">WhatsApp: ${h.enabled?'Enabled':'Disabled'}</span><span class="badge ${h.phone_number_id_configured?'ok':'err'}">Phone ID: ${h.phone_number_id_configured?'Set':'Missing'}</span><span class="badge ${h.access_token_configured?'ok':'err'}">Token: ${h.access_token_configured?'Set':'Missing'}</span><span class="badge warnc">${h.templates_configured} templates configured</span></div>${h.missing&&h.missing.length?'<p class="muted" style="margin-top:6px;color:#f87171">Missing: '+esc(h.missing.join(', '))+'</p>':''}`;if(box)box.innerHTML=html;if(detail&&showDetail)detail.innerHTML='<pre style="background:#0d0d1a;padding:12px;border-radius:6px;font-size:0.82rem;color:#ccc">'+JSON.stringify(h,null,2)+'</pre>'}catch(e){toast(e.message,'err')}}
 async function sendWaTest(){const phone=$('wa-send-phone').value;const template=$('wa-send-template').value;const lang=$('wa-send-lang').value||'en';const paramsRaw=$('wa-send-params').value;const parameters=paramsRaw?paramsRaw.split(',').map(s=>s.trim()).filter(Boolean):null;try{const r=await api('/api/whatsapp/send-template',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,template_name:template,language:lang,parameters})});$('wa-send-result').textContent=JSON.stringify(r,null,2);if(r.success)toast('WhatsApp sent!');else toast(r.error||'Send failed','err')}catch(e){$('wa-send-result').textContent='Error: '+e.message;toast(e.message,'err')}}
 async function loadWaLogs(){const phone=$('wa-log-phone').value;let url='/api/whatsapp/logs?limit=100';if(phone)url+='&phone='+encodeURIComponent(phone);try{const r=await api(url);const rows=r.logs||[];$('wa-logs-list').innerHTML=rows.length?`<table><thead><tr><th>Phone</th><th>Event</th><th>Template</th><th>Status</th><th>Msg ID</th><th>Error</th><th>Time</th></tr></thead><tbody>${rows.map(l=>`<tr><td>${esc(l.phone_number||'')}</td><td>${esc(l.event_type||'')}</td><td>${esc(l.template_name||'')}</td><td><span class="badge ${l.status==='sent'?'ok':l.status==='failed'?'err':'warnc'}">${esc(l.status||'')}</span></td><td style="font-size:0.75rem;color:#888">${esc(l.provider_message_id||'—')}</td><td style="font-size:0.75rem;color:#f87171">${esc((l.error_message||'').slice(0,60))}</td><td style="white-space:nowrap;font-size:0.8rem">${esc((l.created_at||'').slice(0,16).replace('T',' '))}</td></tr>`).join('')}</tbody></table>`:'<p class="muted">No WhatsApp logs found.</p>'}catch(e){toast(e.message,'err')}}
+// ── CRM WhatsApp section helpers ─────────────────────────────────────────────
+window._loadCrmWaSection=async function(phone){const el=$('crm-wa-section');if(!el)return;el.innerHTML='<p class="muted">Loading...</p>';try{const r=await api('/api/whatsapp/conversations?search='+encodeURIComponent(phone)+'&limit=5');const convs=r.conversations||[];if(!convs.length){el.innerHTML='<p class="muted">No WhatsApp conversations found for this contact.</p>';return;}const conv=convs[0];const msgs=await api(`/api/whatsapp/conversations/${conv.id}/messages?limit=5`);const lastMsgs=(msgs.messages||[]).slice(-5);el.innerHTML=`<div style="border:1px solid #222;border-radius:8px;overflow:hidden"><div style="background:#111;padding:8px 12px;display:flex;justify-content:space-between;align-items:center"><span><b>${esc(conv.contact_name||conv.phone_number)}</b> <span class="badge ${conv.status==='open'?'ok':'warnc'}">${esc(conv.status)}</span> ${conv.ai_enabled?'<span class="badge ok" style="font-size:0.7rem">AI ON</span>':'<span class="badge" style="font-size:0.7rem">AI OFF</span>'}</span><span class="muted" style="font-size:0.78rem">Last: ${esc((conv.last_message_at||'').slice(0,16).replace('T',' '))}</span></div><div style="padding:10px;max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:6px">${lastMsgs.length?lastMsgs.map(m=>{const isIn=m.direction==='inbound';const bg=isIn?'#1a2a1a':m.ai_generated?'#0d1f2d':'#1a1a2e';const align=isIn?'flex-start':'flex-end';return`<div style="display:flex;justify-content:${align}"><div style="max-width:80%;background:${bg};padding:6px 10px;border-radius:8px;font-size:0.82rem">${esc(m.message_text||'[media]')}<div style="font-size:0.68rem;color:#555;text-align:right">${esc((m.created_at||'').slice(11,16))}</div></div></div>`}).join(''):'<p class="muted" style="text-align:center">No messages</p>'}</div><div style="padding:8px 12px;background:#0d0d1a;font-size:0.8rem;color:#888">${esc((conv.last_message||'').slice(0,80))}</div></div>`}catch(e){const el2=$('crm-wa-section');if(el2)el2.innerHTML='<p class="err">'+esc(e.message)+'</p>';}};
+window._openWaChatFromCRM=function(phone){closeModal();switchTab('whatsapp');setTimeout(async()=>{await loadWaConversations();const conv=_waConvs.find(c=>c.phone_number===phone);if(conv)waOpenConversation(conv.id);else toast('No WhatsApp conversation found for '+phone,'err')},500)};
 // ── init ────────────────────────────────────────────────────────────
 function init(){tabs.forEach(([id,label])=>{let b=document.createElement('button');b.className='tab'+(id==='stats'?' active':'');b.dataset.tab=id;b.textContent=label;b.onclick=()=>switchTab(id);$('tabs').appendChild(b)});$('agent-voice').innerHTML=voiceOptions();
 $('login-form').onsubmit=async e=>{e.preventDefault();$('login-error').textContent='';try{await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('login-username').value,password:$('login-password').value})});$('login-password').value='';showDashboard()}catch(err){showLogin(err.message||'Login failed')}};

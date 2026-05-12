@@ -139,6 +139,49 @@ CREATE INDEX IF NOT EXISTS idx_crm_contacts_campaign_name ON crm_contacts(campai
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_city ON crm_contacts(city);
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_created_at ON crm_contacts(created_at);
 
+-- ── Phase 8: WhatsApp Chat Inbox ──────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS whatsapp_conversations (
+    id TEXT PRIMARY KEY,
+    phone_number TEXT NOT NULL,
+    contact_name TEXT NOT NULL DEFAULT '',
+    crm_contact_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open',
+    ai_enabled BOOLEAN NOT NULL DEFAULT true,
+    assigned_to TEXT NOT NULL DEFAULT '',
+    last_message TEXT NOT NULL DEFAULT '',
+    last_message_at TEXT NOT NULL DEFAULT '',
+    unread_count INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL DEFAULT 'whatsapp',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+ALTER TABLE whatsapp_conversations DISABLE ROW LEVEL SECURITY;
+CREATE INDEX IF NOT EXISTS idx_wa_conv_phone ON whatsapp_conversations(phone_number);
+CREATE INDEX IF NOT EXISTS idx_wa_conv_last_msg ON whatsapp_conversations(last_message_at DESC);
+CREATE INDEX IF NOT EXISTS idx_wa_conv_status ON whatsapp_conversations(status);
+
+CREATE TABLE IF NOT EXISTS whatsapp_messages (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    phone_number TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    message_type TEXT NOT NULL DEFAULT 'text',
+    message_text TEXT NOT NULL DEFAULT '',
+    template_name TEXT NOT NULL DEFAULT '',
+    media_url TEXT NOT NULL DEFAULT '',
+    provider_message_id TEXT NOT NULL DEFAULT '',
+    provider_status TEXT NOT NULL DEFAULT '',
+    raw_payload TEXT NOT NULL DEFAULT '{}',
+    ai_generated BOOLEAN NOT NULL DEFAULT false,
+    human_sent BOOLEAN NOT NULL DEFAULT false,
+    created_at TEXT NOT NULL
+);
+ALTER TABLE whatsapp_messages DISABLE ROW LEVEL SECURITY;
+CREATE INDEX IF NOT EXISTS idx_wa_msg_conv ON whatsapp_messages(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_wa_msg_phone ON whatsapp_messages(phone_number);
+CREATE INDEX IF NOT EXISTS idx_wa_msg_created ON whatsapp_messages(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_wa_msg_provider_id ON whatsapp_messages(provider_message_id);
+
 -- ── Phase 7: Automation Actions Queue ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS automation_actions (
     id TEXT PRIMARY KEY,

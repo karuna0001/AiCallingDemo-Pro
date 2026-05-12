@@ -75,6 +75,11 @@ from whatsapp import (
     run_due_automation_actions,
     send_callback_confirmation, send_appointment_confirmation, send_showroom_visit_confirmation,
     handle_call_outcome_whatsapp_fallback,
+    # Phase 8 — WhatsApp Inbox
+    get_conversations, get_conversation_by_id, get_messages, patch_conversation,
+    save_wa_message, send_whatsapp_text, is_whatsapp_service_window_open,
+    get_or_create_conversation, update_conversation_last_message,
+    parse_webhook_messages, handle_inbound_whatsapp_message,
 )
 
 load_dotenv(".env", override=False)
@@ -1187,14 +1192,153 @@ async def api_wa_webhook_verify(
     from db import get_setting as _gs
     verify_token = await _gs("WHATSAPP_VERIFY_TOKEN", "")
     if hub_mode == "subscribe" and verify_token and hub_verify_token == verify_token:
-        return JSONResponse(content=int(hub_challenge or "0"), media_type="text/plain")
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(content=hub_challenge or "")
     raise HTTPException(403, "Verification failed")
 
 
 @app.post("/api/whatsapp/webhook")
 async def api_wa_webhook_receive(request: Request):
-    # Phase 8 will process incoming messages here
-    return {"status": "received"}
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"status": "ok"}  # always return 200 to Meta
+    try:
+        parsed_list = parse_webhook_messages(payload)
+        import asyncio as _asyncio
+        for parsed in parsed_list:
+            _asyncio.create_task(handle_inbound_whatsapp_message(parsed))
+    except Exception as exc:
+        logger.error("Webhook processing error: %s", exc)
+    return {"status": "ok"}
+
+
+# ── WhatsApp Inbox — Conversations ────────────────────────────────────────────
+
+@app.get("/api/whatsapp/conversations")
+async def api_wa_conversations(
+    status: Optional[str] = None,
+    ai_enabled: Optional[bool] = None,
+    search: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    _user=Depends(require_auth),
+):
+    convs = await get_conversations(status=status, ai_enabled=ai_enabled, search=search, limit=limit, offset=offset)
+    return {"conversations": convs, "total": len(convs)}
+
+
+@app.get("/api/whatsapp/conversations/{conv_id}")
+async def api_wa_conversation_detail(conv_id: str, _user=Depends(require_auth)):
+    conv = await get_conversation_by_id(conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    msgs = await get_messages(conv_id, limit=50)
+    return {"conversation": conv, "messages": msgs}
+
+
+@app.get("/api/whatsapp/conversations/{conv_id}/messages")
+async def api_wa_conversation_messages(
+    conv_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    _user=Depends(require_auth),
+):
+    msgs = await get_messages(conv_id, limit=limit, offset=offset)
+    return {"messages": msgs}
+
+
+class WaConvPatchRequest(BaseModel):
+    status: Optional[str] = None
+    ai_enabled: Optional[bool] = None
+    assigned_to: Optional[str] = None
+    unread_count: Optional[int] = None
+
+
+@app.patch("/api/whatsapp/conversations/{conv_id}")
+async def api_wa_patch_conversation(conv_id: str, req: WaConvPatchRequest, _user=Depends(require_auth)):
+    updates = req.dict(exclude_none=True)
+    if not updates:
+        raise HTTPException(400, "No fields to update")
+    conv = await patch_conversation(conv_id, updates)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    return conv
+
+
+class WaConvSendRequest(BaseModel):
+    message: str
+
+
+@app.post("/api/whatsapp/conversations/{conv_id}/send")
+async def api_wa_conv_send(conv_id: str, req: WaConvSendRequest, _user=Depends(require_auth)):
+    conv = await get_conversation_by_id(conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    phone = conv.get("phone_number", "")
+    message = (req.message or "").strip()
+    if not message:
+        raise HTTPException(400, "message is required")
+
+    # Check 24h window
+    window_open = await is_whatsapp_service_window_open(phone)
+    if not window_open:
+        raise HTTPException(400, {
+            "message": "Customer service window may be closed. Please send an approved template.",
+            "reason": "window_closed"
+        })
+
+    result = await send_whatsapp_text(phone, message)
+    if not result.get("success"):
+        err = result.get("error") or "Send failed"
+        raise HTTPException(502, {"message": err, "reason": result.get("reason", "send_error")})
+
+    provider_id = result.get("provider_message_id") or ""
+    saved = await save_wa_message(
+        conv_id=conv_id, phone=phone, direction="outbound",
+        message_type="text", message_text=message,
+        provider_message_id=provider_id, provider_status="sent",
+        human_sent=True,
+    )
+    await update_conversation_last_message(conv_id, message, increment_unread=False)
+    return {"status": "sent", "message": saved, "provider_message_id": provider_id}
+
+
+class WaConvTemplateRequest(BaseModel):
+    template_name: str
+    language: Optional[str] = "en"
+    parameters: Optional[list] = None
+
+
+@app.post("/api/whatsapp/conversations/{conv_id}/send-template")
+async def api_wa_conv_send_template(conv_id: str, req: WaConvTemplateRequest, _user=Depends(require_auth)):
+    conv = await get_conversation_by_id(conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    phone = conv.get("phone_number", "")
+    result = await send_whatsapp_template(
+        phone=phone,
+        template_name=req.template_name,
+        language=req.language or "en",
+        parameters=req.parameters,
+        event_type="manual_template",
+        source_type="inbox",
+        source_id=conv_id,
+    )
+    if not result.get("success"):
+        err = result.get("error") or "Template send failed"
+        raise HTTPException(502, {"message": err, "reason": result.get("reason", "send_error")})
+
+    provider_id = result.get("provider_message_id") or ""
+    saved = await save_wa_message(
+        conv_id=conv_id, phone=phone, direction="outbound",
+        message_type="template", message_text=f"[Template: {req.template_name}]",
+        template_name=req.template_name,
+        provider_message_id=provider_id, provider_status="sent",
+        human_sent=True,
+    )
+    await update_conversation_last_message(conv_id, f"[Template: {req.template_name}]", increment_unread=False)
+    return {"status": "sent", "message": saved, "provider_message_id": provider_id}
 
 
 # ── Automation Rules ──────────────────────────────────────────────────────────

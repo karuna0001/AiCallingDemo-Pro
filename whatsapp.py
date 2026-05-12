@@ -11,6 +11,7 @@ Handles:
 """
 
 import asyncio
+import json as _json
 import logging
 import os
 import uuid
@@ -883,3 +884,587 @@ async def send_showroom_visit_confirmation(phone: str, context: Optional[dict] =
     if template:
         return await send_whatsapp_template(phone, template, language, params, event_type="showroom_visit_confirmed", source_type="manual", source_id=phone)
     return {"success": False, "error": "No showroom template configured", "reason": "template_missing"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 8 — WhatsApp Chat Inbox
+# ══════════════════════════════════════════════════════════════════════════════
+
+_OPT_OUT_KEYWORDS = {"stop", "unsubscribe", "optout", "opt out", "opt-out",
+                     "don't message", "dont message", "do not message",
+                     "no message", "remove me", "block"}
+
+
+# ── Conversation helpers ───────────────────────────────────────────────────
+
+async def get_or_create_conversation(phone: str, contact_name: str = "") -> dict:
+    """Return existing open/any conversation for phone, or create a new one."""
+    try:
+        db = await _db()._adb()
+        res = await db.table("whatsapp_conversations") \
+            .select("*") \
+            .eq("phone_number", phone) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+        rows = res.data or []
+        if rows:
+            conv = rows[0]
+            # Refresh contact_name if we now have one
+            if contact_name and not conv.get("contact_name"):
+                await db.table("whatsapp_conversations") \
+                    .update({"contact_name": contact_name, "updated_at": datetime.now().isoformat()}) \
+                    .eq("id", conv["id"]).execute()
+                conv["contact_name"] = contact_name
+            return conv
+        # Create new
+        now = datetime.now().isoformat()
+        conv_id = str(uuid.uuid4())
+        row = {
+            "id": conv_id,
+            "phone_number": phone,
+            "contact_name": contact_name or phone,
+            "crm_contact_id": "",
+            "status": "open",
+            "ai_enabled": True,
+            "assigned_to": "",
+            "last_message": "",
+            "last_message_at": now,
+            "unread_count": 0,
+            "source": "whatsapp",
+            "created_at": now,
+            "updated_at": now,
+        }
+        await db.table("whatsapp_conversations").insert(row).execute()
+        return row
+    except Exception as exc:
+        logger.error("get_or_create_conversation error: %s", exc)
+        return {}
+
+
+async def update_conversation_last_message(conv_id: str, text: str, increment_unread: bool = True) -> None:
+    try:
+        db = await _db()._adb()
+        upd: dict = {
+            "last_message": text[:200],
+            "last_message_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+        }
+        if increment_unread:
+            # Increment via RPC not available easily; fetch then update
+            res = await db.table("whatsapp_conversations").select("unread_count").eq("id", conv_id).execute()
+            rows = res.data or []
+            cur = rows[0].get("unread_count", 0) if rows else 0
+            upd["unread_count"] = cur + 1
+        await db.table("whatsapp_conversations").update(upd).eq("id", conv_id).execute()
+    except Exception as exc:
+        logger.debug("update_conversation_last_message error: %s", exc)
+
+
+async def patch_conversation(conv_id: str, updates: dict) -> dict:
+    """Patch status/ai_enabled/assigned_to on a conversation."""
+    try:
+        db = await _db()._adb()
+        allowed = {"status", "ai_enabled", "assigned_to", "unread_count"}
+        upd = {k: v for k, v in updates.items() if k in allowed}
+        upd["updated_at"] = datetime.now().isoformat()
+        await db.table("whatsapp_conversations").update(upd).eq("id", conv_id).execute()
+        res = await db.table("whatsapp_conversations").select("*").eq("id", conv_id).execute()
+        rows = res.data or []
+        return rows[0] if rows else {}
+    except Exception as exc:
+        logger.error("patch_conversation error: %s", exc)
+        return {}
+
+
+async def get_conversations(
+    status: Optional[str] = None,
+    ai_enabled: Optional[bool] = None,
+    search: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list:
+    try:
+        db = await _db()._adb()
+        q = db.table("whatsapp_conversations").select("*").order("last_message_at", desc=True).limit(limit).offset(offset)
+        if status and status != "all":
+            q = q.eq("status", status)
+        if ai_enabled is not None:
+            q = q.eq("ai_enabled", ai_enabled)
+        if search:
+            q = q.ilike("phone_number", f"%{search}%")
+        res = await q.execute()
+        return res.data or []
+    except Exception as exc:
+        logger.error("get_conversations error: %s", exc)
+        return []
+
+
+async def get_conversation_by_id(conv_id: str) -> Optional[dict]:
+    try:
+        db = await _db()._adb()
+        res = await db.table("whatsapp_conversations").select("*").eq("id", conv_id).execute()
+        rows = res.data or []
+        return rows[0] if rows else None
+    except Exception as exc:
+        logger.error("get_conversation_by_id error: %s", exc)
+        return None
+
+
+# ── Message helpers ────────────────────────────────────────────────────────
+
+async def save_wa_message(
+    conv_id: str,
+    phone: str,
+    direction: str,
+    message_type: str = "text",
+    message_text: str = "",
+    template_name: str = "",
+    media_url: str = "",
+    provider_message_id: str = "",
+    provider_status: str = "",
+    raw_payload: Optional[dict] = None,
+    ai_generated: bool = False,
+    human_sent: bool = False,
+) -> dict:
+    try:
+        db = await _db()._adb()
+        now = datetime.now().isoformat()
+        row = {
+            "id": str(uuid.uuid4()),
+            "conversation_id": conv_id,
+            "phone_number": phone,
+            "direction": direction,
+            "message_type": message_type,
+            "message_text": (message_text or "")[:4000],
+            "template_name": template_name or "",
+            "media_url": media_url or "",
+            "provider_message_id": provider_message_id or "",
+            "provider_status": provider_status or "",
+            "raw_payload": _json.dumps(raw_payload or {}),
+            "ai_generated": ai_generated,
+            "human_sent": human_sent,
+            "created_at": now,
+        }
+        await db.table("whatsapp_messages").insert(row).execute()
+        return row
+    except Exception as exc:
+        logger.error("save_wa_message error: %s", exc)
+        return {}
+
+
+async def get_messages(conv_id: str, limit: int = 50, offset: int = 0) -> list:
+    try:
+        db = await _db()._adb()
+        res = await db.table("whatsapp_messages") \
+            .select("*") \
+            .eq("conversation_id", conv_id) \
+            .order("created_at", desc=False) \
+            .limit(limit) \
+            .offset(offset) \
+            .execute()
+        return res.data or []
+    except Exception as exc:
+        logger.error("get_messages error: %s", exc)
+        return []
+
+
+# ── CRM linking ────────────────────────────────────────────────────────────
+
+async def link_conversation_to_crm(conv_id: str, phone: str, contact_name: str = "") -> Optional[dict]:
+    """Find or create CRM contact, link to conversation, add note."""
+    try:
+        db_mod = _db()
+        db = await db_mod._adb()
+
+        # Search existing CRM contact
+        res = await db.table("crm_contacts").select("id,phone_number,lead_name,crm_status") \
+            .eq("phone_number", phone).limit(1).execute()
+        rows = res.data or []
+        crm_id = ""
+
+        if rows:
+            contact = rows[0]
+            crm_id = contact.get("id") or contact.get("phone_number") or phone
+            # Append note
+            today = datetime.now().strftime("%Y-%m-%d")
+            note_line = f"[{today}] WhatsApp message received."
+            existing_notes = contact.get("crm_notes") or ""
+            if note_line not in existing_notes:
+                new_notes = (existing_notes.strip() + "\n" + note_line).strip() if existing_notes else note_line
+                await db.table("crm_contacts").update({"crm_notes": new_notes}) \
+                    .eq("phone_number", phone).execute()
+        else:
+            # Create new CRM contact
+            today = datetime.now().strftime("%Y-%m-%d")
+            note_line = f"[{today}] WhatsApp message received."
+            name = contact_name or f"WhatsApp {phone}"
+            new_contact = {
+                "phone_number": phone,
+                "lead_name": name,
+                "source": "whatsapp",
+                "crm_status": "WhatsApp Lead",
+                "crm_notes": note_line,
+                "created_at": datetime.now().isoformat(),
+                "next_followup_at": datetime.now().strftime("%Y-%m-%d"),
+            }
+            ins_res = await db.table("crm_contacts").insert(new_contact).execute()
+            ins_rows = ins_res.data or []
+            crm_id = ins_rows[0].get("id", phone) if ins_rows else phone
+
+        # Update conversation with crm_contact_id
+        if crm_id:
+            await db.table("whatsapp_conversations") \
+                .update({"crm_contact_id": str(crm_id), "updated_at": datetime.now().isoformat()}) \
+                .eq("id", conv_id).execute()
+
+        return {"crm_id": crm_id, "phone": phone}
+    except Exception as exc:
+        logger.error("link_conversation_to_crm error: %s", exc)
+        return None
+
+
+# ── 24-hour service window ─────────────────────────────────────────────────
+
+async def is_whatsapp_service_window_open(phone_or_conv_id: str) -> bool:
+    """Return True if customer sent inbound message within last 24 hours."""
+    try:
+        db = await _db()._adb()
+        cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+        # Try by phone
+        res = await db.table("whatsapp_messages") \
+            .select("created_at") \
+            .eq("phone_number", phone_or_conv_id) \
+            .eq("direction", "inbound") \
+            .gte("created_at", cutoff) \
+            .limit(1).execute()
+        if res.data:
+            return True
+        # Try by conversation_id
+        res2 = await db.table("whatsapp_messages") \
+            .select("created_at") \
+            .eq("conversation_id", phone_or_conv_id) \
+            .eq("direction", "inbound") \
+            .gte("created_at", cutoff) \
+            .limit(1).execute()
+        return bool(res2.data)
+    except Exception as exc:
+        logger.debug("is_whatsapp_service_window_open error: %s", exc)
+        return False
+
+
+# ── Send free-form text (Phase 8 real implementation) ─────────────────────
+
+async def send_whatsapp_text(phone: str, message: str) -> dict:
+    """Send free-form WhatsApp text message via Meta Cloud API."""
+    if not await _is_wa_enabled():
+        return {"success": False, "error": "WhatsApp is disabled", "reason": "whatsapp_disabled"}
+
+    cfg = await _wa_config()
+    token = cfg.get("WHATSAPP_ACCESS_TOKEN", "").strip()
+    phone_number_id = cfg.get("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+    graph_version = cfg.get("WHATSAPP_GRAPH_VERSION", "v20.0").strip() or "v20.0"
+
+    if not token or not phone_number_id:
+        missing = [k for k in ("WHATSAPP_ACCESS_TOKEN", "WHATSAPP_PHONE_NUMBER_ID") if not cfg.get(k, "").strip()]
+        return {"success": False, "error": f"Missing config: {', '.join(missing)}", "reason": "whatsapp_not_configured"}
+
+    to_phone = phone.lstrip("+") if phone else ""
+    if not to_phone:
+        return {"success": False, "error": "Invalid phone number", "reason": "invalid_phone"}
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "text",
+        "text": {"body": message},
+    }
+    url = f"https://graph.facebook.com/{graph_version}/{phone_number_id}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                resp_json = {}
+                try:
+                    resp_json = await resp.json()
+                except Exception:
+                    resp_json = {"raw": await resp.text()}
+                if resp.status in (200, 201):
+                    messages = resp_json.get("messages") or []
+                    msg_id = messages[0].get("id") if messages else None
+                    return {"success": True, "provider_message_id": msg_id, "error": None}
+                else:
+                    error_data = resp_json.get("error") or resp_json
+                    err_msg = str(error_data.get("message", "") if isinstance(error_data, dict) else error_data)[:500]
+                    return {"success": False, "provider_message_id": None, "error": err_msg, "reason": "provider_error"}
+    except Exception as exc:
+        logger.error("send_whatsapp_text error for %s: %s", phone, exc)
+        return {"success": False, "error": str(exc)[:500], "reason": "send_error"}
+
+
+# ── Opt-out detection ──────────────────────────────────────────────────────
+
+def _is_opt_out(text: str) -> bool:
+    t = (text or "").lower().strip()
+    return any(kw in t for kw in _OPT_OUT_KEYWORDS)
+
+
+# ── AI reply generation ────────────────────────────────────────────────────
+
+async def generate_whatsapp_ai_reply(
+    conversation: dict,
+    inbound_text: str,
+    recent_messages: list,
+) -> Optional[str]:
+    """Generate a short WhatsApp AI reply using KB and Gemini."""
+    try:
+        from prompts import build_knowledge_context, build_prompt_for_type
+        from db import get_knowledge_base, get_setting as _gs
+
+        kb = await get_knowledge_base()
+        kb_context = build_knowledge_context(kb)
+
+        # Build conversation history snippet (last 6 messages)
+        history_lines = []
+        for m in recent_messages[-6:]:
+            role = "Customer" if m.get("direction") == "inbound" else "Agent"
+            history_lines.append(f"{role}: {m.get('message_text', '')}")
+        history = "\n".join(history_lines)
+
+        business_name = kb.get("company_profile", {}).get("name", "") or "our company"
+        service_type = kb.get("company_profile", {}).get("services_summary", "") or "our service"
+
+        system_prompt = (
+            f"You are a helpful WhatsApp support agent for {business_name}.\n"
+            f"Answer using ONLY the following company knowledge base. "
+            f"If the answer is not available in the knowledge base, reply exactly: "
+            f"\"Our team will confirm and get back to you.\"\n"
+            f"Keep replies SHORT — max 3 sentences. Do not hallucinate pricing, policies, or offers.\n\n"
+            f"{kb_context}"
+        )
+
+        user_prompt = (
+            f"Conversation history:\n{history}\n\n"
+            f"Customer just said: {inbound_text}\n\n"
+            f"Reply:"
+        )
+
+        import google.generativeai as genai
+        api_key = await _gs("GOOGLE_API_KEY", "")
+        if not api_key:
+            return None
+        genai.configure(api_key=api_key)
+        model_name = await _gs("GEMINI_MODEL", "gemini-1.5-flash")
+        # Use a non-live model for text generation
+        safe_model = model_name if "flash" in model_name or "pro" in model_name else "gemini-1.5-flash"
+        # Strip -live-preview suffix if present
+        safe_model = safe_model.replace("-live-preview", "").replace("-live", "")
+        model = genai.GenerativeModel(safe_model, system_instruction=system_prompt)
+        response = model.generate_content(user_prompt)
+        reply = (response.text or "").strip()
+        if not reply:
+            return None
+        # Truncate to safe WhatsApp length
+        return reply[:1000]
+    except Exception as exc:
+        logger.error("generate_whatsapp_ai_reply error: %s", exc)
+        return None
+
+
+# ── Webhook payload parsing ────────────────────────────────────────────────
+
+def parse_webhook_messages(payload: dict) -> list:
+    """Extract list of inbound message dicts from a Meta webhook payload.
+
+    Returns list of:
+      {phone, message_id, message_type, text, raw, is_status_update}
+    """
+    results = []
+    try:
+        entries = payload.get("entry") or []
+        for entry in entries:
+            for change in (entry.get("changes") or []):
+                value = change.get("value") or {}
+
+                # Status updates (delivery/read receipts)
+                for status in (value.get("statuses") or []):
+                    results.append({
+                        "phone": status.get("recipient_id", ""),
+                        "message_id": status.get("id", ""),
+                        "message_type": "status_update",
+                        "text": "",
+                        "raw": status,
+                        "is_status_update": True,
+                        "status_value": status.get("status", ""),
+                    })
+
+                # Contacts metadata
+                contacts = value.get("contacts") or []
+                contact_map = {}
+                for c in contacts:
+                    wa_id = c.get("wa_id", "")
+                    name = (c.get("profile") or {}).get("name", "")
+                    if wa_id:
+                        contact_map[wa_id] = name
+
+                # Messages
+                for msg in (value.get("messages") or []):
+                    phone_raw = msg.get("from", "")
+                    # Normalize: Meta sends without +
+                    phone = "+" + phone_raw if phone_raw and not phone_raw.startswith("+") else phone_raw
+                    msg_id = msg.get("id", "")
+                    msg_type = msg.get("type", "text")
+                    contact_name = contact_map.get(phone_raw, "")
+
+                    text = ""
+                    media_url = ""
+                    if msg_type == "text":
+                        text = (msg.get("text") or {}).get("body", "")
+                    elif msg_type in ("button", "interactive"):
+                        inter = msg.get("interactive") or {}
+                        btn = inter.get("button_reply") or inter.get("list_reply") or {}
+                        text = btn.get("title", "") or btn.get("id", "")
+                    elif msg_type == "image":
+                        text = "[Image received]"
+                        media_url = (msg.get("image") or {}).get("url", "")
+                    elif msg_type == "audio":
+                        text = "[Audio received]"
+                    elif msg_type == "document":
+                        text = "[Document received]"
+                    elif msg_type == "video":
+                        text = "[Video received]"
+                    else:
+                        text = f"[{msg_type} message received]"
+
+                    results.append({
+                        "phone": phone,
+                        "message_id": msg_id,
+                        "message_type": msg_type,
+                        "text": text,
+                        "media_url": media_url,
+                        "contact_name": contact_name,
+                        "raw": msg,
+                        "is_status_update": False,
+                    })
+    except Exception as exc:
+        logger.error("parse_webhook_messages error: %s", exc)
+    return results
+
+
+# ── Main inbound message handler ───────────────────────────────────────────
+
+async def handle_inbound_whatsapp_message(parsed: dict) -> None:
+    """Process a single parsed inbound WhatsApp message:
+    1. Normalize phone
+    2. Get/create conversation
+    3. CRM link
+    4. Save message
+    5. Check opt-out
+    6. AI reply if enabled and window open
+    """
+    if parsed.get("is_status_update"):
+        # Update provider_status on outbound message if we have the message_id
+        msg_id = parsed.get("message_id", "")
+        status_val = parsed.get("status_value", "")
+        if msg_id and status_val:
+            try:
+                db = await _db()._adb()
+                await db.table("whatsapp_messages") \
+                    .update({"provider_status": status_val}) \
+                    .eq("provider_message_id", msg_id).execute()
+            except Exception:
+                pass
+        return
+
+    phone_raw = parsed.get("phone", "")
+    if not phone_raw:
+        return
+
+    try:
+        from db import normalize_phone
+        phone = normalize_phone(phone_raw)
+    except Exception:
+        phone = phone_raw  # use as-is if normalization fails
+
+    text = parsed.get("text", "")
+    msg_type = parsed.get("message_type", "text")
+    media_url = parsed.get("media_url", "")
+    contact_name = parsed.get("contact_name", "")
+    provider_msg_id = parsed.get("message_id", "")
+    raw = parsed.get("raw", {})
+
+    # Get/create conversation
+    conv = await get_or_create_conversation(phone, contact_name)
+    if not conv:
+        logger.error("Could not get/create conversation for %s", phone)
+        return
+    conv_id = conv["id"]
+
+    # CRM link (async, don't block)
+    asyncio.create_task(link_conversation_to_crm(conv_id, phone, contact_name))
+
+    # Save inbound message
+    await save_wa_message(
+        conv_id=conv_id,
+        phone=phone,
+        direction="inbound",
+        message_type=msg_type,
+        message_text=text,
+        media_url=media_url,
+        provider_message_id=provider_msg_id,
+        raw_payload=raw,
+    )
+
+    # Update conversation last message
+    await update_conversation_last_message(conv_id, text or f"[{msg_type}]", increment_unread=True)
+
+    # Opt-out check
+    if _is_opt_out(text):
+        await patch_conversation(conv_id, {"ai_enabled": False, "status": "opted_out"})
+        logger.info("Opt-out detected for %s", phone)
+        return
+
+    # AI auto-reply
+    ai_enabled = conv.get("ai_enabled", True)
+    if not ai_enabled:
+        return
+
+    # Only reply to text/button/interactive messages
+    if msg_type not in ("text", "button", "interactive"):
+        return
+
+    # Check 24h window
+    window_open = await is_whatsapp_service_window_open(phone)
+    if not window_open:
+        logger.info("24h window closed for %s — skipping AI reply", phone)
+        return
+
+    # Get recent messages for context
+    recent = await get_messages(conv_id, limit=10)
+
+    # Generate AI reply
+    reply_text = await generate_whatsapp_ai_reply(conv, text, recent)
+    if not reply_text:
+        return
+
+    # Send reply
+    send_result = await send_whatsapp_text(phone, reply_text)
+    provider_id = send_result.get("provider_message_id") or ""
+
+    # Save outbound AI message
+    await save_wa_message(
+        conv_id=conv_id,
+        phone=phone,
+        direction="outbound",
+        message_type="text",
+        message_text=reply_text,
+        provider_message_id=provider_id,
+        provider_status="sent" if send_result.get("success") else "failed",
+        ai_generated=True,
+    )
+    if send_result.get("success"):
+        await update_conversation_last_message(conv_id, reply_text, increment_unread=False)
+    else:
+        logger.warning("AI reply send failed for %s: %s", phone, send_result.get("error"))
