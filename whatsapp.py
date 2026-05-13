@@ -32,6 +32,11 @@ WA_SETTINGS_KEYS = [
     "WHATSAPP_VERIFY_TOKEN",
     "WHATSAPP_GRAPH_VERSION",
     "WHATSAPP_DEFAULT_LANGUAGE",
+    # Vobiz provider settings
+    "VOBIZ_AUTH_ID",
+    "VOBIZ_AUTH_TOKEN",
+    "VOBIZ_CHANNEL_ID",
+    "VOBIZ_WEBHOOK_SECRET",
     # Templates
     "WHATSAPP_WELCOME_TEMPLATE",
     "WHATSAPP_MISSED_CALL_TEMPLATE",
@@ -131,26 +136,33 @@ async def _wa_config() -> dict:
     return out
 
 
+def _mask_secret(val: str) -> str:
+    val = val or ""
+    if len(val) >= 4:
+        return "********" + val[-4:]
+    if val:
+        return "****"
+    return ""
+
+
 async def get_wa_settings_masked() -> dict:
-    """Return settings with access token masked for frontend display."""
+    """Return settings with access token + Vobiz secrets masked for frontend display."""
     cfg = await _wa_config()
-    token = cfg.get("WHATSAPP_ACCESS_TOKEN") or ""
-    if token and len(token) >= 4:
-        cfg["WHATSAPP_ACCESS_TOKEN"] = "********" + token[-4:]
-    elif token:
-        cfg["WHATSAPP_ACCESS_TOKEN"] = "****"
+    cfg["WHATSAPP_ACCESS_TOKEN"] = _mask_secret(cfg.get("WHATSAPP_ACCESS_TOKEN") or "")
+    cfg["VOBIZ_AUTH_TOKEN"] = _mask_secret(cfg.get("VOBIZ_AUTH_TOKEN") or "")
+    cfg["VOBIZ_WEBHOOK_SECRET"] = _mask_secret(cfg.get("VOBIZ_WEBHOOK_SECRET") or "")
     return cfg
 
 
 async def save_wa_settings(data: dict) -> None:
-    """Save WhatsApp settings to settings table. Skips masked token placeholder."""
+    """Save WhatsApp settings to settings table. Skips masked secret placeholders."""
     from db import set_setting
-    token = data.get("WHATSAPP_ACCESS_TOKEN") or ""
+    _SECRET_KEYS = {"WHATSAPP_ACCESS_TOKEN", "VOBIZ_AUTH_TOKEN", "VOBIZ_WEBHOOK_SECRET"}
     for k in WA_SETTINGS_KEYS:
         v = data.get(k)
         if v is None:
             continue
-        if k == "WHATSAPP_ACCESS_TOKEN" and (not v or "****" in str(v)):
+        if k in _SECRET_KEYS and (not v or "****" in str(v)):
             continue  # do not overwrite with masked value
         await set_setting(k, str(v))
 
@@ -158,13 +170,40 @@ async def save_wa_settings(data: dict) -> None:
 async def get_wa_health() -> dict:
     cfg = await _wa_config()
     enabled = (cfg.get("WHATSAPP_ENABLED") or "false").strip().lower() in ("1", "true", "yes", "on")
-    phone_id = bool(cfg.get("WHATSAPP_PHONE_NUMBER_ID", "").strip())
-    token = bool(cfg.get("WHATSAPP_ACCESS_TOKEN", "").strip())
+    provider = (cfg.get("WHATSAPP_PROVIDER") or "meta").strip().lower()
     templates = [
         k for k in WA_SETTINGS_KEYS
         if k.endswith("_TEMPLATE") and cfg.get(k, "").strip()
     ]
     missing = []
+    if provider == "vobiz":
+        auth_id = bool(cfg.get("VOBIZ_AUTH_ID", "").strip())
+        auth_token = bool(cfg.get("VOBIZ_AUTH_TOKEN", "").strip())
+        channel_id = bool(cfg.get("VOBIZ_CHANNEL_ID", "").strip())
+        if not auth_id:
+            missing.append("VOBIZ_AUTH_ID")
+        if not auth_token:
+            missing.append("VOBIZ_AUTH_TOKEN")
+        if not channel_id:
+            missing.append("VOBIZ_CHANNEL_ID")
+        ok = enabled and auth_id and auth_token and channel_id
+        return {
+            "enabled": enabled,
+            "provider": "vobiz",
+            "vobiz_auth_id_configured": auth_id,
+            "vobiz_auth_token_configured": auth_token,
+            "vobiz_channel_id_configured": channel_id,
+            # Keep these keys for back-compat with existing UI badges
+            "phone_number_id_configured": channel_id,
+            "access_token_configured": auth_token,
+            "templates_configured": len(templates),
+            "template_names": templates,
+            "missing": missing,
+            "status": "ok" if ok else "missing_config",
+        }
+    # Meta provider (default)
+    phone_id = bool(cfg.get("WHATSAPP_PHONE_NUMBER_ID", "").strip())
+    token = bool(cfg.get("WHATSAPP_ACCESS_TOKEN", "").strip())
     if not phone_id:
         missing.append("WHATSAPP_PHONE_NUMBER_ID")
     if not token:
@@ -172,7 +211,7 @@ async def get_wa_health() -> dict:
     status = "ok" if (enabled and phone_id and token) else "missing_config"
     return {
         "enabled": enabled,
-        "provider": cfg.get("WHATSAPP_PROVIDER") or "meta",
+        "provider": "meta",
         "phone_number_id_configured": phone_id,
         "access_token_configured": token,
         "templates_configured": len(templates),
@@ -180,6 +219,11 @@ async def get_wa_health() -> dict:
         "missing": missing,
         "status": status,
     }
+
+
+async def _get_provider() -> str:
+    cfg = await _wa_config()
+    return (cfg.get("WHATSAPP_PROVIDER") or "meta").strip().lower()
 
 
 # ── Core send functions ────────────────────────────────────────────────────
@@ -209,6 +253,16 @@ async def send_whatsapp_template(
         return result
 
     cfg = await _wa_config()
+    provider = (cfg.get("WHATSAPP_PROVIDER") or "meta").strip().lower()
+
+    # Vobiz template send is provider-specific. Until Vobiz template payload is
+    # confirmed in their docs, we surface a clear, non-crashing error so the
+    # caller (automation rules / UI) can fall back gracefully.
+    if provider == "vobiz":
+        err = "Vobiz template send not configured — please configure template payload format"
+        await _log_wa(phone, event_type, template_name, language, parameters, "failed", None, err, source_type, source_id)
+        return {"success": False, "provider_message_id": None, "error": err, "reason": "vobiz_template_format_not_configured"}
+
     token = cfg.get("WHATSAPP_ACCESS_TOKEN", "").strip()
     phone_number_id = cfg.get("WHATSAPP_PHONE_NUMBER_ID", "").strip()
     graph_version = cfg.get("WHATSAPP_GRAPH_VERSION", "v20.0").strip() or "v20.0"
@@ -1155,12 +1209,79 @@ async def is_whatsapp_service_window_open(phone_or_conv_id: str) -> bool:
 
 # ── Send free-form text (Phase 8 real implementation) ─────────────────────
 
+async def _send_vobiz_text(phone: str, message: str, cfg: dict) -> dict:
+    """Send free-form WhatsApp text via Vobiz API.
+
+    POST https://api.vobiz.ai/v1/messaging/messages
+    Headers: X-Auth-ID, X-Auth-Token, Content-Type: application/json
+    Payload: {channel_id, to, type:'text', text:{body}}
+    """
+    auth_id = cfg.get("VOBIZ_AUTH_ID", "").strip()
+    auth_token = cfg.get("VOBIZ_AUTH_TOKEN", "").strip()
+    channel_id = cfg.get("VOBIZ_CHANNEL_ID", "").strip()
+
+    missing = []
+    if not auth_id: missing.append("VOBIZ_AUTH_ID")
+    if not auth_token: missing.append("VOBIZ_AUTH_TOKEN")
+    if not channel_id: missing.append("VOBIZ_CHANNEL_ID")
+    if missing:
+        return {"success": False, "error": f"Missing config: {', '.join(missing)}", "reason": "vobiz_not_configured"}
+
+    # Vobiz expects E.164 with leading +
+    to_phone = phone if phone.startswith("+") else ("+" + phone) if phone else ""
+    if not to_phone:
+        return {"success": False, "error": "Invalid phone number", "reason": "invalid_phone"}
+
+    url = "https://api.vobiz.ai/v1/messaging/messages"
+    headers = {
+        "X-Auth-ID": auth_id,
+        "X-Auth-Token": auth_token,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "channel_id": channel_id,
+        "to": to_phone,
+        "type": "text",
+        "text": {"body": message},
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                try:
+                    resp_json = await resp.json()
+                except Exception:
+                    resp_json = {"raw": await resp.text()}
+                if resp.status in (200, 201):
+                    # Try several common id field shapes
+                    msg_id = (
+                        resp_json.get("message_id")
+                        or resp_json.get("id")
+                        or (resp_json.get("data") or {}).get("message_id")
+                        or (resp_json.get("data") or {}).get("id")
+                        or ""
+                    )
+                    return {"success": True, "provider_message_id": msg_id, "error": None}
+                error_data = resp_json.get("error") or resp_json.get("message") or resp_json
+                err_msg = (
+                    error_data.get("message") if isinstance(error_data, dict) else str(error_data)
+                ) or f"HTTP {resp.status}"
+                return {"success": False, "provider_message_id": None, "error": str(err_msg)[:500], "reason": "vobiz_provider_error"}
+    except Exception as exc:
+        logger.error("vobiz send_text error for %s: %s", phone, exc)
+        return {"success": False, "error": str(exc)[:500], "reason": "send_error"}
+
+
 async def send_whatsapp_text(phone: str, message: str) -> dict:
-    """Send free-form WhatsApp text message via Meta Cloud API."""
+    """Send free-form WhatsApp text message. Routes to Vobiz or Meta based on provider."""
     if not await _is_wa_enabled():
         return {"success": False, "error": "WhatsApp is disabled", "reason": "whatsapp_disabled"}
 
     cfg = await _wa_config()
+    provider = (cfg.get("WHATSAPP_PROVIDER") or "meta").strip().lower()
+    if provider == "vobiz":
+        return await _send_vobiz_text(phone, message, cfg)
+
     token = cfg.get("WHATSAPP_ACCESS_TOKEN", "").strip()
     phone_number_id = cfg.get("WHATSAPP_PHONE_NUMBER_ID", "").strip()
     graph_version = cfg.get("WHATSAPP_GRAPH_VERSION", "v20.0").strip() or "v20.0"
@@ -1275,7 +1396,131 @@ async def generate_whatsapp_ai_reply(
 
 # ── Webhook payload parsing ────────────────────────────────────────────────
 
-def parse_webhook_messages(payload: dict) -> list:
+def parse_vobiz_webhook_messages(payload: dict) -> list:
+    """Extract list of inbound message dicts from a Vobiz webhook payload.
+
+    Vobiz events: message.received, message.sent, message.delivered,
+                  message.read, message.failed
+
+    Payload shape (best-effort, tolerant to multiple wrappings):
+      { "event": "message.received", "data": {
+          "message": {"id":..., "from":..., "text":{"body":...}, "type":"text", ...},
+          "channel_id": ..., "conversation_id": ..., "timestamp": ...
+      }}
+    Some integrations send it as a flat object, or as a list of events.
+    """
+    results: list = []
+    try:
+        # Normalize to a list of event dicts
+        events: list = []
+        if isinstance(payload, list):
+            events = payload
+        elif isinstance(payload, dict):
+            if "events" in payload and isinstance(payload["events"], list):
+                events = payload["events"]
+            else:
+                events = [payload]
+
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            event_type = (ev.get("event") or ev.get("type") or ev.get("event_type") or "").strip().lower()
+            data = ev.get("data") if isinstance(ev.get("data"), dict) else ev
+            msg = data.get("message") if isinstance(data.get("message"), dict) else data
+            channel_id = data.get("channel_id") or msg.get("channel_id") or ""
+            conversation_id = data.get("conversation_id") or msg.get("conversation_id") or ""
+            timestamp = data.get("timestamp") or msg.get("timestamp") or ""
+
+            # Status events: message.sent / delivered / read / failed
+            if event_type in ("message.sent", "message.delivered", "message.read", "message.failed"):
+                msg_id = msg.get("id") or msg.get("message_id") or data.get("message_id") or ""
+                phone_raw = msg.get("to") or msg.get("recipient") or data.get("to") or ""
+                phone = phone_raw if str(phone_raw).startswith("+") else ("+" + str(phone_raw)) if phone_raw else ""
+                status_value = event_type.split(".", 1)[-1]  # sent/delivered/read/failed
+                results.append({
+                    "phone": phone,
+                    "message_id": msg_id,
+                    "message_type": "status_update",
+                    "text": "",
+                    "raw": ev,
+                    "is_status_update": True,
+                    "status_value": status_value,
+                    "provider": "vobiz",
+                })
+                continue
+
+            # Inbound message: message.received
+            if event_type in ("message.received", "message_received", "received", ""):
+                phone_raw = msg.get("from") or data.get("from") or ""
+                phone = str(phone_raw)
+                if phone and not phone.startswith("+"):
+                    phone = "+" + phone
+                msg_id = msg.get("id") or msg.get("message_id") or ""
+                msg_type = (msg.get("type") or "text").lower()
+                contact_name = (msg.get("contact") or {}).get("name", "") or msg.get("from_name", "") or ""
+
+                text = ""
+                media_url = ""
+                if msg_type == "text":
+                    text = (msg.get("text") or {}).get("body", "") or msg.get("body", "")
+                elif msg_type in ("button", "interactive"):
+                    inter = msg.get("interactive") or msg.get("button") or {}
+                    btn = inter.get("button_reply") or inter.get("list_reply") or inter
+                    text = (btn.get("title") if isinstance(btn, dict) else "") or (btn.get("id") if isinstance(btn, dict) else "") or ""
+                elif msg_type == "image":
+                    text = "[Image received]"
+                    media_url = (msg.get("image") or {}).get("url", "")
+                elif msg_type == "audio":
+                    text = "[Audio received]"
+                    media_url = (msg.get("audio") or {}).get("url", "")
+                elif msg_type == "document":
+                    text = "[Document received]"
+                    media_url = (msg.get("document") or {}).get("url", "")
+                elif msg_type == "video":
+                    text = "[Video received]"
+                    media_url = (msg.get("video") or {}).get("url", "")
+                else:
+                    text = f"[{msg_type} message received]"
+
+                results.append({
+                    "phone": phone,
+                    "message_id": msg_id,
+                    "message_type": msg_type,
+                    "text": text,
+                    "media_url": media_url,
+                    "contact_name": contact_name,
+                    "channel_id": channel_id,
+                    "conversation_id": conversation_id,
+                    "timestamp": timestamp,
+                    "raw": ev,
+                    "is_status_update": False,
+                    "provider": "vobiz",
+                })
+    except Exception as exc:
+        logger.error("parse_vobiz_webhook_messages error: %s", exc)
+    return results
+
+
+def _looks_like_vobiz_payload(payload: dict) -> bool:
+    if not isinstance(payload, dict):
+        return isinstance(payload, list)
+    # Meta payloads always have an 'object' = 'whatsapp_business_account' field
+    # and an 'entry' list. Anything else with 'event' or 'channel_id' is Vobiz.
+    if payload.get("object") == "whatsapp_business_account" or "entry" in payload:
+        return False
+    if any(k in payload for k in ("event", "events", "channel_id", "data")):
+        return True
+    return False
+
+
+def parse_webhook_messages(payload) -> list:
+    """Dispatch to provider-specific parser. Auto-detects Meta vs Vobiz shape."""
+    if _looks_like_vobiz_payload(payload):
+        return parse_vobiz_webhook_messages(payload)
+    return _parse_meta_webhook_messages(payload)
+
+
+def _parse_meta_webhook_messages(payload: dict) -> list:
     """Extract list of inbound message dicts from a Meta webhook payload.
 
     Returns list of:
