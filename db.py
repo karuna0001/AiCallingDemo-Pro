@@ -119,6 +119,18 @@ def normalize_phone(phone: str) -> str:
     Generic E.164 numbers (e.g. ``+14155551234``) are also preserved.
     """
     raw = str(phone or "").strip()
+    # Strip surrounding quotes and Google Sheets leading apostrophe text-marker
+    if raw and raw[0] in ("'", '"'):
+        raw = raw[1:].strip()
+    if raw and raw[-1] in ("'", '"'):
+        raw = raw[:-1].strip()
+    # Handle scientific notation that Sheets/Excel sometimes produces
+    # (e.g. "6.597382392e9" → "6597382392")
+    if raw and ("e" in raw.lower()) and re.match(r"^[+-]?\d+(\.\d+)?[eE][+-]?\d+$", raw):
+        try:
+            raw = str(int(float(raw)))
+        except Exception:
+            pass
     if raw.endswith(".0"):
         raw = raw[:-2]
     if not raw:
@@ -127,7 +139,10 @@ def normalize_phone(phone: str) -> str:
         digits = "+" + re.sub(r"\D", "", raw)
     else:
         digits = re.sub(r"\D", "", raw)
-        if len(digits) == 10:
+        # International "00" prefix (e.g. 006597382392 → +6597382392)
+        if len(digits) >= 11 and digits.startswith("00"):
+            digits = "+" + digits[2:]
+        elif len(digits) == 10:
             digits = "+91" + digits
         elif len(digits) == 11 and digits.startswith("0"):
             digits = "+91" + digits[1:]
@@ -937,6 +952,33 @@ async def update_crm_contact_notes(phone: str, crm_notes: str) -> bool:
         logger.warning("update_crm_contact_notes: failed for %s: %s", phone, exc)
         return False
     return len(_safe_list(result)) > 0
+
+
+async def delete_crm_contact_by_phone(phone: str) -> bool:
+    """Hard-delete a CRM contact row by phone number.
+
+    Related call_logs / appointments / whatsapp records are NOT touched —
+    they are retained for audit purposes and reference the phone number,
+    not a foreign-key id, so they remain valid history rows.
+
+    Returns True if a row was deleted, False if no matching contact existed.
+    Raises ValueError if a DB constraint blocks deletion.
+    """
+    db = await _adb()
+    phone = normalize_phone(phone)
+    try:
+        existing = await db.table("crm_contacts").select("phone_number").eq("phone_number", phone).maybe_single().execute()
+    except Exception as exc:
+        logger.warning("delete_crm_contact_by_phone: lookup failed for %s: %s", phone, exc)
+        existing = None
+    if not existing or not getattr(existing, "data", None):
+        return False
+    try:
+        await db.table("crm_contacts").delete().eq("phone_number", phone).execute()
+    except Exception as exc:
+        logger.error("delete_crm_contact_by_phone: delete failed for %s: %s", phone, exc)
+        raise ValueError(f"Could not delete contact: {exc}") from exc
+    return True
 
 
 async def get_crm_contact_by_phone(phone: str) -> Optional[dict]:

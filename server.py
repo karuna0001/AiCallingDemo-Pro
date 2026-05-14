@@ -52,7 +52,7 @@ from db import (
     add_lead_status, delete_lead_status, update_agent_profile, update_call_notes,
     update_campaign_contacts, update_campaign_run_stats, update_campaign_status,
     update_crm_contact_followup, update_crm_contact_full, update_crm_contact_notes,
-    update_crm_contact_status,
+    update_crm_contact_status, delete_crm_contact_by_phone,
     get_knowledge_base, save_knowledge_base, get_kb_section, save_kb_section,
     _KB_SECTIONS,
 )
@@ -2173,6 +2173,22 @@ async def api_update_crm_notes(phone: str, req: CrmNotesRequest):
     if not ok:
         raise HTTPException(404, "CRM contact not found")
     return {"success": True, "message": "CRM notes updated"}
+
+
+@app.delete("/api/crm/contacts/{phone}")
+async def api_delete_crm_contact(phone: str):
+    """Hard-delete a CRM contact. Related call/appointment history is preserved."""
+    try:
+        clean = normalize_phone(phone)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    try:
+        ok = await delete_crm_contact_by_phone(clean)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    if not ok:
+        raise HTTPException(404, "CRM contact not found")
+    return {"success": True, "message": "Lead deleted", "phone_number": clean}
 
 
 @app.get("/api/agent-profiles")
