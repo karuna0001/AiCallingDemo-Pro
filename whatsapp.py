@@ -37,16 +37,14 @@ WA_SETTINGS_KEYS = [
     "VOBIZ_AUTH_TOKEN",
     "VOBIZ_CHANNEL_ID",
     "VOBIZ_WEBHOOK_SECRET",
-    # Templates
-    "WHATSAPP_WELCOME_TEMPLATE",
-    "WHATSAPP_MISSED_CALL_TEMPLATE",
-    "WHATSAPP_BUSY_CALL_TEMPLATE",
-    "WHATSAPP_FAILED_CALL_TEMPLATE",
-    "WHATSAPP_CALLBACK_TEMPLATE",
-    "WHATSAPP_APPOINTMENT_TEMPLATE",
-    "WHATSAPP_SHOWROOM_VISIT_TEMPLATE",
-    "WHATSAPP_RE_ENQUIRY_TEMPLATE",
-    "WHATSAPP_FOLLOWUP_TEMPLATE",
+    # Template purpose slots — admin enters actual Meta/Vobiz template name per purpose
+    "welcome_template",
+    "missed_call_template",
+    "callback_confirmation_template",
+    "appointment_confirmation_template",
+    "reminder_template",
+    "no_response_followup_template",
+    "re_enquiry_followup_template",
 ]
 
 WA_DEFAULTS = {
@@ -54,6 +52,45 @@ WA_DEFAULTS = {
     "WHATSAPP_PROVIDER": "meta",
     "WHATSAPP_GRAPH_VERSION": "v20.0",
     "WHATSAPP_DEFAULT_LANGUAGE": "en",
+}
+
+# ── Template purpose slot labels (for UI and health reporting) ───────────────
+WA_TEMPLATE_PURPOSES = [
+    ("welcome_template",                  "Welcome Message"),
+    ("missed_call_template",              "Missed Call Follow-up"),
+    ("callback_confirmation_template",    "Callback Confirmation"),
+    ("appointment_confirmation_template", "Appointment Confirmation"),
+    ("reminder_template",                 "Reminder"),
+    ("no_response_followup_template",     "No Response Follow-up"),
+    ("re_enquiry_followup_template",      "Re-enquiry Follow-up"),
+]
+
+# ── Backward-compat: old key → new purpose slot ───────────────────────────
+_WA_LEGACY_KEY_MAP = {
+    # Old WA_SETTINGS_KEYS that clients may still have saved
+    "WHATSAPP_WELCOME_TEMPLATE":       "welcome_template",
+    "WHATSAPP_MISSED_CALL_TEMPLATE":   "missed_call_template",
+    "WHATSAPP_BUSY_CALL_TEMPLATE":     "missed_call_template",
+    "WHATSAPP_FAILED_CALL_TEMPLATE":   "no_response_followup_template",
+    "WHATSAPP_CALLBACK_TEMPLATE":      "callback_confirmation_template",
+    "WHATSAPP_APPOINTMENT_TEMPLATE":   "appointment_confirmation_template",
+    "WHATSAPP_SHOWROOM_VISIT_TEMPLATE":"appointment_confirmation_template",
+    "WHATSAPP_RE_ENQUIRY_TEMPLATE":    "re_enquiry_followup_template",
+    "WHATSAPP_FOLLOWUP_TEMPLATE":      "no_response_followup_template",
+    # Old literal purpose names used in automation rule whatsapp_template field
+    "callback_template":               "callback_confirmation_template",
+    "appointment_template":            "appointment_confirmation_template",
+    "showroom_visit_template":         "appointment_confirmation_template",
+    "re_enquiry_template":             "re_enquiry_followup_template",
+    "followup_template":               "no_response_followup_template",
+    # Old literal template name values that some clients had in settings
+    "voice_ai_demo_welcome":           "welcome_template",
+    "missed_call_followup":            "missed_call_template",
+    "appointment_confirmation":        "appointment_confirmation_template",
+    "demo_reminder":                   "reminder_template",
+    "callback_confirmation":           "callback_confirmation_template",
+    "re_enquiry_followup":             "re_enquiry_followup_template",
+    "no_response_followup":            "no_response_followup_template",
 }
 
 # ── Automation rule settings key ───────────────────────────────────────────
@@ -95,21 +132,23 @@ WA_FALLBACK_OUTCOMES = {"no_answer", "busy", "failed", "failed_call", "unreachab
 
 # ── Default automation rules ───────────────────────────────────────────────
 def _default_automation_rules() -> list:
+    # whatsapp_template values are purpose-slot keys (welcome_template, etc.) or
+    # "custom:<actual_template_name>" for one-off overrides.
     return [
-        {"event_type": "new_lead",               "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "welcome_call",           "whatsapp_template": "welcome_template",   "fallback_whatsapp_template": "missed_call_template", "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True, "respect_outbound_schedule": True},
-        {"event_type": "manual_lead",            "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "welcome_call",           "whatsapp_template": "welcome_template",   "fallback_whatsapp_template": "missed_call_template", "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True, "respect_outbound_schedule": True},
-        {"event_type": "uploaded_lead",          "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "welcome_call",           "whatsapp_template": "welcome_template",   "fallback_whatsapp_template": "missed_call_template", "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True, "respect_outbound_schedule": True},
-        {"event_type": "facebook_lead",          "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 30, "call_type": "welcome_call",           "whatsapp_template": "welcome_template",   "fallback_whatsapp_template": "missed_call_template", "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True, "respect_outbound_schedule": True},
-        {"event_type": "instagram_lead",         "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 30, "call_type": "welcome_call",           "whatsapp_template": "welcome_template",   "fallback_whatsapp_template": "missed_call_template", "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True, "respect_outbound_schedule": True},
-        {"event_type": "website_lead",           "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "welcome_call",           "whatsapp_template": "welcome_template",   "fallback_whatsapp_template": "missed_call_template", "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True, "respect_outbound_schedule": True},
-        {"event_type": "google_sheet_lead",      "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "welcome_call",           "whatsapp_template": "welcome_template",   "fallback_whatsapp_template": "missed_call_template", "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True, "respect_outbound_schedule": True},
-        {"event_type": "api_lead",               "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "welcome_call",           "whatsapp_template": "welcome_template",   "fallback_whatsapp_template": "missed_call_template", "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True, "respect_outbound_schedule": True},
-        {"event_type": "followup_lead",          "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "followup_call",          "whatsapp_template": "followup_template",  "fallback_whatsapp_template": "missed_call_template", "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True, "respect_outbound_schedule": True},
-        {"event_type": "callback_scheduled",     "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "callback_call",          "whatsapp_template": "callback_template",  "fallback_whatsapp_template": "missed_call_template", "send_on_no_answer": False, "send_on_busy": False, "send_on_failed": False,"respect_outbound_schedule": True},
-        {"event_type": "appointment_confirmed",  "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "appointment_confirmation","whatsapp_template": "appointment_template","fallback_whatsapp_template": "",           "send_on_no_answer": False, "send_on_busy": False, "send_on_failed": False,"respect_outbound_schedule": False},
-        {"event_type": "showroom_visit_confirmed","source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "appointment_confirmation","whatsapp_template": "showroom_visit_template","fallback_whatsapp_template": "",     "send_on_no_answer": False, "send_on_busy": False, "send_on_failed": False,"respect_outbound_schedule": False},
-        {"event_type": "re_enquiry",             "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "re_enquiry",             "whatsapp_template": "re_enquiry_template","fallback_whatsapp_template": "missed_call_template",  "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True, "respect_outbound_schedule": True},
-        {"event_type": "missed_call_retry",      "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "missed_call_retry",      "whatsapp_template": "missed_call_template","fallback_whatsapp_template": "",          "send_on_no_answer": False, "send_on_busy": False, "send_on_failed": False,"respect_outbound_schedule": True},
+        {"event_type": "new_lead",               "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "welcome_call",            "whatsapp_template": "welcome_template",                "fallback_whatsapp_template": "missed_call_template",    "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True,  "respect_outbound_schedule": True},
+        {"event_type": "manual_lead",            "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "welcome_call",            "whatsapp_template": "welcome_template",                "fallback_whatsapp_template": "missed_call_template",    "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True,  "respect_outbound_schedule": True},
+        {"event_type": "uploaded_lead",          "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "welcome_call",            "whatsapp_template": "welcome_template",                "fallback_whatsapp_template": "missed_call_template",    "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True,  "respect_outbound_schedule": True},
+        {"event_type": "facebook_lead",          "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 30, "call_type": "welcome_call",            "whatsapp_template": "welcome_template",                "fallback_whatsapp_template": "missed_call_template",    "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True,  "respect_outbound_schedule": True},
+        {"event_type": "instagram_lead",         "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 30, "call_type": "welcome_call",            "whatsapp_template": "welcome_template",                "fallback_whatsapp_template": "missed_call_template",    "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True,  "respect_outbound_schedule": True},
+        {"event_type": "website_lead",           "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "welcome_call",            "whatsapp_template": "welcome_template",                "fallback_whatsapp_template": "missed_call_template",    "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True,  "respect_outbound_schedule": True},
+        {"event_type": "google_sheet_lead",      "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "welcome_call",            "whatsapp_template": "welcome_template",                "fallback_whatsapp_template": "missed_call_template",    "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True,  "respect_outbound_schedule": True},
+        {"event_type": "api_lead",               "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "welcome_call",            "whatsapp_template": "welcome_template",                "fallback_whatsapp_template": "missed_call_template",    "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True,  "respect_outbound_schedule": True},
+        {"event_type": "followup_lead",          "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "followup_call",           "whatsapp_template": "no_response_followup_template",  "fallback_whatsapp_template": "missed_call_template",    "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True,  "respect_outbound_schedule": True},
+        {"event_type": "callback_scheduled",     "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "callback_call",           "whatsapp_template": "callback_confirmation_template", "fallback_whatsapp_template": "missed_call_template",    "send_on_no_answer": False, "send_on_busy": False, "send_on_failed": False, "respect_outbound_schedule": True},
+        {"event_type": "appointment_confirmed",  "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "appointment_confirmation", "whatsapp_template": "appointment_confirmation_template","fallback_whatsapp_template": "",                      "send_on_no_answer": False, "send_on_busy": False, "send_on_failed": False, "respect_outbound_schedule": False},
+        {"event_type": "showroom_visit_confirmed","source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "appointment_confirmation", "whatsapp_template": "appointment_confirmation_template","fallback_whatsapp_template": "",                      "send_on_no_answer": False, "send_on_busy": False, "send_on_failed": False, "respect_outbound_schedule": False},
+        {"event_type": "re_enquiry",             "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "re_enquiry",              "whatsapp_template": "re_enquiry_followup_template",   "fallback_whatsapp_template": "missed_call_template",    "send_on_no_answer": True,  "send_on_busy": True,  "send_on_failed": True,  "respect_outbound_schedule": True},
+        {"event_type": "missed_call_retry",      "source": "all", "enabled": False, "action": "manual_only", "delay_minutes": 0,  "call_type": "missed_call_retry",       "whatsapp_template": "missed_call_template",           "fallback_whatsapp_template": "",                      "send_on_no_answer": False, "send_on_busy": False, "send_on_failed": False, "respect_outbound_schedule": True},
     ]
 
 
@@ -195,13 +234,44 @@ async def save_wa_settings(data: dict) -> None:
         await set_setting(k, str(v))
 
 
+async def resolve_wa_template(purpose_or_name: str) -> str:
+    """Resolve a template purpose key or custom override to the actual Meta/Vobiz template name.
+
+    Rules (in order):
+    1. If value starts with 'custom:' strip prefix and return the literal name.
+    2. If value is a purpose slot key (welcome_template, etc.), look it up in settings.
+    3. If value is a legacy key name, map to new slot and look up.
+    4. Otherwise treat value as a literal template name (pass-through).
+    Returns empty string if nothing is configured.
+    """
+    if not purpose_or_name:
+        return ""
+    # Custom override: "custom:actual_template_name"
+    if purpose_or_name.startswith("custom:"):
+        return purpose_or_name[len("custom:"):].strip()
+    # Direct purpose slot (welcome_template, missed_call_template, …)
+    if purpose_or_name in {k for k, _ in WA_TEMPLATE_PURPOSES}:
+        return (await _get_wa_setting(purpose_or_name) or "").strip()
+    # Legacy purpose/key name — map to new slot then fetch
+    mapped = _WA_LEGACY_KEY_MAP.get(purpose_or_name)
+    if mapped:
+        val = (await _get_wa_setting(mapped) or "").strip()
+        if val:
+            return val
+        # If new slot is empty, try also reading the legacy key directly as fallback
+        legacy_val = (await _get_wa_setting(purpose_or_name) or "").strip()
+        return legacy_val
+    # Literal name pass-through (admin typed actual template name in old system)
+    return purpose_or_name.strip()
+
+
 async def get_wa_health() -> dict:
     cfg = await _wa_config()
     enabled = _is_truthy(cfg.get("WHATSAPP_ENABLED"))
     provider = (cfg.get("WHATSAPP_PROVIDER") or "meta").strip().lower()
     templates = [
-        k for k in WA_SETTINGS_KEYS
-        if k.endswith("_TEMPLATE") and cfg.get(k, "").strip()
+        key for key, _ in WA_TEMPLATE_PURPOSES
+        if cfg.get(key, "").strip()
     ]
     missing = []
     if provider == "vobiz":
@@ -225,7 +295,10 @@ async def get_wa_health() -> dict:
             "phone_number_id_configured": channel_id,
             "access_token_configured": auth_token,
             "templates_configured": len(templates),
-            "template_names": templates,
+            "template_purposes": [
+                {"key": k, "label": lbl, "configured": bool(cfg.get(k, "").strip())}
+                for k, lbl in WA_TEMPLATE_PURPOSES
+            ],
             "missing": missing,
             "status": "ok" if ok else "missing_config",
         }
@@ -243,7 +316,10 @@ async def get_wa_health() -> dict:
         "phone_number_id_configured": phone_id,
         "access_token_configured": token,
         "templates_configured": len(templates),
-        "template_names": templates,
+        "template_purposes": [
+            {"key": k, "label": lbl, "configured": bool(cfg.get(k, "").strip())}
+            for k, lbl in WA_TEMPLATE_PURPOSES
+        ],
         "missing": missing,
         "status": status,
     }
@@ -581,7 +657,7 @@ async def execute_automation_rule(
         return {"action": "manual_only", "automation_status": "no_matching_rule", "whatsapp_status": None, "call_status": None, "scheduled_action_id": None}
 
     action = rule.get("action", "manual_only")
-    template = rule.get("whatsapp_template", "")
+    template = await resolve_wa_template(rule.get("whatsapp_template", "") or "")
     language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
     lead_name = contact.get("lead_name") or "there"
     business_name = contact.get("business_name") or ""
@@ -818,11 +894,11 @@ async def handle_call_outcome_whatsapp_fallback(
         if fa == "call_then_whatsapp_always":
             should_send = True
             if outcome_norm in ("no_answer", "voicemail"):
-                template_key = "WHATSAPP_MISSED_CALL_TEMPLATE"
+                template_key = "missed_call_template"
             elif outcome_norm == "busy":
-                template_key = "WHATSAPP_BUSY_CALL_TEMPLATE"
+                template_key = "missed_call_template"
             else:
-                template_key = "WHATSAPP_FOLLOWUP_TEMPLATE"
+                template_key = "no_response_followup_template"
         elif fa == "call_then_whatsapp_on_failure":
             if outcome_norm in WA_FALLBACK_OUTCOMES:
                 should_send = True
@@ -832,17 +908,21 @@ async def handle_call_outcome_whatsapp_fallback(
                 should_send = True
 
             if outcome_norm in ("no_answer", "voicemail"):
-                template_key = "WHATSAPP_MISSED_CALL_TEMPLATE"
+                template_key = "missed_call_template"
             elif outcome_norm == "busy":
-                template_key = "WHATSAPP_BUSY_CALL_TEMPLATE"
+                template_key = "missed_call_template"
             else:
-                template_key = "WHATSAPP_FAILED_CALL_TEMPLATE"
+                template_key = "no_response_followup_template"
 
         if not should_send:
             await update_automation_action_status(fallback_action["id"], "completed", {"skipped": "outcome_not_triggering"})
             return {"sent": False, "reason": "outcome_not_triggering"}
 
-        fallback_template = rule.get("fallback_whatsapp_template") or await _get_wa_setting(template_key) or ""
+        fallback_template = (
+            await resolve_wa_template(rule.get("fallback_whatsapp_template") or "")
+            or await _get_wa_setting(template_key)
+            or ""
+        )
         if not fallback_template:
             await update_automation_action_status(fallback_action["id"], "failed", {}, "No fallback template configured")
             return {"sent": False, "reason": "no_fallback_template"}
