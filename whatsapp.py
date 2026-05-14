@@ -65,6 +65,16 @@ WA_TEMPLATE_PURPOSES = [
     ("re_enquiry_followup_template",      "Re-enquiry Follow-up"),
 ]
 
+WA_TEMPLATE_PARAM_COUNTS = {
+    "welcome_template": 2,
+    "missed_call_template": 2,
+    "callback_confirmation_template": 4,
+    "appointment_confirmation_template": 4,
+    "reminder_template": 3,
+    "no_response_followup_template": 2,
+    "re_enquiry_followup_template": 2,
+}
+
 # ── Backward-compat: old key → new purpose slot ───────────────────────────
 _WA_LEGACY_KEY_MAP = {
     # Old WA_SETTINGS_KEYS that clients may still have saved
@@ -340,6 +350,7 @@ async def send_whatsapp_template(
     event_type: str = "",
     source_type: str = "",
     source_id: str = "",
+    template_purpose: str = "",
 ) -> dict:
     """Send an approved WhatsApp template message via Meta Cloud API.
 
@@ -432,6 +443,14 @@ async def send_whatsapp_template(
                 else:
                     error_data = resp_json.get("error") or resp_json
                     err_msg = str(error_data.get("message", "") if isinstance(error_data, dict) else error_data)[:500]
+                    if "132000" in err_msg or "Number of parameters" in err_msg:
+                        purpose = _template_purpose_key(template_purpose)
+                        expected = WA_TEMPLATE_PARAM_COUNTS.get(purpose)
+                        sent = len(parameters or [])
+                        detail = f" sent_params={sent}"
+                        if expected is not None:
+                            detail += f" expected_params={expected}"
+                        err_msg = (err_msg + detail)[:500]
                     await _log_wa(phone, event_type, template_name, language, parameters, "failed", None, err_msg, source_type, source_id)
                     return {"success": False, "provider_message_id": None, "error": err_msg, "reason": "provider_error"}
     except Exception as exc:
@@ -748,7 +767,18 @@ async def _send_rule_whatsapp(
     return await send_whatsapp_template(
         phone, template, language, params,
         event_type=event_type, source_type="automation", source_id=source_id,
+        template_purpose=selected_template,
     )
+
+
+def _template_purpose_key(purpose_or_name: str) -> str:
+    if not purpose_or_name:
+        return ""
+    if purpose_or_name.startswith("custom:"):
+        return ""
+    if purpose_or_name in {k for k, _ in WA_TEMPLATE_PURPOSES}:
+        return purpose_or_name
+    return _WA_LEGACY_KEY_MAP.get(purpose_or_name, "")
 
 
 async def execute_automation_rule(
@@ -805,7 +835,7 @@ async def execute_automation_rule(
     delay_minutes = int(rule.get("delay_minutes") or 0)
     call_type = (context or {}).get("call_type") or rule.get("call_type") or "welcome_call"
 
-    params = _build_template_params(lead_name, business_name, service_type, context)
+    params = _build_template_params(selected_template, contact, context)
     action_id = await insert_automation_action(
         phone, event_type, source, action, datetime.now(),
         payload={**contact, "rule": rule, "call_type": call_type, "selected_template": selected_template},
@@ -890,17 +920,58 @@ async def execute_automation_rule(
     return await finish("skipped", result, "unknown_action")
 
 
-def _build_template_params(lead_name: str, business_name: str, service_type: str, context: Optional[dict]) -> list:
-    params = [lead_name or "there"]
-    if service_type:
-        params.append(service_type)
-    if business_name:
-        params.append(business_name)
-    if context:
-        for k in ("appointment_date", "appointment_time", "address", "contact_number"):
-            v = context.get(k)
-            if v:
-                params.append(str(v))
+def _first_value(*values, fallback: str = "") -> str:
+    for value in values:
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return fallback
+
+
+def _build_template_params(purpose_or_name: str, contact: Optional[dict], context: Optional[dict] = None) -> list:
+    contact = contact or {}
+    context = context or {}
+    purpose = _template_purpose_key(purpose_or_name)
+    name = _first_value(
+        context.get("name"), context.get("lead_name"), context.get("customer_name"),
+        contact.get("name"), contact.get("lead_name"), contact.get("customer_name"),
+        fallback="there",
+    )
+    company = _first_value(
+        context.get("business_name"), context.get("company_name"), context.get("business"), context.get("company"), context.get("service_company"),
+        contact.get("business_name"), contact.get("company_name"), contact.get("business"), contact.get("company"), contact.get("service_company"),
+        contact.get("service_type"), context.get("service_type"), context.get("service"),
+        fallback="your business",
+    )
+    service = _first_value(
+        context.get("purpose"), context.get("service_type"), context.get("service"), context.get("requirement"),
+        contact.get("service_type"), contact.get("service"), contact.get("requirement"),
+        fallback=company,
+    )
+    date = _first_value(
+        context.get("date"), context.get("appointment_date"), context.get("callback_date"),
+        contact.get("date"), contact.get("appointment_date"), contact.get("callback_date"),
+        fallback="the scheduled date",
+    )
+    time = _first_value(
+        context.get("time"), context.get("appointment_time"), context.get("callback_time"),
+        contact.get("time"), contact.get("appointment_time"), contact.get("callback_time"),
+        fallback="the scheduled time",
+    )
+
+    if purpose in ("welcome_template", "missed_call_template", "no_response_followup_template", "re_enquiry_followup_template"):
+        return [name, company]
+    if purpose == "callback_confirmation_template":
+        return [name, service, date, time]
+    if purpose == "appointment_confirmation_template":
+        return [name, company, date, time]
+    if purpose == "reminder_template":
+        return [name, company, time]
+
+    params = [name]
+    if service:
+        params.append(service)
+    if company and company != service:
+        params.append(company)
     return params
 
 
@@ -1082,10 +1153,13 @@ async def handle_call_outcome_whatsapp_fallback(
         fallback_template = await resolve_wa_template(selected_template)
 
         language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
-        lead_name = (contact or {}).get("lead_name") or "there"
+        fallback_contact = contact or {}
+        if "lead_name" not in fallback_contact:
+            fallback_contact = {**fallback_contact, "lead_name": "there"}
+        params = _build_template_params(selected_template, fallback_contact, None)
         wa_result = await _send_rule_whatsapp(
             phone, "call_fallback", fallback_action["id"],
-            selected_template, fallback_template, language, [lead_name],
+            selected_template, fallback_template, language, params,
         )
         status = "completed" if wa_result["success"] else "failed"
         await update_automation_action_status(fallback_action["id"], status, wa_result, wa_result.get("error") or "")
@@ -1150,6 +1224,7 @@ async def run_due_automation_actions() -> dict:
                 wa_result = await send_whatsapp_template(
                     phone, template, language, parameters,
                     event_type=event_type, source_type="automation_runner", source_id=action_id,
+                    template_purpose=payload.get("template_purpose") or payload.get("selected_template") or "",
                 )
                 status = "completed" if wa_result["success"] else "failed"
                 await update_automation_action_status(action_id, status, wa_result, wa_result.get("error") or "")
@@ -1170,26 +1245,24 @@ async def run_due_automation_actions() -> dict:
 async def send_callback_confirmation(phone: str, context: Optional[dict] = None) -> dict:
     template = await resolve_wa_template("callback_confirmation_template")
     language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
-    lead_name = (context or {}).get("lead_name") or "there"
-    params = _build_template_params(lead_name, (context or {}).get("business_name", ""), (context or {}).get("service_type", ""), context)
+    params = _build_template_params("callback_confirmation_template", context or {}, context)
     result = await execute_automation_rule("callback_scheduled", {"phone": phone, **(context or {})})
     if result.get("action") != "manual_only":
         return result
     if template:
-        return await send_whatsapp_template(phone, template, language, params, event_type="callback_scheduled", source_type="manual", source_id=phone)
+        return await send_whatsapp_template(phone, template, language, params, event_type="callback_scheduled", source_type="manual", source_id=phone, template_purpose="callback_confirmation_template")
     return {"success": False, "error": "No callback template configured", "reason": "template_missing"}
 
 
 async def send_appointment_confirmation(phone: str, context: Optional[dict] = None) -> dict:
     template = await resolve_wa_template("appointment_confirmation_template")
     language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
-    lead_name = (context or {}).get("lead_name") or "there"
-    params = _build_template_params(lead_name, (context or {}).get("business_name", ""), (context or {}).get("service_type", ""), context)
+    params = _build_template_params("appointment_confirmation_template", context or {}, context)
     result = await execute_automation_rule("appointment_confirmed", {"phone": phone, **(context or {})})
     if result.get("action") != "manual_only":
         return result
     if template:
-        return await send_whatsapp_template(phone, template, language, params, event_type="appointment_confirmed", source_type="manual", source_id=phone)
+        return await send_whatsapp_template(phone, template, language, params, event_type="appointment_confirmed", source_type="manual", source_id=phone, template_purpose="appointment_confirmation_template")
     return {"success": False, "error": "No appointment template configured", "reason": "template_missing"}
 
 
@@ -1197,13 +1270,12 @@ async def send_showroom_visit_confirmation(phone: str, context: Optional[dict] =
     # Showroom visit reuses the appointment confirmation slot (single confirmation template covers both).
     template = await resolve_wa_template("appointment_confirmation_template")
     language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
-    lead_name = (context or {}).get("lead_name") or "there"
-    params = _build_template_params(lead_name, (context or {}).get("business_name", ""), (context or {}).get("service_type", ""), context)
+    params = _build_template_params("appointment_confirmation_template", context or {}, context)
     result = await execute_automation_rule("showroom_visit_confirmed", {"phone": phone, **(context or {})})
     if result.get("action") != "manual_only":
         return result
     if template:
-        return await send_whatsapp_template(phone, template, language, params, event_type="showroom_visit_confirmed", source_type="manual", source_id=phone)
+        return await send_whatsapp_template(phone, template, language, params, event_type="showroom_visit_confirmed", source_type="manual", source_id=phone, template_purpose="appointment_confirmation_template")
     return {"success": False, "error": "No showroom template configured", "reason": "template_missing"}
 
 
@@ -1942,12 +2014,13 @@ async def _handle_inbound_intent(phone: str, intent: str, conv: dict) -> bool:
     if not template:
         return False
     language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
-    params = _build_template_params(lead_name, "", "", None)
+    params = _build_template_params(slot, {"lead_name": lead_name}, None)
     try:
         result = await send_whatsapp_template(
             phone, template, language, params,
             event_type=event_type, source_type="whatsapp_intent",
             source_id=conv.get("id", "") or phone,
+            template_purpose=slot,
         )
         return bool(result.get("success"))
     except Exception as exc:
