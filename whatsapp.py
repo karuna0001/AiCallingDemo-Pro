@@ -120,12 +120,37 @@ def _db():
 
 
 async def _get_wa_setting(key: str) -> str:
-    return await _db().get_setting(key, WA_DEFAULTS.get(key, ""))
+    """Read a WhatsApp setting.
+
+    Precedence: settings table (user-saved via UI) → env var → WA_DEFAULTS.
+    This is intentionally different from db.get_setting() which prefers env first;
+    for WhatsApp we want the dashboard Save button to be the source of truth so
+    Coolify/host env vars don't silently override user choices like
+    WHATSAPP_ENABLED, WHATSAPP_PROVIDER, VOBIZ_* credentials, etc.
+    """
+    try:
+        db_mod = _db()
+        adb = await db_mod._adb()
+        result = await adb.table("settings").select("value").eq("key", key).maybe_single().execute()
+        if result and result.data and result.data.get("value") not in (None, ""):
+            return result.data["value"]
+    except Exception as exc:
+        logger.debug("_get_wa_setting DB read failed for %s: %s", key, exc)
+    env_val = os.getenv(key, "")
+    if env_val:
+        return env_val
+    return WA_DEFAULTS.get(key, "")
+
+
+def _is_truthy(val) -> bool:
+    if isinstance(val, bool):
+        return val
+    s = str(val or "").strip().lower()
+    return s in ("1", "true", "yes", "on", "enabled", "y", "t")
 
 
 async def _is_wa_enabled() -> bool:
-    val = (await _get_wa_setting("WHATSAPP_ENABLED") or "false").strip().lower()
-    return val in ("1", "true", "yes", "on")
+    return _is_truthy(await _get_wa_setting("WHATSAPP_ENABLED"))
 
 
 async def _wa_config() -> dict:
@@ -158,18 +183,21 @@ async def save_wa_settings(data: dict) -> None:
     """Save WhatsApp settings to settings table. Skips masked secret placeholders."""
     from db import set_setting
     _SECRET_KEYS = {"WHATSAPP_ACCESS_TOKEN", "VOBIZ_AUTH_TOKEN", "VOBIZ_WEBHOOK_SECRET"}
+    _BOOL_KEYS = {"WHATSAPP_ENABLED"}
     for k in WA_SETTINGS_KEYS:
         v = data.get(k)
         if v is None:
             continue
         if k in _SECRET_KEYS and (not v or "****" in str(v)):
             continue  # do not overwrite with masked value
+        if k in _BOOL_KEYS:
+            v = "true" if _is_truthy(v) else "false"
         await set_setting(k, str(v))
 
 
 async def get_wa_health() -> dict:
     cfg = await _wa_config()
-    enabled = (cfg.get("WHATSAPP_ENABLED") or "false").strip().lower() in ("1", "true", "yes", "on")
+    enabled = _is_truthy(cfg.get("WHATSAPP_ENABLED"))
     provider = (cfg.get("WHATSAPP_PROVIDER") or "meta").strip().lower()
     templates = [
         k for k in WA_SETTINGS_KEYS
