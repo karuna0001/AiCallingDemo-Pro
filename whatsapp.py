@@ -548,6 +548,9 @@ def _find_disabled_automation_rule(rules: list, event_type: str, source: Optiona
         for r in rules:
             if r.get("event_type") == "new_lead" and r.get("source") == "all" and not _is_enabled_rule(r):
                 return r
+    for r in rules:
+        if r.get("event_type") == "all" and r.get("source") == "all" and not _is_enabled_rule(r):
+            return r
     return None
 
 
@@ -567,6 +570,10 @@ def find_automation_rule(rules: list, event_type: str, source: Optional[str] = N
         for r in rules:
             if r.get("event_type") == "new_lead" and r.get("source") == "all" and _is_enabled_rule(r):
                 return r
+    # 4. global all+all fallback for API-created/custom rules
+    for r in rules:
+        if r.get("event_type") == "all" and r.get("source") == "all" and _is_enabled_rule(r):
+            return r
     return None
 
 
@@ -582,7 +589,12 @@ def source_to_event_type(source: str) -> str:
         "web": "website_lead",
         "google_sheet": "google_sheet_lead",
         "google sheet": "google_sheet_lead",
+        "google sheets": "google_sheet_lead",
+        "googlesheet": "google_sheet_lead",
+        "googlesheets": "google_sheet_lead",
         "n8n": "google_sheet_lead",
+        "n8n_google_sheet": "google_sheet_lead",
+        "n8n_google_sheets": "google_sheet_lead",
         "manual": "manual_lead",
         "csv": "uploaded_lead",
         "xlsx": "uploaded_lead",
@@ -604,6 +616,9 @@ async def insert_automation_action(
     action_type: str,
     scheduled_at: datetime,
     payload: Optional[dict] = None,
+    status: str = "pending",
+    result: Optional[dict] = None,
+    error: str = "",
 ) -> str:
     action_id = str(uuid.uuid4())
     try:
@@ -616,12 +631,12 @@ async def insert_automation_action(
             "source": source or "",
             "action_type": action_type,
             "scheduled_at": scheduled_at.isoformat(),
-            "status": "pending",
+            "status": status or "pending",
             "payload": _json.dumps(payload or {}),
-            "result": "{}",
-            "error_message": "",
+            "result": _json.dumps(result or {}),
+            "error_message": (error or "")[:500],
             "created_at": datetime.now().isoformat(),
-            "completed_at": "",
+            "completed_at": datetime.now().isoformat() if status in ("completed", "failed", "cancelled", "skipped") else "",
         }
         await db.table("automation_actions").insert(row).execute()
     except Exception as exc:
@@ -657,7 +672,7 @@ async def update_automation_action_status(action_id: str, status: str, result: O
             updates["result"] = _json.dumps(result)
         if error:
             updates["error_message"] = error[:500]
-        if status in ("completed", "failed", "cancelled"):
+        if status in ("completed", "failed", "cancelled", "skipped"):
             updates["completed_at"] = datetime.now().isoformat()
         await db.table("automation_actions").update(updates).eq("id", action_id).execute()
         return True
@@ -667,6 +682,65 @@ async def update_automation_action_status(action_id: str, status: str, result: O
 
 
 # ── Execute automation rule for a contact ─────────────────────────────────
+
+def _rule_key(rule: Optional[dict]) -> str:
+    if not rule:
+        return ""
+    return f"{rule.get('event_type', '')}:{rule.get('source', 'all')}"
+
+
+def _automation_result(
+    event_type: str,
+    source: str,
+    rule: Optional[dict],
+    action: str = "manual_only",
+    automation_status: str = "",
+    whatsapp_status: Optional[str] = None,
+    call_status: Optional[str] = None,
+    queue_action_id: Optional[str] = None,
+    skip_reason: str = "",
+    error: str = "",
+) -> dict:
+    return {
+        "automation_status": automation_status,
+        "automation_event_type": event_type,
+        "matched_rule_key": _rule_key(rule),
+        "matched_rule_enabled": _is_enabled_rule(rule) if rule else False,
+        "selected_action": action,
+        "action": action,
+        "call_status": call_status,
+        "whatsapp_status": whatsapp_status,
+        "queue_action_id": queue_action_id,
+        "scheduled_action_id": queue_action_id,
+        "skip_reason": skip_reason,
+        "error": error,
+    }
+
+
+async def _send_rule_whatsapp(
+    phone: str,
+    event_type: str,
+    source_id: str,
+    selected_template: str,
+    template: str,
+    language: str,
+    params: list,
+) -> dict:
+    if not template:
+        if selected_template in {k for k, _ in WA_TEMPLATE_PURPOSES}:
+            err = f"WhatsApp template purpose slot '{selected_template}' is not configured"
+        else:
+            err = "WhatsApp template is not configured for this automation rule"
+        await _log_wa(
+            phone, event_type, selected_template, language, params,
+            "failed", None, err, "automation", source_id,
+        )
+        return {"success": False, "provider_message_id": None, "error": err, "reason": "template_missing"}
+    return await send_whatsapp_template(
+        phone, template, language, params,
+        event_type=event_type, source_type="automation", source_id=source_id,
+    )
+
 
 async def execute_automation_rule(
     event_type: str,
@@ -682,26 +756,37 @@ async def execute_automation_rule(
     phone = (contact.get("phone") or contact.get("phone_number") or "").strip()
     source = (contact.get("source") or "").strip()
     if not phone:
-        return {"action": "skip", "automation_status": "no_phone", "whatsapp_status": None, "call_status": None, "scheduled_action_id": None}
+        return _automation_result(event_type, source, None, "skip", "skipped", skip_reason="invalid_phone", error="Phone number is missing")
 
     rules = await get_automation_rules()
     rule = find_automation_rule(rules, event_type, source)
     if not rule:
         disabled_rule = _find_disabled_automation_rule(rules, event_type, source)
         if disabled_rule:
-            matched_event = disabled_rule.get("event_type", "")
-            matched_source = disabled_rule.get("source", "")
-            logger.info(
-                "Automation skipped for phone=%s event=%s source=%s: matching rule is disabled (rule_event=%s rule_source=%s action=%s)",
-                phone, event_type, source, matched_event, matched_source, disabled_rule.get("action", ""),
+            action = disabled_rule.get("action", "manual_only")
+            result = _automation_result(event_type, source, disabled_rule, action, "skipped", skip_reason="rule_disabled")
+            action_id = await insert_automation_action(
+                phone, event_type, source, action, datetime.now(),
+                payload={**contact, "rule": disabled_rule},
+                status="skipped", result=result, error="rule_disabled",
             )
-            return {"action": disabled_rule.get("action", "manual_only"), "automation_status": "rule_disabled", "whatsapp_status": None, "call_status": None, "scheduled_action_id": None}
-        logger.info("Automation skipped for phone=%s event=%s source=%s: no matching enabled rule", phone, event_type, source)
-        return {"action": "manual_only", "automation_status": "no_matching_rule", "whatsapp_status": None, "call_status": None, "scheduled_action_id": None}
+            result["queue_action_id"] = action_id
+            result["scheduled_action_id"] = action_id
+            logger.info("Automation skipped: %s", result)
+            return result
+        result = _automation_result(event_type, source, None, "manual_only", "skipped", skip_reason="no_matching_rule")
+        action_id = await insert_automation_action(
+            phone, event_type, source, "manual_only", datetime.now(),
+            payload={**contact}, status="skipped", result=result, error="no_matching_rule",
+        )
+        result["queue_action_id"] = action_id
+        result["scheduled_action_id"] = action_id
+        logger.info("Automation skipped: %s", result)
+        return result
 
     action = rule.get("action", "manual_only")
     selected_template = rule.get("whatsapp_template", "") or ""
-    if action == "whatsapp_only" and rule.get("event_type") == "new_lead" and not selected_template:
+    if action in ("whatsapp_only", "whatsapp_and_call_now", "whatsapp_then_call_after_delay", "whatsapp_then_call_on_reply") and rule.get("event_type") == "new_lead" and not selected_template:
         selected_template = "welcome_template"
     template = await resolve_wa_template(selected_template)
     language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
@@ -711,78 +796,89 @@ async def execute_automation_rule(
     delay_minutes = int(rule.get("delay_minutes") or 0)
     call_type = (context or {}).get("call_type") or rule.get("call_type") or "welcome_call"
 
-    wa_result = None
-    call_status = None
-    action_id = None
+    params = _build_template_params(lead_name, business_name, service_type, context)
+    action_id = await insert_automation_action(
+        phone, event_type, source, action, datetime.now(),
+        payload={**contact, "rule": rule, "call_type": call_type, "selected_template": selected_template},
+        status="running",
+    )
+
+    async def finish(status: str, result: dict, error: str = "") -> dict:
+        result["queue_action_id"] = result.get("queue_action_id") or action_id
+        result["scheduled_action_id"] = result.get("scheduled_action_id") or result["queue_action_id"]
+        result["parent_queue_action_id"] = action_id
+        await update_automation_action_status(action_id, status, result, error)
+        logger.info("Automation result: %s", result)
+        return result
 
     if action == "manual_only":
-        return {"action": action, "automation_status": "manual_only", "whatsapp_status": None, "call_status": None, "scheduled_action_id": None}
+        result = _automation_result(event_type, source, rule, action, "skipped", skip_reason="manual_only")
+        return await finish("skipped", result, "manual_only")
 
     elif action == "whatsapp_only":
-        params = _build_template_params(lead_name, business_name, service_type, context)
-        if not template:
-            if selected_template in {k for k, _ in WA_TEMPLATE_PURPOSES}:
-                err = f"WhatsApp template purpose slot '{selected_template}' is not configured"
-            else:
-                err = "WhatsApp template is not configured for this automation rule"
-            await _log_wa(
-                phone, event_type, selected_template, language, params,
-                "failed", None, err, "automation", event_type,
-            )
-            return {"action": action, "automation_status": "failed", "whatsapp_status": "template_missing", "call_status": None, "scheduled_action_id": None}
-        wa_result = await send_whatsapp_template(
-            phone, template, language, params,
-            event_type=event_type, source_type="automation", source_id=event_type,
-        )
-        return {"action": action, "automation_status": "executed", "whatsapp_status": wa_result.get("reason") or ("sent" if wa_result["success"] else "failed"), "call_status": None, "scheduled_action_id": None}
+        wa_result = await _send_rule_whatsapp(phone, event_type, action_id, selected_template, template, language, params)
+        whatsapp_status = "sent" if wa_result["success"] else (wa_result.get("reason") or "failed")
+        result = _automation_result(event_type, source, rule, action, "executed" if wa_result["success"] else "failed", whatsapp_status=whatsapp_status, error=wa_result.get("error") or "")
+        return await finish("completed" if wa_result["success"] else "failed", result, wa_result.get("error") or "")
 
     elif action == "call_only":
-        call_status = await _schedule_or_start_call(phone, contact, call_type, event_type, source, delay_minutes=0, rule=rule)
-        return {"action": action, "automation_status": "executed", "whatsapp_status": None, "call_status": call_status, "scheduled_action_id": None}
+        call_result = await _schedule_or_start_call(phone, contact, call_type, event_type, source, delay_minutes=0, rule=rule, return_details=True)
+        result = _automation_result(event_type, source, rule, action, "executed", call_status=call_result.get("call_status"), queue_action_id=call_result.get("action_id"))
+        result["next_allowed_at"] = call_result.get("next_allowed_at")
+        result["skip_reason"] = call_result.get("skip_reason", "")
+        result["error"] = call_result.get("error", "")
+        return await finish("completed", result, result.get("error", ""))
 
     elif action == "whatsapp_and_call_now":
-        wa_result = await send_whatsapp_template(
-            phone, template, language,
-            _build_template_params(lead_name, business_name, service_type, context),
-            event_type=event_type, source_type="automation", source_id=event_type,
-        )
-        call_status = await _schedule_or_start_call(phone, contact, call_type, event_type, source, delay_minutes=0, rule=rule)
-        return {"action": action, "automation_status": "executed", "whatsapp_status": "sent" if wa_result["success"] else "failed", "call_status": call_status, "scheduled_action_id": None}
+        wa_result = await _send_rule_whatsapp(phone, event_type, action_id, selected_template, template, language, params)
+        call_result = await _schedule_or_start_call(phone, contact, call_type, event_type, source, delay_minutes=0, rule=rule, return_details=True)
+        whatsapp_status = "sent" if wa_result["success"] else (wa_result.get("reason") or "failed")
+        result = _automation_result(event_type, source, rule, action, "executed" if wa_result["success"] else "failed", whatsapp_status=whatsapp_status, call_status=call_result.get("call_status"), queue_action_id=call_result.get("action_id"), error=wa_result.get("error") or call_result.get("error", ""))
+        result["next_allowed_at"] = call_result.get("next_allowed_at")
+        result["skip_reason"] = call_result.get("skip_reason", "")
+        return await finish("completed" if wa_result["success"] else "failed", result, result.get("error", ""))
 
     elif action == "whatsapp_then_call_after_delay":
-        wa_result = await send_whatsapp_template(
-            phone, template, language,
-            _build_template_params(lead_name, business_name, service_type, context),
-            event_type=event_type, source_type="automation", source_id=event_type,
-        )
+        wa_result = await _send_rule_whatsapp(phone, event_type, action_id, selected_template, template, language, params)
         sched_at = _next_allowed_time(delay_minutes, rule)
-        action_id = await insert_automation_action(
+        scheduled_id = await insert_automation_action(
             phone, event_type, source, "call_only", sched_at,
-            payload={**contact, "call_type": call_type, "rule": rule},
+            payload={**contact, "call_type": call_type, "rule": rule, "parent_action_id": action_id},
         )
-        return {"action": action, "automation_status": "whatsapp_sent_call_scheduled", "whatsapp_status": "sent" if wa_result["success"] else "failed", "call_status": "scheduled", "scheduled_action_id": action_id}
+        whatsapp_status = "sent" if wa_result["success"] else (wa_result.get("reason") or "failed")
+        result = _automation_result(event_type, source, rule, action, "queued" if wa_result["success"] else "failed", whatsapp_status=whatsapp_status, call_status="scheduled", queue_action_id=scheduled_id, error=wa_result.get("error") or "")
+        result["parent_queue_action_id"] = action_id
+        result["next_allowed_at"] = sched_at.isoformat()
+        await update_automation_action_status(action_id, "completed" if wa_result["success"] else "failed", result, wa_result.get("error") or "")
+        logger.info("Automation result: %s", result)
+        return result
 
     elif action in ("call_then_whatsapp_on_failure", "call_then_whatsapp_always"):
-        call_status = await _schedule_or_start_call(
+        call_result = await _schedule_or_start_call(
             phone, contact, call_type, event_type, source, delay_minutes=0, rule=rule,
-            fallback_action=action,
+            fallback_action=action, return_details=True,
         )
-        return {"action": action, "automation_status": "call_dispatched", "whatsapp_status": "pending_call_outcome", "call_status": call_status, "scheduled_action_id": None}
+        result = _automation_result(event_type, source, rule, action, "executed", whatsapp_status="pending_call_outcome", call_status=call_result.get("call_status"), queue_action_id=call_result.get("action_id"), error=call_result.get("error", ""))
+        result["next_allowed_at"] = call_result.get("next_allowed_at")
+        result["skip_reason"] = call_result.get("skip_reason", "")
+        return await finish("completed", result, result.get("error", ""))
 
     elif action == "whatsapp_then_call_on_reply":
-        wa_result = await send_whatsapp_template(
-            phone, template, language,
-            _build_template_params(lead_name, business_name, service_type, context),
-            event_type=event_type, source_type="automation", source_id=event_type,
-        )
-        action_id = await insert_automation_action(
+        wa_result = await _send_rule_whatsapp(phone, event_type, action_id, selected_template, template, language, params)
+        waiting_id = await insert_automation_action(
             phone, event_type, source, "waiting_for_whatsapp_reply", datetime.now(),
-            payload={**contact, "call_type": call_type, "rule": rule},
+            payload={**contact, "call_type": call_type, "rule": rule, "parent_action_id": action_id},
         )
-        await update_automation_action_status(action_id, "waiting_schedule")
-        return {"action": action, "automation_status": "whatsapp_sent_waiting_reply", "whatsapp_status": "sent" if wa_result["success"] else "failed", "call_status": "waiting_reply", "scheduled_action_id": action_id}
+        await update_automation_action_status(waiting_id, "waiting_schedule", {"waiting_for": "whatsapp_reply", "parent_action_id": action_id})
+        whatsapp_status = "sent" if wa_result["success"] else (wa_result.get("reason") or "failed")
+        result = _automation_result(event_type, source, rule, action, "waiting_reply" if wa_result["success"] else "failed", whatsapp_status=whatsapp_status, call_status="waiting_reply", queue_action_id=waiting_id, error=wa_result.get("error") or "")
+        result["parent_queue_action_id"] = action_id
+        await update_automation_action_status(action_id, "completed" if wa_result["success"] else "failed", result, wa_result.get("error") or "")
+        logger.info("Automation result: %s", result)
+        return result
 
-    return {"action": action, "automation_status": "unknown_action", "whatsapp_status": None, "call_status": None, "scheduled_action_id": None}
+    result = _automation_result(event_type, source, rule, action, "skipped", skip_reason="unknown_action")
+    return await finish("skipped", result, "unknown_action")
 
 
 def _build_template_params(lead_name: str, business_name: str, service_type: str, context: Optional[dict]) -> list:
@@ -814,11 +910,23 @@ async def _schedule_or_start_call(
     delay_minutes: int = 0,
     rule: Optional[dict] = None,
     fallback_action: Optional[str] = None,
+    return_details: bool = False,
 ) -> str:
     """Schedule or immediately start an outbound call.
 
     Returns: 'scheduled' | 'queued' | 'dispatched' | 'skipped_no_livekit'
     """
+    def done(call_status: str, action_id: Optional[str] = None, next_allowed_at=None, skip_reason: str = "", error: str = ""):
+        if return_details:
+            return {
+                "call_status": call_status,
+                "action_id": action_id,
+                "next_allowed_at": next_allowed_at.isoformat() if hasattr(next_allowed_at, "isoformat") else next_allowed_at,
+                "skip_reason": skip_reason,
+                "error": error,
+            }
+        return call_status
+
     try:
         from server import _is_outbound_allowed, _dispatch_one, _outbound_window_error
         from livekit import api as lk_api_module
@@ -827,11 +935,11 @@ async def _schedule_or_start_call(
     except Exception:
         # Safe fallback — log a scheduled action for the runner to pick up
         sched_at = _next_allowed_time(delay_minutes, rule)
-        await insert_automation_action(
+        action_id = await insert_automation_action(
             phone, event_type, source, "call_only", sched_at,
             payload={**contact, "call_type": call_type, "rule": rule, "fallback_action": fallback_action},
         )
-        return "scheduled"
+        return done("scheduled", action_id, sched_at, error="call_dispatch_import_failed")
 
     if delay_minutes > 0:
         sched_at = _next_allowed_time(delay_minutes, rule)
@@ -839,7 +947,7 @@ async def _schedule_or_start_call(
             phone, event_type, source, "call_only", sched_at,
             payload={**contact, "call_type": call_type, "rule": rule, "fallback_action": fallback_action},
         )
-        return "scheduled"
+        return done("scheduled", action_id, sched_at)
 
     # Immediate call
     if not await _is_outbound_allowed():
@@ -857,7 +965,7 @@ async def _schedule_or_start_call(
             payload={**contact, "call_type": call_type, "rule": rule, "fallback_action": fallback_action},
         )
         await update_automation_action_status(action_id, "waiting_schedule")
-        return "waiting_schedule"
+        return done("waiting_schedule", action_id, sched_at, skip_reason="outside_outbound_window")
 
     # Try to dispatch via LiveKit
     try:
@@ -883,29 +991,30 @@ async def _schedule_or_start_call(
 
         if ok:
             # Schedule fallback WhatsApp action linked to this call's outcome
+            fallback_id = None
             if fallback_action:
-                await insert_automation_action(
+                fallback_id = await insert_automation_action(
                     phone, event_type, source,
                     "whatsapp_fallback_on_outcome",
-                    datetime.now() + timedelta(minutes=5),
+                    datetime.now() + timedelta(days=30),
                     payload={**contact, "call_type": call_type, "rule": rule, "fallback_action": fallback_action, "room_name": room_name},
                 )
-            return "dispatched"
+            return done("dispatched", fallback_id)
         else:
             sched_at = _next_allowed_time(15, rule)
-            await insert_automation_action(
+            action_id = await insert_automation_action(
                 phone, event_type, source, "call_only", sched_at,
                 payload={**contact, "call_type": call_type, "rule": rule, "fallback_action": fallback_action},
             )
-            return "scheduled"
+            return done("scheduled", action_id, sched_at, error="call_dispatch_failed")
     except Exception as exc:
         logger.error("_schedule_or_start_call error for %s: %s", phone, exc)
         sched_at = _next_allowed_time(5, rule)
-        await insert_automation_action(
+        action_id = await insert_automation_action(
             phone, event_type, source, "call_only", sched_at,
             payload={**contact, "call_type": call_type, "rule": rule, "fallback_action": fallback_action},
         )
-        return "scheduled"
+        return done("scheduled", action_id, sched_at, error="call_dispatch_failed")
 
 
 # ── Call-outcome WhatsApp fallback ─────────────────────────────────────────
@@ -926,7 +1035,7 @@ async def handle_call_outcome_whatsapp_fallback(
         # Check if a pending whatsapp_fallback_on_outcome action exists for this phone
         actions = await get_automation_actions(phone=phone, limit=20)
         fallback_action = None
-        for a in actions:
+        for a in reversed(actions):
             if a.get("action_type") == "whatsapp_fallback_on_outcome" and a.get("status") == "pending":
                 fallback_action = a
                 break
@@ -941,20 +1050,13 @@ async def handle_call_outcome_whatsapp_fallback(
             pass
 
         rule = payload.get("rule") or {}
-        fa = payload.get("fallback_action") or ""
+        fa = payload.get("fallback_action") or "call_then_whatsapp_on_failure"
         outcome_norm = outcome.strip().lower()
 
         should_send = False
-        template_key = ""
 
         if fa == "call_then_whatsapp_always":
             should_send = True
-            if outcome_norm in ("no_answer", "voicemail"):
-                template_key = "missed_call_template"
-            elif outcome_norm == "busy":
-                template_key = "missed_call_template"
-            else:
-                template_key = "no_response_followup_template"
         elif fa == "call_then_whatsapp_on_failure":
             if outcome_norm in WA_FALLBACK_OUTCOMES:
                 should_send = True
@@ -963,34 +1065,18 @@ async def handle_call_outcome_whatsapp_fallback(
             elif outcome_norm == "busy" and rule.get("send_on_busy"):
                 should_send = True
 
-            if outcome_norm in ("no_answer", "voicemail"):
-                template_key = "missed_call_template"
-            elif outcome_norm == "busy":
-                template_key = "missed_call_template"
-            else:
-                template_key = "no_response_followup_template"
-
         if not should_send:
-            await update_automation_action_status(fallback_action["id"], "completed", {"skipped": "outcome_not_triggering"})
+            await update_automation_action_status(fallback_action["id"], "skipped", {"skipped": "outcome_not_triggering", "outcome": outcome_norm}, "outcome_not_triggering")
             return {"sent": False, "reason": "outcome_not_triggering"}
 
-        fallback_template = (
-            await resolve_wa_template(rule.get("fallback_whatsapp_template") or "")
-            or await _get_wa_setting(template_key)
-            or ""
-        )
-        if not fallback_template:
-            await update_automation_action_status(fallback_action["id"], "failed", {}, "No fallback template configured")
-            return {"sent": False, "reason": "no_fallback_template"}
+        selected_template = rule.get("fallback_whatsapp_template") or rule.get("whatsapp_template") or "missed_call_template"
+        fallback_template = await resolve_wa_template(selected_template)
 
         language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
         lead_name = (contact or {}).get("lead_name") or "there"
-        wa_result = await send_whatsapp_template(
-            phone, fallback_template, language,
-            [lead_name],
-            event_type="call_fallback",
-            source_type="call_log",
-            source_id=call_log_id,
+        wa_result = await _send_rule_whatsapp(
+            phone, "call_fallback", fallback_action["id"],
+            selected_template, fallback_template, language, [lead_name],
         )
         status = "completed" if wa_result["success"] else "failed"
         await update_automation_action_status(fallback_action["id"], status, wa_result, wa_result.get("error") or "")
@@ -1007,8 +1093,15 @@ async def run_due_automation_actions() -> dict:
     now = datetime.now().isoformat()
     try:
         db = await _db()._adb()
-        result = await db.table("automation_actions").select("*").eq("status", "pending").lte("scheduled_at", now).limit(20).execute()
-        due = result.data or []
+        pending = await db.table("automation_actions").select("*").eq("status", "pending").lte("scheduled_at", now).limit(20).execute()
+        waiting = await db.table("automation_actions").select("*").eq("status", "waiting_schedule").lte("scheduled_at", now).limit(20).execute()
+        seen = set()
+        due = []
+        for row in (pending.data or []) + (waiting.data or []):
+            rid = row.get("id")
+            if rid not in seen:
+                seen.add(rid)
+                due.append(row)
     except Exception as exc:
         logger.debug("run_due_automation_actions fetch failed: %s", exc)
         return {"processed": 0, "error": str(exc)}
@@ -1053,7 +1146,7 @@ async def run_due_automation_actions() -> dict:
                 await update_automation_action_status(action_id, status, wa_result, wa_result.get("error") or "")
 
             else:
-                await update_automation_action_status(action_id, "completed", {"skipped": f"unhandled type: {action_type}"})
+                await update_automation_action_status(action_id, "skipped", {"skipped": f"unhandled type: {action_type}"}, f"unhandled type: {action_type}")
 
             processed += 1
         except Exception as exc:
@@ -1861,19 +1954,11 @@ async def _promote_waiting_for_reply_calls(phone: str) -> int:
 
     Returns the number of rows promoted.
     """
-    try:
-        db = await _db()._adb()
-        result = await db.table("automation_actions") \
-            .select("*") \
-            .eq("phone_number", phone) \
-            .eq("action_type", "waiting_for_whatsapp_reply") \
-            .eq("status", "waiting_schedule") \
-            .limit(20) \
-            .execute()
-        rows = result.data or []
-    except Exception as exc:
-        logger.debug("promote_waiting_for_reply_calls fetch failed: %s", exc)
-        return 0
+    rows = [
+        row for row in await get_automation_actions(phone=phone, limit=20)
+        if row.get("action_type") == "waiting_for_whatsapp_reply"
+        and row.get("status") == "waiting_schedule"
+    ]
 
     if not rows:
         return 0
@@ -1883,11 +1968,15 @@ async def _promote_waiting_for_reply_calls(phone: str) -> int:
     for row in rows:
         action_id = row.get("id", "")
         try:
-            payload = {}
-            try:
-                payload = _json.loads(row.get("payload") or "{}")
-            except Exception:
-                pass
+            raw_payload = row.get("payload") or {}
+            if isinstance(raw_payload, dict):
+                payload = raw_payload
+            else:
+                payload = {}
+                try:
+                    payload = _json.loads(raw_payload or "{}")
+                except Exception:
+                    pass
             contact = {k: payload.get(k, "") for k in ("phone", "lead_name", "business_name", "service_type")}
             contact["phone"] = phone
             call_type = payload.get("call_type") or "welcome_call"

@@ -1399,7 +1399,7 @@ async def api_get_automation_actions(status: Optional[str] = None, phone: Option
 
 @app.patch("/api/automation/actions/{action_id}/status")
 async def api_update_action_status(action_id: str, req: StatusRequest):
-    allowed = {"pending", "running", "completed", "failed", "cancelled", "waiting_schedule"}
+    allowed = {"pending", "running", "completed", "failed", "cancelled", "waiting_schedule", "skipped"}
     if req.status not in allowed:
         raise HTTPException(400, f"status must be one of: {', '.join(sorted(allowed))}")
     ok = await update_automation_action_status(action_id, req.status)
@@ -1469,8 +1469,15 @@ async def api_incoming_lead(req: LeadIncomingRequest):
         "phone": phone,
         "contact_status": contact_status,
         "event_type": event_type,
+        "automation": automation_result,
         "automation_action": automation_result.get("action"),
         "automation_status": automation_result.get("automation_status"),
+        "automation_event_type": automation_result.get("automation_event_type"),
+        "matched_rule_key": automation_result.get("matched_rule_key"),
+        "matched_rule_enabled": automation_result.get("matched_rule_enabled"),
+        "selected_action": automation_result.get("selected_action"),
+        "queue_action_id": automation_result.get("queue_action_id"),
+        "skip_reason": automation_result.get("skip_reason"),
         "scheduled_action_id": automation_result.get("scheduled_action_id"),
         "whatsapp_status": automation_result.get("whatsapp_status"),
         "call_status": automation_result.get("call_status"),
@@ -1791,6 +1798,7 @@ async def _import_leads(leads: list, import_source: str = "api", upload_batch_id
     """
     inserted = duplicates = skipped = failed = 0
     errors = []
+    processed_leads = []
     for idx, lead in enumerate(leads, start=1):
         if not isinstance(lead, dict):
             skipped += 1
@@ -1804,6 +1812,7 @@ async def _import_leads(leads: list, import_source: str = "api", upload_batch_id
         try:
             result = await upsert_crm_lead(lead, import_source=import_source, upload_batch_id=upload_batch_id)
             status = result.get("status")
+            processed_leads.append({"lead": lead, "contact_status": status})
             if status == "inserted":
                 inserted += 1
             elif status == "duplicate":
@@ -1829,7 +1838,37 @@ async def _import_leads(leads: list, import_source: str = "api", upload_batch_id
         "updated": duplicates,
         "failed": failed,
         "errors": errors,
+        "_processed_leads": processed_leads,
     }
+
+
+async def _run_lead_automation_for_imports(processed_leads: list, default_source: str) -> list:
+    results = []
+    for item in processed_leads or []:
+        lead = item.get("lead") or {}
+        try:
+            phone = normalize_phone(lead.get("phone_number") or lead.get("phone") or "")
+        except Exception as exc:
+            results.append({
+                "phone": lead.get("phone_number") or lead.get("phone") or "",
+                "automation_status": "skipped",
+                "skip_reason": "invalid_phone",
+                "error": str(exc),
+            })
+            continue
+        source = (lead.get("source") or default_source or "api").strip().lower()
+        contact_status = item.get("contact_status") or ""
+        event_type = "re_enquiry" if contact_status == "duplicate" else source_to_event_type(source)
+        contact = {
+            "phone": phone,
+            "lead_name": lead.get("lead_name") or lead.get("name") or "",
+            "business_name": lead.get("business_name") or "",
+            "service_type": lead.get("service_type") or lead.get("service") or "",
+            "source": source,
+        }
+        result = await execute_automation_rule(event_type, contact)
+        results.append({"phone": phone, "event_type": event_type, **result})
+    return results
 
 
 UPLOAD_COLUMN_ALIASES = {
@@ -1923,14 +1962,13 @@ async def api_add_crm_contact(req: CrmLeadRequest):
             import_source=req.source or "manual",
             forbid_duplicate=True,
         )
-        # Trigger automation for manual lead
         phone = normalize_phone(req.phone_number or "")
-        asyncio.create_task(execute_automation_rule(
+        automation_result = await execute_automation_rule(
             "manual_lead",
             {"phone": phone, "lead_name": req.lead_name or "", "source": req.source or "manual",
              "business_name": req.business_name or "", "service_type": req.service_type or ""},
-        ))
-        return {"success": True, **result, "message": "Lead added"}
+        )
+        return {"success": True, **result, "message": "Lead added", "automation": automation_result}
     except DuplicateContactError as exc:
         # 409 Conflict so the Add-Lead UI shows a friendly error instead of
         # silently merging on top of an existing CRM record.
@@ -1948,7 +1986,10 @@ async def api_add_crm_contact(req: CrmLeadRequest):
 
 @app.post("/api/crm/import-leads")
 async def api_import_crm_leads(req: CrmBulkImportRequest):
-    return await _import_leads(req.leads or [], import_source=req.import_source or "api")
+    result = await _import_leads(req.leads or [], import_source=req.import_source or "api")
+    processed = result.pop("_processed_leads", [])
+    result["automation_results"] = await _run_lead_automation_for_imports(processed, req.import_source or "api")
+    return result
 
 
 @app.post("/api/crm/upload-leads")
@@ -1976,23 +2017,9 @@ async def api_upload_crm_leads(file: UploadFile = File(...)):
             raise HTTPException(400, "Required column missing: phone (aliases: phone_number, mobile, contact_number)")
 
         result = await _import_leads(rows, import_source="file_upload", upload_batch_id=upload_batch_id)
-        # Trigger automation for each successfully inserted uploaded lead
-        async def _trigger_upload_automation(rows_: list) -> None:
-            for row_ in rows_:
-                try:
-                    ph_ = normalize_phone(row_.get("phone_number") or row_.get("phone") or "")
-                    if ph_:
-                        await execute_automation_rule(
-                            "uploaded_lead",
-                            {"phone": ph_, "lead_name": row_.get("lead_name") or "",
-                             "source": row_.get("source") or "file_upload",
-                             "business_name": row_.get("business_name") or "",
-                             "service_type": row_.get("service_type") or ""},
-                        )
-                except Exception:
-                    pass
-        asyncio.create_task(_trigger_upload_automation(rows))
-        return {**result, "upload_batch_id": upload_batch_id}
+        processed = result.pop("_processed_leads", [])
+        automation_results = await _run_lead_automation_for_imports(processed, "file_upload")
+        return {**result, "upload_batch_id": upload_batch_id, "automation_results": automation_results}
     except HTTPException:
         raise
     except Exception as exc:
