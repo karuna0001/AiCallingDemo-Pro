@@ -464,6 +464,14 @@
 </div>
 </section>
 
+<!-- Shared modal container used by CRM lead detail, batch monitor, etc. -->
+<div id="modal-backdrop" class="modal-backdrop" onclick="if(event.target===this)closeModal()">
+  <div class="modal-panel">
+    <button type="button" class="modal-close" onclick="closeModal()" aria-label="Close">×</button>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
 <script>
 const $=id=>document.getElementById(id);
 const api=(p,o)=>fetch(p,o).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok){if(r.status===401&&p!=='/api/auth/me')showLogin('Session expired. Please login again.');const msg=(typeof j.detail==='object'&&j.detail!==null)?j.detail.message||JSON.stringify(j.detail):j.detail||j.error||JSON.stringify(j);throw Object.assign(new Error(msg),{detail:j.detail,data:j})}return j});
@@ -688,8 +696,8 @@ async function uploadLeads(){const f=$('lead-upload-file').files[0];if(!f){toast
 function exportCrmLeads(format){window.location.href='/api/crm/export/leads.'+format+'?'+crmFilterParams().toString()}
 async function callOneLead(phone){try{await api('/api/crm/call-selected',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phones:[phone]})});toast('Calling started')}catch(e){toast(e.message||'Call failed','err')}}
 // ── CRM modal plumbing ──────────────────────────────────────────────────────
-function showModal(html){$('modal-body').innerHTML=html;$('modal-backdrop').classList.add('open')}
-function closeModal(){$('modal-backdrop').classList.remove('open');$('modal-body').innerHTML=''}
+function showModal(html){const body=$('modal-body'),back=$('modal-backdrop');if(!body||!back){console.warn('showModal: missing #modal-body or #modal-backdrop in DOM');toast('Modal container missing','err');return}body.innerHTML=html;back.classList.add('open')}
+function closeModal(){const body=$('modal-body'),back=$('modal-backdrop');if(back)back.classList.remove('open');if(body)body.innerHTML=''}
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()});
 async function fetchLeadDetail(phoneEnc){return api('/api/crm/contacts/'+phoneEnc)}
 window.quickStatusChange=async(phoneEnc,status)=>{if(!status)return;try{await api('/api/crm/contacts/'+phoneEnc+'/status',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({crm_status:status})});toast('Status updated');loadCRM()}catch(e){toast(e.message||'Update failed','err')}};
