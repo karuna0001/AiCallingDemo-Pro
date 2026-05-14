@@ -501,7 +501,16 @@ async def get_whatsapp_logs(phone: Optional[str] = None, limit: int = 50) -> lis
 # ── Automation Rules ───────────────────────────────────────────────────────
 
 async def get_automation_rules() -> list:
-    raw = await _db().get_setting(_AUTOMATION_RULES_KEY, "")
+    raw = ""
+    try:
+        db = await _db()._adb()
+        result = await db.table("settings").select("value").eq("key", _AUTOMATION_RULES_KEY).maybe_single().execute()
+        if result and result.data and result.data.get("value"):
+            raw = result.data["value"]
+    except Exception as exc:
+        logger.debug("Automation rules DB read failed: %s", exc)
+    if not raw:
+        raw = os.getenv(_AUTOMATION_RULES_KEY, "")
     if raw:
         try:
             import json as _json
@@ -518,21 +527,45 @@ async def save_automation_rules(rules: list) -> None:
     await _db().set_setting(_AUTOMATION_RULES_KEY, _json.dumps(rules))
 
 
+def _is_enabled_rule(rule: dict) -> bool:
+    val = rule.get("enabled")
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on", "enabled", "y", "t")
+    return bool(val)
+
+
+def _find_disabled_automation_rule(rules: list, event_type: str, source: Optional[str] = None) -> Optional[dict]:
+    if source:
+        for r in rules:
+            if r.get("event_type") == event_type and r.get("source") == source and not _is_enabled_rule(r):
+                return r
+    for r in rules:
+        if r.get("event_type") == event_type and r.get("source") == "all" and not _is_enabled_rule(r):
+            return r
+    if event_type != "new_lead":
+        for r in rules:
+            if r.get("event_type") == "new_lead" and r.get("source") == "all" and not _is_enabled_rule(r):
+                return r
+    return None
+
+
 def find_automation_rule(rules: list, event_type: str, source: Optional[str] = None) -> Optional[dict]:
     """Priority: exact event+source > event+all > new_lead+all > None."""
     # 1. Exact match
     if source:
         for r in rules:
-            if r.get("event_type") == event_type and r.get("source") == source and r.get("enabled"):
+            if r.get("event_type") == event_type and r.get("source") == source and _is_enabled_rule(r):
                 return r
     # 2. event_type + source=all
     for r in rules:
-        if r.get("event_type") == event_type and r.get("source") == "all" and r.get("enabled"):
+        if r.get("event_type") == event_type and r.get("source") == "all" and _is_enabled_rule(r):
             return r
     # 3. new_lead + source=all as generic fallback
     if event_type != "new_lead":
         for r in rules:
-            if r.get("event_type") == "new_lead" and r.get("source") == "all" and r.get("enabled"):
+            if r.get("event_type") == "new_lead" and r.get("source") == "all" and _is_enabled_rule(r):
                 return r
     return None
 
@@ -654,6 +687,16 @@ async def execute_automation_rule(
     rules = await get_automation_rules()
     rule = find_automation_rule(rules, event_type, source)
     if not rule:
+        disabled_rule = _find_disabled_automation_rule(rules, event_type, source)
+        if disabled_rule:
+            matched_event = disabled_rule.get("event_type", "")
+            matched_source = disabled_rule.get("source", "")
+            logger.info(
+                "Automation skipped for phone=%s event=%s source=%s: matching rule is disabled (rule_event=%s rule_source=%s action=%s)",
+                phone, event_type, source, matched_event, matched_source, disabled_rule.get("action", ""),
+            )
+            return {"action": disabled_rule.get("action", "manual_only"), "automation_status": "rule_disabled", "whatsapp_status": None, "call_status": None, "scheduled_action_id": None}
+        logger.info("Automation skipped for phone=%s event=%s source=%s: no matching enabled rule", phone, event_type, source)
         return {"action": "manual_only", "automation_status": "no_matching_rule", "whatsapp_status": None, "call_status": None, "scheduled_action_id": None}
 
     action = rule.get("action", "manual_only")
