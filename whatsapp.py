@@ -657,7 +657,10 @@ async def execute_automation_rule(
         return {"action": "manual_only", "automation_status": "no_matching_rule", "whatsapp_status": None, "call_status": None, "scheduled_action_id": None}
 
     action = rule.get("action", "manual_only")
-    template = await resolve_wa_template(rule.get("whatsapp_template", "") or "")
+    selected_template = rule.get("whatsapp_template", "") or ""
+    if action == "whatsapp_only" and rule.get("event_type") == "new_lead" and not selected_template:
+        selected_template = "welcome_template"
+    template = await resolve_wa_template(selected_template)
     language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
     lead_name = contact.get("lead_name") or "there"
     business_name = contact.get("business_name") or ""
@@ -673,9 +676,19 @@ async def execute_automation_rule(
         return {"action": action, "automation_status": "manual_only", "whatsapp_status": None, "call_status": None, "scheduled_action_id": None}
 
     elif action == "whatsapp_only":
+        params = _build_template_params(lead_name, business_name, service_type, context)
+        if not template:
+            if selected_template in {k for k, _ in WA_TEMPLATE_PURPOSES}:
+                err = f"WhatsApp template purpose slot '{selected_template}' is not configured"
+            else:
+                err = "WhatsApp template is not configured for this automation rule"
+            await _log_wa(
+                phone, event_type, selected_template, language, params,
+                "failed", None, err, "automation", event_type,
+            )
+            return {"action": action, "automation_status": "failed", "whatsapp_status": "template_missing", "call_status": None, "scheduled_action_id": None}
         wa_result = await send_whatsapp_template(
-            phone, template, language,
-            _build_template_params(lead_name, business_name, service_type, context),
+            phone, template, language, params,
             event_type=event_type, source_type="automation", source_id=event_type,
         )
         return {"action": action, "automation_status": "executed", "whatsapp_status": wa_result.get("reason") or ("sent" if wa_result["success"] else "failed"), "call_status": None, "scheduled_action_id": None}
@@ -1010,7 +1023,7 @@ async def run_due_automation_actions() -> dict:
 # ── Confirmation helpers ───────────────────────────────────────────────────
 
 async def send_callback_confirmation(phone: str, context: Optional[dict] = None) -> dict:
-    template = await _get_wa_setting("WHATSAPP_CALLBACK_TEMPLATE") or ""
+    template = await resolve_wa_template("callback_confirmation_template")
     language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
     lead_name = (context or {}).get("lead_name") or "there"
     params = _build_template_params(lead_name, (context or {}).get("business_name", ""), (context or {}).get("service_type", ""), context)
@@ -1023,7 +1036,7 @@ async def send_callback_confirmation(phone: str, context: Optional[dict] = None)
 
 
 async def send_appointment_confirmation(phone: str, context: Optional[dict] = None) -> dict:
-    template = await _get_wa_setting("WHATSAPP_APPOINTMENT_TEMPLATE") or ""
+    template = await resolve_wa_template("appointment_confirmation_template")
     language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
     lead_name = (context or {}).get("lead_name") or "there"
     params = _build_template_params(lead_name, (context or {}).get("business_name", ""), (context or {}).get("service_type", ""), context)
@@ -1036,7 +1049,8 @@ async def send_appointment_confirmation(phone: str, context: Optional[dict] = No
 
 
 async def send_showroom_visit_confirmation(phone: str, context: Optional[dict] = None) -> dict:
-    template = await _get_wa_setting("WHATSAPP_SHOWROOM_VISIT_TEMPLATE") or ""
+    # Showroom visit reuses the appointment confirmation slot (single confirmation template covers both).
+    template = await resolve_wa_template("appointment_confirmation_template")
     language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
     lead_name = (context or {}).get("lead_name") or "there"
     params = _build_template_params(lead_name, (context or {}).get("business_name", ""), (context or {}).get("service_type", ""), context)
@@ -1706,6 +1720,158 @@ def _parse_meta_webhook_messages(payload: dict) -> list:
     return results
 
 
+# ── Inbound intent detection (Fix 2) ───────────────────────────────────────
+
+_CALLBACK_INTENT_PATTERNS = (
+    "call me", "callback", "call back", "please call", "kindly call",
+    "ring me", "phone me", "give me a call", "call now",
+)
+_APPOINTMENT_INTENT_PATTERNS = (
+    "appointment", "meeting", "book demo", "schedule demo", "book a demo",
+    "schedule a demo", "demo", "google meet", "zoom", "showroom visit",
+    "showroom", "book a slot", "book slot", "book a meeting",
+)
+
+
+def _detect_inbound_intent(text: str) -> Optional[str]:
+    """Keyword-based intent detection for inbound WhatsApp messages.
+
+    Returns 'callback', 'appointment', or None.
+    Callback patterns take priority over appointment when both match.
+    """
+    if not text:
+        return None
+    lower = text.lower()
+    for pat in _CALLBACK_INTENT_PATTERNS:
+        if pat in lower:
+            return "callback"
+    for pat in _APPOINTMENT_INTENT_PATTERNS:
+        if pat in lower:
+            return "appointment"
+    return None
+
+
+async def _handle_inbound_intent(phone: str, intent: str, conv: dict) -> bool:
+    """Dispatch (or schedule) a call for the detected intent and optionally
+    send the matching confirmation template.
+
+    Always tries to create a call action: immediately if outbound window is
+    open, otherwise queued for the next allowed time (handled inside
+    _schedule_or_start_call).
+
+    Returns True if a confirmation template was successfully sent — in that
+    case the caller should skip the AI free-form reply to avoid double-replying.
+    """
+    if intent not in ("callback", "appointment"):
+        return False
+    lead_name = conv.get("contact_name") or "there"
+    if intent == "callback":
+        event_type = "callback_scheduled"
+        call_type = "callback_call"
+        slot = "callback_confirmation_template"
+    else:
+        event_type = "appointment_confirmed"
+        call_type = "appointment_confirmation"
+        slot = "appointment_confirmation_template"
+
+    contact = {
+        "phone": phone,
+        "lead_name": lead_name,
+        "business_name": "",
+        "service_type": "",
+        "source": "whatsapp_inbound",
+    }
+
+    # Dispatch or schedule a call (respects outbound window inside the helper).
+    try:
+        call_status = await _schedule_or_start_call(
+            phone, contact, call_type, event_type, "whatsapp_inbound",
+            delay_minutes=0, rule=None,
+        )
+        logger.info("Inbound %s intent for %s → call_status=%s", intent, phone, call_status)
+    except Exception as exc:
+        logger.error("Inbound intent call dispatch failed for %s: %s", phone, exc)
+
+    # Send confirmation template if configured for this slot.
+    template = await resolve_wa_template(slot)
+    if not template:
+        return False
+    language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
+    params = _build_template_params(lead_name, "", "", None)
+    try:
+        result = await send_whatsapp_template(
+            phone, template, language, params,
+            event_type=event_type, source_type="whatsapp_intent",
+            source_id=conv.get("id", "") or phone,
+        )
+        return bool(result.get("success"))
+    except Exception as exc:
+        logger.error("Inbound intent template send failed for %s: %s", phone, exc)
+        return False
+
+
+async def _promote_waiting_for_reply_calls(phone: str) -> int:
+    """Fix 3: When the customer replies on WhatsApp, promote any queued
+    ``waiting_for_whatsapp_reply`` rows for this phone into actual call
+    dispatches via _schedule_or_start_call (immediate if outbound window
+    is open, otherwise queued for the next allowed time).
+
+    Returns the number of rows promoted.
+    """
+    try:
+        db = await _db()._adb()
+        result = await db.table("automation_actions") \
+            .select("*") \
+            .eq("phone_number", phone) \
+            .eq("action_type", "waiting_for_whatsapp_reply") \
+            .eq("status", "waiting_schedule") \
+            .limit(20) \
+            .execute()
+        rows = result.data or []
+    except Exception as exc:
+        logger.debug("promote_waiting_for_reply_calls fetch failed: %s", exc)
+        return 0
+
+    if not rows:
+        return 0
+
+    promoted = 0
+    import json as _json
+    for row in rows:
+        action_id = row.get("id", "")
+        try:
+            payload = {}
+            try:
+                payload = _json.loads(row.get("payload") or "{}")
+            except Exception:
+                pass
+            contact = {k: payload.get(k, "") for k in ("phone", "lead_name", "business_name", "service_type")}
+            contact["phone"] = phone
+            call_type = payload.get("call_type") or "welcome_call"
+            event_type = row.get("event_type") or ""
+            source = row.get("source") or ""
+            rule = payload.get("rule") or {}
+
+            call_status = await _schedule_or_start_call(
+                phone, contact, call_type, event_type, source,
+                delay_minutes=0, rule=rule,
+            )
+            await update_automation_action_status(
+                action_id, "completed",
+                {"promoted_by_inbound_reply": True, "call_status": call_status},
+            )
+            promoted += 1
+            logger.info("Promoted waiting_for_whatsapp_reply action %s for %s → %s", action_id, phone, call_status)
+        except Exception as exc:
+            logger.error("Failed to promote action %s: %s", action_id, exc)
+            try:
+                await update_automation_action_status(action_id, "failed", {}, str(exc)[:500])
+            except Exception:
+                pass
+
+    return promoted
+
+
 # ── Main inbound message handler ───────────────────────────────────────────
 
 async def handle_inbound_whatsapp_message(parsed: dict) -> None:
@@ -1779,6 +1945,14 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
         logger.info("Opt-out detected for %s", phone)
         return
 
+    # Fix 3: Promote any waiting_for_whatsapp_reply rows for this phone
+    # (runs regardless of ai_enabled — the call was already queued by the admin's rule).
+    try:
+        promoted = await _promote_waiting_for_reply_calls(phone)
+    except Exception as exc:
+        logger.warning("promote_waiting_for_reply_calls failed for %s: %s", phone, exc)
+        promoted = 0
+
     # AI auto-reply
     ai_enabled = conv.get("ai_enabled", True)
     if not ai_enabled:
@@ -1787,6 +1961,20 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
     # Only reply to text/button/interactive messages
     if msg_type not in ("text", "button", "interactive"):
         return
+
+    # Fix 2: Intent detection (skip if we already promoted a waiting call
+    # for this phone — that call covers the customer's request).
+    if promoted == 0:
+        intent = _detect_inbound_intent(text)
+        if intent:
+            try:
+                template_sent = await _handle_inbound_intent(phone, intent, conv)
+            except Exception as exc:
+                logger.error("Inbound intent handling failed for %s: %s", phone, exc)
+                template_sent = False
+            if template_sent:
+                # Confirmation template already sent — don't double-reply with AI.
+                return
 
     # Check 24h window
     window_open = await is_whatsapp_service_window_open(phone)
