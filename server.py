@@ -69,7 +69,7 @@ from whatsapp import (
     WA_SETTINGS_KEYS, AUTOMATION_EVENT_TYPES, AUTOMATION_ACTION_TYPES,
     get_wa_settings_masked, save_wa_settings, get_wa_health,
     send_whatsapp_template, get_whatsapp_logs,
-    get_automation_rules, save_automation_rules, find_automation_rule, source_to_event_type,
+    get_automation_rules, get_automation_rules_with_source, save_automation_rules, find_automation_rule, source_to_event_type,
     execute_automation_rule,
     insert_automation_action, get_automation_actions, update_automation_action_status,
     run_due_automation_actions,
@@ -1343,15 +1343,20 @@ async def api_wa_conv_send_template(conv_id: str, req: WaConvTemplateRequest):
 
 @app.get("/api/automation/rules")
 async def api_get_automation_rules():
-    return {"rules": await get_automation_rules(), "event_types": AUTOMATION_EVENT_TYPES, "action_types": AUTOMATION_ACTION_TYPES}
+    rules, source = await get_automation_rules_with_source()
+    return {"rules": rules, "rules_source": source, "event_types": AUTOMATION_EVENT_TYPES, "action_types": AUTOMATION_ACTION_TYPES}
 
 
 @app.post("/api/automation/rules")
 async def api_save_automation_rules(req: AutomationRulesRequest):
     if not isinstance(req.rules, list):
         raise HTTPException(400, "rules must be a list")
+    enabled_count = sum(1 for r in req.rules if isinstance(r, dict) and bool(r.get("enabled")))
+    logger.info("Saving automation rules: count=%s enabled=%s", len(req.rules), enabled_count)
     await save_automation_rules(req.rules)
-    return {"status": "saved", "count": len(req.rules)}
+    saved_rules, source = await get_automation_rules_with_source()
+    logger.info("Saved automation rules loaded from %s: count=%s enabled=%s", source, len(saved_rules), sum(1 for r in saved_rules if isinstance(r, dict) and bool(r.get("enabled"))))
+    return {"status": "saved", "count": len(saved_rules), "enabled_count": sum(1 for r in saved_rules if isinstance(r, dict) and bool(r.get("enabled"))), "rules_source": source, "rules": saved_rules}
 
 
 @app.post("/api/automation/rules/reset")
@@ -1359,7 +1364,8 @@ async def api_reset_automation_rules():
     from whatsapp import _default_automation_rules
     default = _default_automation_rules()
     await save_automation_rules(default)
-    return {"status": "reset", "count": len(default)}
+    saved_rules, source = await get_automation_rules_with_source()
+    return {"status": "reset", "count": len(saved_rules), "rules_source": source, "rules": saved_rules}
 
 
 @app.post("/api/automation/test")

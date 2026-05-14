@@ -500,26 +500,35 @@ async def get_whatsapp_logs(phone: Optional[str] = None, limit: int = 50) -> lis
 
 # ── Automation Rules ───────────────────────────────────────────────────────
 
-async def get_automation_rules() -> list:
+async def get_automation_rules_with_source() -> tuple[list, str]:
     raw = ""
+    source = "default"
     try:
         db = await _db()._adb()
         result = await db.table("settings").select("value").eq("key", _AUTOMATION_RULES_KEY).maybe_single().execute()
         if result and result.data and result.data.get("value"):
             raw = result.data["value"]
+            source = "db"
     except Exception as exc:
         logger.debug("Automation rules DB read failed: %s", exc)
     if not raw:
         raw = os.getenv(_AUTOMATION_RULES_KEY, "")
+        if raw:
+            source = "env"
     if raw:
         try:
             import json as _json
             rules = _json.loads(raw)
             if isinstance(rules, list):
-                return rules
-        except Exception:
-            pass
-    return _default_automation_rules()
+                return rules, source
+        except Exception as exc:
+            logger.warning("Automation rules parse failed from %s: %s", source, exc)
+    return _default_automation_rules(), "default"
+
+
+async def get_automation_rules() -> list:
+    rules, _source = await get_automation_rules_with_source()
+    return rules
 
 
 async def save_automation_rules(rules: list) -> None:
