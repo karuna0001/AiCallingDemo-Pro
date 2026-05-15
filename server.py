@@ -509,6 +509,7 @@ async def api_health():
     whatsapp_chat_prompt = (
         await get_setting("AI_PROMPT_whatsapp_chat", "")
         or await get_setting("AI_PROMPT_whatsapp_chat_prompt", "")
+        or get_default_prompt("whatsapp_chat")
     )
     supabase_configured, supabase_error = await supabase_status(supabase_url, supabase_key)
     response = {
@@ -519,8 +520,8 @@ async def api_health():
         "trunk_configured": bool(trunk_id),
         "gemini_model_configured": bool(gemini_model),
         "gemini_tts_voice_configured": bool(gemini_voice),
-        "prompt_configured": bool(prompt_saved),
-        "prompt_mode": "custom" if prompt_saved else "unknown",
+        "prompt_configured": bool(prompt_saved or PROMPT_TYPES),
+        "prompt_mode": "custom" if prompt_saved else "default",
         "whatsapp_ai_provider": "gemini",
         "whatsapp_gemini_model": whatsapp_gemini_model,
         "whatsapp_gemini_model_configured": bool(whatsapp_gemini_model),
