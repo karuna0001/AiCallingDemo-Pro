@@ -79,6 +79,7 @@ from whatsapp import (
     get_conversations, get_conversation_by_id, get_messages, patch_conversation,
     save_wa_message, send_whatsapp_text, is_whatsapp_service_window_open,
     get_or_create_conversation, update_conversation_last_message,
+    soft_delete_whatsapp_message, soft_delete_whatsapp_conversation,
     parse_webhook_messages, handle_inbound_whatsapp_message,
     fetch_whatsapp_media,
     get_whatsapp_gemini_model,
@@ -1256,6 +1257,22 @@ async def api_wa_conversation_messages(
 ):
     msgs = await get_messages(conv_id, limit=limit, offset=offset)
     return {"messages": msgs}
+
+
+@app.delete("/api/whatsapp/messages/{message_id}")
+async def api_wa_soft_delete_message(message_id: str):
+    ok = await soft_delete_whatsapp_message(message_id, deleted_by="dashboard")
+    if not ok:
+        raise HTTPException(404, "Message not found")
+    return {"success": True, "message": "Message deleted"}
+
+
+@app.delete("/api/whatsapp/conversations/{conv_id}")
+async def api_wa_soft_delete_conversation(conv_id: str):
+    ok = await soft_delete_whatsapp_conversation(conv_id, deleted_by="dashboard")
+    if not ok:
+        raise HTTPException(404, "Conversation not found")
+    return {"success": True, "message": "Conversation deleted"}
 
 
 @app.get("/api/whatsapp/media/{media_id}")

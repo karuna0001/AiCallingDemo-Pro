@@ -159,6 +159,10 @@ ALTER TABLE whatsapp_conversations DISABLE ROW LEVEL SECURITY;
 CREATE INDEX IF NOT EXISTS idx_wa_conv_phone ON whatsapp_conversations(phone_number);
 CREATE INDEX IF NOT EXISTS idx_wa_conv_last_msg ON whatsapp_conversations(last_message_at DESC);
 CREATE INDEX IF NOT EXISTS idx_wa_conv_status ON whatsapp_conversations(status);
+ALTER TABLE whatsapp_conversations ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE whatsapp_conversations ADD COLUMN IF NOT EXISTS deleted_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_conversations ADD COLUMN IF NOT EXISTS deleted_by TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_wa_conv_is_deleted ON whatsapp_conversations(is_deleted);
 
 CREATE TABLE IF NOT EXISTS whatsapp_messages (
     id TEXT PRIMARY KEY,
@@ -190,6 +194,10 @@ ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS media_id TEXT NOT NULL DE
 ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS mime_type TEXT NOT NULL DEFAULT '';
 ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS file_name TEXT NOT NULL DEFAULT '';
 ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS caption TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS deleted_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS deleted_by TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_wa_msg_is_deleted ON whatsapp_messages(is_deleted);
 
 -- ── Phase 7: Automation Actions Queue ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS automation_actions (

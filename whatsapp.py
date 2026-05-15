@@ -1482,6 +1482,18 @@ async def get_or_create_conversation(phone: str, contact_name: str = "") -> dict
         rows = res.data or []
         if rows:
             conv = rows[0]
+            if conv.get("is_deleted"):
+                updates = {
+                    "is_deleted": False,
+                    "deleted_at": "",
+                    "deleted_by": "",
+                    "status": "open",
+                    "updated_at": datetime.now().isoformat(),
+                }
+                if contact_name and not conv.get("contact_name"):
+                    updates["contact_name"] = contact_name
+                await db.table("whatsapp_conversations").update(updates).eq("id", conv["id"]).execute()
+                conv.update(updates)
             # Refresh contact_name if we now have one
             if contact_name and not conv.get("contact_name"):
                 await db.table("whatsapp_conversations") \
@@ -1558,7 +1570,7 @@ async def get_conversations(
 ) -> list:
     try:
         db = await _db()._adb()
-        q = db.table("whatsapp_conversations").select("*").order("last_message_at", desc=True).limit(limit).offset(offset)
+        q = db.table("whatsapp_conversations").select("*").eq("is_deleted", False).order("last_message_at", desc=True).limit(limit).offset(offset)
         if status and status != "all":
             q = q.eq("status", status)
         if ai_enabled is not None:
@@ -1575,7 +1587,7 @@ async def get_conversations(
 async def get_conversation_by_id(conv_id: str) -> Optional[dict]:
     try:
         db = await _db()._adb()
-        res = await db.table("whatsapp_conversations").select("*").eq("id", conv_id).execute()
+        res = await db.table("whatsapp_conversations").select("*").eq("id", conv_id).eq("is_deleted", False).execute()
         rows = res.data or []
         return rows[0] if rows else None
     except Exception as exc:
@@ -1704,6 +1716,7 @@ async def get_messages(conv_id: str, limit: int = 50, offset: int = 0) -> list:
         res = await db.table("whatsapp_messages") \
             .select("*") \
             .eq("conversation_id", conv_id) \
+            .eq("is_deleted", False) \
             .order("created_at", desc=False) \
             .limit(limit) \
             .offset(offset) \
@@ -1712,6 +1725,46 @@ async def get_messages(conv_id: str, limit: int = 50, offset: int = 0) -> list:
     except Exception as exc:
         logger.error("get_messages error: %s", exc)
         return []
+
+
+async def soft_delete_whatsapp_message(message_id: str, deleted_by: str = "dashboard") -> bool:
+    try:
+        db = await _db()._adb()
+        now = datetime.now().isoformat()
+        res = await db.table("whatsapp_messages").update({
+            "is_deleted": True,
+            "deleted_at": now,
+            "deleted_by": deleted_by or "dashboard",
+        }).eq("id", message_id).execute()
+        ok = bool(getattr(res, "data", None))
+        await _db().log_error("whatsapp_inbox", "whatsapp_message_soft_deleted", f"message_id={message_id} deleted_by={deleted_by}", "info")
+        return ok
+    except Exception as exc:
+        logger.error("soft_delete_whatsapp_message error: %s", exc)
+        return False
+
+
+async def soft_delete_whatsapp_conversation(conv_id: str, deleted_by: str = "dashboard") -> bool:
+    try:
+        db = await _db()._adb()
+        now = datetime.now().isoformat()
+        conv_res = await db.table("whatsapp_conversations").update({
+            "is_deleted": True,
+            "deleted_at": now,
+            "deleted_by": deleted_by or "dashboard",
+            "updated_at": now,
+        }).eq("id", conv_id).execute()
+        await db.table("whatsapp_messages").update({
+            "is_deleted": True,
+            "deleted_at": now,
+            "deleted_by": deleted_by or "dashboard",
+        }).eq("conversation_id", conv_id).execute()
+        ok = bool(getattr(conv_res, "data", None))
+        await _db().log_error("whatsapp_inbox", "whatsapp_conversation_soft_deleted", f"conversation_id={conv_id} deleted_by={deleted_by}", "info")
+        return ok
+    except Exception as exc:
+        logger.error("soft_delete_whatsapp_conversation error: %s", exc)
+        return False
 
 
 # ── CRM linking ────────────────────────────────────────────────────────────
