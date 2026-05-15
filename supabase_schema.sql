@@ -67,6 +67,32 @@ CREATE TABLE IF NOT EXISTS campaigns (
 ALTER TABLE campaigns DISABLE ROW LEVEL SECURITY;
 
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS calcom_booking_uid TEXT;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS staff_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS staff_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 30;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS buffer_minutes INTEGER NOT NULL DEFAULT 15;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'Asia/Kolkata';
+CREATE INDEX IF NOT EXISTS idx_appointments_staff ON appointments(staff_id);
+CREATE INDEX IF NOT EXISTS idx_appointments_date_time ON appointments(date, time);
+
+CREATE TABLE IF NOT EXISTS appointment_staff (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL DEFAULT '',
+    whatsapp_number TEXT NOT NULL DEFAULT '',
+    calendar_email TEXT NOT NULL DEFAULT '',
+    working_days TEXT NOT NULL DEFAULT '["mon","tue","wed","thu","fri","sat"]',
+    start_time TEXT NOT NULL DEFAULT '09:00',
+    end_time TEXT NOT NULL DEFAULT '18:00',
+    timezone TEXT NOT NULL DEFAULT 'Asia/Kolkata',
+    active BOOLEAN NOT NULL DEFAULT true,
+    round_robin_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+ALTER TABLE appointment_staff DISABLE ROW LEVEL SECURITY;
+CREATE INDEX IF NOT EXISTS idx_appointment_staff_active ON appointment_staff(active);
+CREATE INDEX IF NOT EXISTS idx_appointment_staff_order ON appointment_staff(round_robin_order);
 
 CREATE TABLE IF NOT EXISTS contact_memory (
     id TEXT PRIMARY KEY,

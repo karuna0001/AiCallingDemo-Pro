@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from typing import Optional
 from collections import defaultdict
 
@@ -379,29 +379,255 @@ async def clear_all_test_data() -> dict:
     }
 
 
+APPOINTMENT_SETTING_DEFAULTS = {
+    "demo_duration_minutes": 30,
+    "buffer_minutes": 15,
+    "slot_interval_minutes": 0,
+    "timezone": "Asia/Kolkata",
+    "minimum_notice_minutes": 30,
+    "max_booking_days_ahead": 30,
+}
+
+
+async def get_appointment_settings() -> dict:
+    out = dict(APPOINTMENT_SETTING_DEFAULTS)
+    for key, default in APPOINTMENT_SETTING_DEFAULTS.items():
+        raw = await get_setting(f"APPOINTMENT_{key.upper()}", str(default))
+        if key == "timezone":
+            out[key] = raw or default
+        else:
+            try:
+                out[key] = max(int(raw), 0)
+            except (TypeError, ValueError):
+                out[key] = default
+    if not out["slot_interval_minutes"]:
+        out["slot_interval_minutes"] = out["demo_duration_minutes"] + out["buffer_minutes"]
+    return out
+
+
+async def save_appointment_settings(settings: dict) -> dict:
+    clean = dict(APPOINTMENT_SETTING_DEFAULTS)
+    for key in clean:
+        if key not in settings:
+            continue
+        if key == "timezone":
+            clean[key] = str(settings.get(key) or APPOINTMENT_SETTING_DEFAULTS[key]).strip() or APPOINTMENT_SETTING_DEFAULTS[key]
+        else:
+            try:
+                clean[key] = max(int(settings.get(key)), 0)
+            except (TypeError, ValueError):
+                clean[key] = APPOINTMENT_SETTING_DEFAULTS[key]
+    if not clean["slot_interval_minutes"]:
+        clean["slot_interval_minutes"] = clean["demo_duration_minutes"] + clean["buffer_minutes"]
+    await save_settings({f"APPOINTMENT_{k.upper()}": v for k, v in clean.items()})
+    return clean
+
+
+def _parse_hhmm(value: str) -> dt_time:
+    return datetime.strptime((value or "00:00")[:5], "%H:%M").time()
+
+
+def _appointment_start(row: dict) -> Optional[datetime]:
+    try:
+        return datetime.strptime(f"{row.get('date')} {(row.get('time') or '')[:5]}", "%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+
+
+def _staff_days(staff: dict) -> list:
+    raw = staff.get("working_days") or ""
+    if isinstance(raw, list):
+        return [str(x).lower() for x in raw]
+    try:
+        parsed = _json_mod.loads(raw)
+        if isinstance(parsed, list):
+            return [str(x).lower() for x in parsed]
+    except Exception:
+        pass
+    return [x.strip().lower() for x in str(raw or "").split(",") if x.strip()]
+
+
+def _staff_available_for(staff: dict, start: datetime) -> bool:
+    if not staff.get("active", True):
+        return False
+    days = _staff_days(staff)
+    day_names = {start.strftime("%A").lower(), start.strftime("%a").lower(), str(start.weekday())}
+    if days and not any(day in day_names for day in days):
+        return False
+    start_time = _parse_hhmm(staff.get("start_time") or "09:00")
+    end_time = _parse_hhmm(staff.get("end_time") or "18:00")
+    return start_time <= start.time() < end_time
+
+
+async def get_appointment_staff(include_inactive: bool = True) -> list:
+    try:
+        db = await _adb()
+        q = db.table("appointment_staff").select("*").order("round_robin_order").order("created_at")
+        if not include_inactive:
+            q = q.eq("active", True)
+        result = await q.execute()
+        return result.data or []
+    except Exception as exc:
+        logger.warning("get_appointment_staff failed: %s", exc)
+        return []
+
+
+async def upsert_appointment_staff(data: dict, staff_id: Optional[str] = None) -> dict:
+    db = await _adb()
+    now = datetime.now().isoformat()
+    row = {
+        "id": staff_id or str(uuid.uuid4()),
+        "name": str(data.get("name") or "").strip(),
+        "email": str(data.get("email") or "").strip(),
+        "whatsapp_number": str(data.get("whatsapp_number") or "").strip(),
+        "calendar_email": str(data.get("calendar_email") or "").strip(),
+        "working_days": _json_mod.dumps(data.get("working_days") or ["mon", "tue", "wed", "thu", "fri", "sat"]),
+        "start_time": str(data.get("start_time") or "09:00")[:5],
+        "end_time": str(data.get("end_time") or "18:00")[:5],
+        "timezone": str(data.get("timezone") or "Asia/Kolkata").strip() or "Asia/Kolkata",
+        "active": bool(data.get("active", True)),
+        "round_robin_order": int(data.get("round_robin_order") or 0),
+        "updated_at": now,
+    }
+    if not row["name"]:
+        raise ValueError("Staff name is required")
+    if not staff_id:
+        row["created_at"] = now
+        await db.table("appointment_staff").insert(row).execute()
+    else:
+        await db.table("appointment_staff").update(row).eq("id", staff_id).execute()
+    return row
+
+
+async def deactivate_appointment_staff(staff_id: str) -> bool:
+    db = await _adb()
+    result = await db.table("appointment_staff").update({"active": False, "updated_at": datetime.now().isoformat()}).eq("id", staff_id).execute()
+    return len(result.data or []) > 0
+
+
+async def delete_appointment_staff(staff_id: str) -> dict:
+    db = await _adb()
+    appts = await db.table("appointments").select("id").eq("staff_id", staff_id).limit(1).execute()
+    if appts.data:
+        ok = await deactivate_appointment_staff(staff_id)
+        return {"deleted": False, "deactivated": ok}
+    result = await db.table("appointment_staff").delete().eq("id", staff_id).execute()
+    return {"deleted": len(result.data or []) > 0, "deactivated": False}
+
+
+async def _appointment_conflicts(staff_id: str, start: datetime, settings: dict) -> bool:
+    db = await _adb()
+    rows = (await db.table("appointments").select("*").eq("staff_id", staff_id).eq("status", "booked").execute()).data or []
+    new_end = start + timedelta(minutes=settings["demo_duration_minutes"] + settings["buffer_minutes"])
+    for row in rows:
+        existing_start = _appointment_start(row)
+        if not existing_start:
+            continue
+        duration = int(row.get("duration_minutes") or settings["demo_duration_minutes"])
+        buffer = int(row.get("buffer_minutes") or settings["buffer_minutes"])
+        existing_end = existing_start + timedelta(minutes=duration + buffer)
+        if start < existing_end and existing_start < new_end:
+            return True
+    return False
+
+
+async def _booking_candidate_staff(start: datetime) -> list:
+    settings = await get_appointment_settings()
+    staff = [s for s in await get_appointment_staff(include_inactive=False) if _staff_available_for(s, start)]
+    available = []
+    for person in staff:
+        if not await _appointment_conflicts(person["id"], start, settings):
+            available.append(person)
+    return available
+
+
+async def _select_staff_round_robin(start: datetime) -> Optional[dict]:
+    candidates = await _booking_candidate_staff(start)
+    if not candidates:
+        return None
+    candidates = sorted(candidates, key=lambda s: (int(s.get("round_robin_order") or 0), s.get("created_at") or ""))
+    last_id = await get_setting("APPOINTMENT_LAST_STAFF_ID", "")
+    if last_id:
+        ids = [s["id"] for s in candidates]
+        if last_id in ids:
+            return candidates[(ids.index(last_id) + 1) % len(candidates)]
+    return candidates[0]
+
+
 async def insert_appointment(name: str, phone: str, date: str, time: str, service: str) -> str:
+    settings = await get_appointment_settings()
+    try:
+        start = datetime.strptime(f"{date} {time[:5]}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        raise ValueError("Invalid appointment date or time")
+    now = datetime.now()
+    if start < now + timedelta(minutes=settings["minimum_notice_minutes"]):
+        raise ValueError("Appointment is too soon")
+    if start.date() > (now + timedelta(days=settings["max_booking_days_ahead"])).date():
+        raise ValueError("Appointment is too far ahead")
+    staff = await _select_staff_round_robin(start)
+    if not staff and await get_appointment_staff(include_inactive=True):
+        raise ValueError("No staff available for this slot")
+    if not staff and not await check_slot(date, time):
+        raise ValueError("Slot is unavailable")
     full_id = str(uuid.uuid4())
     db = await _adb()
-    await db.table("appointments").insert({"id": full_id, "name": name, "phone": phone, "date": date, "time": time, "service": service, "status": "booked", "created_at": datetime.now().isoformat()}).execute()
+    row = {
+        "id": full_id,
+        "name": name,
+        "phone": phone,
+        "date": date,
+        "time": time[:5],
+        "service": service,
+        "status": "booked",
+        "staff_id": (staff or {}).get("id", ""),
+        "staff_name": (staff or {}).get("name", ""),
+        "duration_minutes": settings["demo_duration_minutes"],
+        "buffer_minutes": settings["buffer_minutes"],
+        "timezone": settings["timezone"],
+        "created_at": datetime.now().isoformat(),
+    }
+    try:
+        await db.table("appointments").insert(row).execute()
+    except Exception:
+        fallback = {k: row[k] for k in ("id", "name", "phone", "date", "time", "service", "status", "created_at")}
+        await db.table("appointments").insert(fallback).execute()
+    if staff:
+        await set_setting("APPOINTMENT_LAST_STAFF_ID", staff["id"])
     return full_id[:8].upper()
 
 
 async def check_slot(date: str, time: str) -> bool:
+    settings = await get_appointment_settings()
+    try:
+        start = datetime.strptime(f"{date} {time[:5]}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        return False
+    now = datetime.now()
+    if start < now + timedelta(minutes=settings["minimum_notice_minutes"]):
+        return False
+    if start.date() > (now + timedelta(days=settings["max_booking_days_ahead"])).date():
+        return False
+    staff = await get_appointment_staff(include_inactive=True)
+    if staff:
+        return bool(await _booking_candidate_staff(start))
     db = await _adb()
-    result = await db.table("appointments").select("id").eq("date", date).eq("time", time).eq("status", "booked").maybe_single().execute()
+    result = await db.table("appointments").select("id").eq("date", date).eq("time", time[:5]).eq("status", "booked").maybe_single().execute()
     return result.data is None
 
 
 async def get_next_available(date: str, time: str) -> str:
+    settings = await get_appointment_settings()
     try:
-        dt = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
+        dt = datetime.strptime(f"{date} {time[:5]}", "%Y-%m-%d %H:%M")
     except ValueError:
         dt = datetime.now().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    for _ in range(7 * 24):
-        dt += timedelta(hours=1)
-        if 9 <= dt.hour < 18 and await check_slot(dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")):
+    interval = max(settings["slot_interval_minutes"], 5)
+    for _ in range((settings["max_booking_days_ahead"] + 1) * 24 * 12):
+        dt += timedelta(minutes=interval)
+        if await check_slot(dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")):
             return f"{dt.strftime('%Y-%m-%d')} at {dt.strftime('%H:%M')}"
-    return "no open slots found in the next 7 days"
+    return f"no open slots found in the next {settings['max_booking_days_ahead']} days"
 
 
 async def get_all_appointments(date_filter: Optional[str] = None) -> list:

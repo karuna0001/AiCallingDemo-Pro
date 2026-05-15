@@ -38,6 +38,7 @@ ssl.create_default_context = _certifi_ssl
 from db import (
     ConfigError, CRM_TERMINAL_STATUSES, DuplicateContactError,
     cancel_appointment, clear_all_test_data, clear_appointments,
+    delete_appointment_staff, get_appointment_settings, get_appointment_staff,
     clear_call_logs, clear_campaigns, clear_contact_memory, clear_error_logs,
     clear_errors, create_agent_profile, create_campaign, delete_agent_profile,
     delete_campaign, get_agent_profile,
@@ -48,8 +49,9 @@ from db import (
     get_logs, get_recording_storage_stats, get_recordings_for_cleanup,
     get_setting, get_stats, init_db, log_error, mark_recording_deleted,
     normalize_phone, _tz_today, upsert_crm_lead,
-    save_settings, set_default_agent_profile, set_setting,
+    save_appointment_settings, save_settings, set_default_agent_profile, set_setting,
     add_lead_status, delete_lead_status, update_agent_profile, update_call_notes,
+    upsert_appointment_staff,
     update_campaign_contacts, update_campaign_run_stats, update_campaign_status,
     update_crm_contact_followup, update_crm_contact_full, update_crm_contact_notes,
     update_crm_contact_status, delete_crm_contact_by_phone,
@@ -413,6 +415,28 @@ class AutomationTestRequest(BaseModel):
     source: Optional[str] = None
     lead_name: Optional[str] = "Test Lead"
     dry_run: bool = True
+
+
+class AppointmentSettingsRequest(BaseModel):
+    demo_duration_minutes: Optional[int] = None
+    buffer_minutes: Optional[int] = None
+    slot_interval_minutes: Optional[int] = None
+    timezone: Optional[str] = None
+    minimum_notice_minutes: Optional[int] = None
+    max_booking_days_ahead: Optional[int] = None
+
+
+class AppointmentStaffRequest(BaseModel):
+    name: str
+    email: Optional[str] = ""
+    whatsapp_number: Optional[str] = ""
+    calendar_email: Optional[str] = ""
+    working_days: Optional[list] = None
+    start_time: Optional[str] = "09:00"
+    end_time: Optional[str] = "18:00"
+    timezone: Optional[str] = "Asia/Kolkata"
+    active: Optional[bool] = True
+    round_robin_order: Optional[int] = 0
 
 
 class WaConfirmRequest(BaseModel):
@@ -843,6 +867,47 @@ async def api_recordings_cleanup(req: Optional[RecordingCleanupRequest] = None):
 @app.get("/api/appointments")
 async def api_get_appointments(date: Optional[str] = None):
     return await get_all_appointments(date_filter=date)
+
+
+@app.get("/api/appointments/settings")
+async def api_get_appointment_settings():
+    return await get_appointment_settings()
+
+
+@app.post("/api/appointments/settings")
+async def api_save_appointment_settings(req: AppointmentSettingsRequest):
+    return await save_appointment_settings(req.dict(exclude_none=True))
+
+
+@app.get("/api/appointments/staff")
+async def api_get_appointment_staff(include_inactive: bool = True):
+    return {"staff": await get_appointment_staff(include_inactive=include_inactive)}
+
+
+@app.post("/api/appointments/staff")
+async def api_create_appointment_staff(req: AppointmentStaffRequest):
+    try:
+        staff = await upsert_appointment_staff(req.dict(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"success": True, "staff": staff}
+
+
+@app.put("/api/appointments/staff/{staff_id}")
+async def api_update_appointment_staff(staff_id: str, req: AppointmentStaffRequest):
+    try:
+        staff = await upsert_appointment_staff(req.dict(exclude_none=True), staff_id=staff_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"success": True, "staff": staff}
+
+
+@app.delete("/api/appointments/staff/{staff_id}")
+async def api_delete_appointment_staff(staff_id: str):
+    result = await delete_appointment_staff(staff_id)
+    if not (result.get("deleted") or result.get("deactivated")):
+        raise HTTPException(404, "Staff member not found")
+    return {"success": True, **result}
 
 
 @app.delete("/api/appointments/{appointment_id}")
