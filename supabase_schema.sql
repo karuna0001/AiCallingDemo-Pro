@@ -181,6 +181,11 @@ CREATE INDEX IF NOT EXISTS idx_wa_msg_conv ON whatsapp_messages(conversation_id)
 CREATE INDEX IF NOT EXISTS idx_wa_msg_phone ON whatsapp_messages(phone_number);
 CREATE INDEX IF NOT EXISTS idx_wa_msg_created ON whatsapp_messages(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_wa_msg_provider_id ON whatsapp_messages(provider_message_id);
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS delivered_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS read_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS failed_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS failure_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS error_code TEXT NOT NULL DEFAULT '';
 
 -- ── Phase 7: Automation Actions Queue ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS automation_actions (
@@ -221,3 +226,9 @@ ALTER TABLE whatsapp_logs DISABLE ROW LEVEL SECURITY;
 CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_phone ON whatsapp_logs(phone_number);
 CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_status ON whatsapp_logs(status);
 CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_created_at ON whatsapp_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_provider_id ON whatsapp_logs(provider_message_id);
+ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS delivered_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS read_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS failed_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS failure_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS error_code TEXT NOT NULL DEFAULT '';

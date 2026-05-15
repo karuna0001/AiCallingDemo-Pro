@@ -527,6 +527,77 @@ async def get_whatsapp_logs(phone: Optional[str] = None, limit: int = 50) -> lis
 
 # ── Automation Rules ───────────────────────────────────────────────────────
 
+def _extract_whatsapp_status_failure(raw: dict) -> tuple[str, str]:
+    errors = raw.get("errors") if isinstance(raw, dict) else None
+    if isinstance(errors, list) and errors:
+        err = errors[0] if isinstance(errors[0], dict) else {}
+        code = str(err.get("code") or err.get("error_code") or "")
+        message = (
+            err.get("message")
+            or err.get("title")
+            or (err.get("error_data") or {}).get("details")
+            or str(err)
+        )
+        return code, str(message or "")[:500]
+    return "", ""
+
+
+async def update_whatsapp_delivery_status(parsed: dict) -> dict:
+    """Update WhatsApp message/log delivery status from provider receipts."""
+    msg_id = parsed.get("message_id") or ""
+    status_val = (parsed.get("status_value") or "").strip().lower()
+    raw = parsed.get("raw") if isinstance(parsed.get("raw"), dict) else {}
+    phone = parsed.get("phone") or raw.get("recipient_id") or ""
+    now = datetime.now().isoformat()
+    ts = raw.get("timestamp") or parsed.get("timestamp") or ""
+    status_time = datetime.fromtimestamp(int(ts)).isoformat() if str(ts).isdigit() else now
+    failure_code, failure_reason = _extract_whatsapp_status_failure(raw)
+    await _db().log_error("whatsapp_status", "whatsapp_status_webhook_received", f"id={msg_id} status={status_val} phone={phone}", "info")
+    if not msg_id or status_val not in {"sent", "delivered", "read", "failed"}:
+        await _db().log_error("whatsapp_status", "whatsapp_status_unmatched", f"invalid id/status id={msg_id} status={status_val}", "warning")
+        return {"matched": False, "status": status_val, "reason": "invalid_status_webhook"}
+
+    time_fields = {
+        "delivered": {"delivered_at": status_time},
+        "read": {"read_at": status_time},
+        "failed": {"failed_at": status_time, "failure_reason": failure_reason, "error_code": failure_code},
+    }.get(status_val, {})
+    msg_update = {"provider_status": status_val, **time_fields}
+    log_update = {"status": status_val, "error_message": failure_reason or "", **time_fields}
+    if status_val == "failed":
+        await _db().log_error("whatsapp_status", "whatsapp_status_failed_reason", f"id={msg_id} code={failure_code} reason={failure_reason}", "error")
+
+    matched = False
+    try:
+        db = await _db()._adb()
+        res = await db.table("whatsapp_messages").select("id").eq("provider_message_id", msg_id).limit(1).execute()
+        msg_matched = bool(res.data)
+        log_res = await db.table("whatsapp_logs").select("id").eq("provider_message_id", msg_id).limit(1).execute()
+        log_matched = bool(log_res.data)
+        matched = msg_matched or log_matched
+        if msg_matched:
+            await _db().log_error("whatsapp_status", "whatsapp_status_matched", f"message_id={msg_id}", "info")
+            try:
+                await db.table("whatsapp_messages").update(msg_update).eq("provider_message_id", msg_id).execute()
+            except Exception:
+                await db.table("whatsapp_messages").update({"provider_status": status_val}).eq("provider_message_id", msg_id).execute()
+        elif log_matched:
+            await _db().log_error("whatsapp_status", "whatsapp_status_matched", f"log_id={msg_id}", "info")
+        try:
+            await db.table("whatsapp_logs").update(log_update).eq("provider_message_id", msg_id).execute()
+        except Exception:
+            await db.table("whatsapp_logs").update({"status": status_val, "error_message": failure_reason or ""}).eq("provider_message_id", msg_id).execute()
+    except Exception as exc:
+        logger.error("update_whatsapp_delivery_status failed: %s", exc)
+        await _db().log_error("whatsapp_status", "whatsapp_status_unmatched", f"id={msg_id} error={str(exc)[:500]}", "warning")
+        return {"matched": False, "status": status_val, "reason": "update_failed"}
+
+    event = "whatsapp_status_updated" if matched else "whatsapp_status_unmatched"
+    level = "info" if matched else "warning"
+    await _db().log_error("whatsapp_status", event, f"id={msg_id} status={status_val}", level)
+    return {"matched": matched, "status": status_val, "provider_message_id": msg_id}
+
+
 async def get_automation_rules_with_source() -> tuple[list, str]:
     raw = ""
     source = "default"
@@ -2048,6 +2119,7 @@ def parse_vobiz_webhook_messages(payload: dict) -> list:
                     "raw": ev,
                     "is_status_update": True,
                     "status_value": status_value,
+                    "timestamp": timestamp,
                     "provider": "vobiz",
                 })
                 continue
@@ -2146,6 +2218,8 @@ def _parse_meta_webhook_messages(payload: dict) -> list:
                         "raw": status,
                         "is_status_update": True,
                         "status_value": status.get("status", ""),
+                        "timestamp": status.get("timestamp", ""),
+                        "provider": "meta",
                     })
 
                 # Contacts metadata
@@ -2362,17 +2436,7 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
     6. AI reply if enabled and window open
     """
     if parsed.get("is_status_update"):
-        # Update provider_status on outbound message if we have the message_id
-        msg_id = parsed.get("message_id", "")
-        status_val = parsed.get("status_value", "")
-        if msg_id and status_val:
-            try:
-                db = await _db()._adb()
-                await db.table("whatsapp_messages") \
-                    .update({"provider_status": status_val}) \
-                    .eq("provider_message_id", msg_id).execute()
-            except Exception:
-                pass
+        await update_whatsapp_delivery_status(parsed)
         return
 
     phone_raw = parsed.get("phone", "")
