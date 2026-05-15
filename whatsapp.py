@@ -1337,6 +1337,21 @@ async def _log_whatsapp_ai_event(phone: str, event: str, detail: str = "", level
         pass
 
 
+def _usable_whatsapp_name(*values: str) -> str:
+    for value in values:
+        name = str(value or "").strip()
+        if not name:
+            continue
+        digits = "".join(ch for ch in name if ch.isdigit())
+        if len(digits) >= 8:
+            continue
+        lowered = name.lower()
+        if lowered in {"there", "customer", "unknown"} or lowered.startswith("whatsapp +"):
+            continue
+        return name
+    return ""
+
+
 async def get_or_create_conversation(phone: str, contact_name: str = "") -> dict:
     """Return existing open/any conversation for phone, or create a new one."""
     try:
@@ -1830,6 +1845,8 @@ async def generate_whatsapp_ai_reply(
     conversation: dict,
     inbound_text: str,
     recent_messages: list,
+    conversation_mode: str = "in_progress",
+    crm_contact: Optional[dict] = None,
 ) -> dict:
     """Generate a short WhatsApp chat reply using the WhatsApp-specific prompt."""
     try:
@@ -1837,12 +1854,49 @@ async def generate_whatsapp_ai_reply(
         from db import get_knowledge_base, get_setting as _gs
 
         lower_text = (inbound_text or "").strip().lower()
+        known_name = _usable_whatsapp_name(
+            (crm_contact or {}).get("lead_name"),
+            (crm_contact or {}).get("name"),
+            conversation.get("contact_name"),
+        )
         if any(word in lower_text for word in ("booking", "book demo", "demo", "appointment", "meeting", "google meet")):
             return {
                 "reply": "Sure, I can help you book a demo. May I know your preferred date and time for a quick Google Meet demo?",
                 "reason": "",
                 "provider": "deterministic_intent",
-                "prompt_type": "whatsapp_chat_prompt",
+                "prompt_type": "whatsapp_chat",
+            }
+        if any(word in lower_text for word in ("ai voice", "voice agent", "ai calling", "voice bot", "calling agent")):
+            return {
+                "reply": "We provide AI Voice Agent for lead follow-up, appointment booking, customer support, missed-call follow-up, and bulk outbound calling.",
+                "reason": "",
+                "provider": "deterministic_intent",
+                "prompt_type": "whatsapp_chat",
+            }
+        if any(word in lower_text for word in ("price", "pricing", "cost", "charges", "rate", "per minute")):
+            return {
+                "reply": "AI voice calling starts from ₹5 per minute. Setup and monthly maintenance depend on your requirement. I can arrange a quick demo.",
+                "reason": "",
+                "provider": "deterministic_intent",
+                "prompt_type": "whatsapp_chat",
+            }
+        if any(phrase in lower_text for phrase in ("call me", "callback", "call back", "please call")):
+            return {
+                "reply": "Sure, our team will call you shortly. If now is not suitable, please share your preferred time.",
+                "reason": "",
+                "provider": "deterministic_intent",
+                "prompt_type": "whatsapp_chat",
+            }
+        if conversation_mode == "new":
+            if known_name:
+                reply = f"Hi {known_name}, thanks for contacting us. How can I assist you?"
+            else:
+                reply = "Hi, thanks for contacting S Cube Digital Marketing. May I know your name and how can I assist you?"
+            return {
+                "reply": reply,
+                "reason": "",
+                "provider": "deterministic_greeting",
+                "prompt_type": "whatsapp_chat",
             }
 
         kb = await get_knowledge_base()
@@ -1856,23 +1910,25 @@ async def generate_whatsapp_ai_reply(
         business_name = company_profile.get("business_name") or company_profile.get("name") or "our company"
         service_type = company_profile.get("services_summary") or "our service"
         saved_prompt = (
-            await _gs("AI_PROMPT_whatsapp_chat_prompt", "")
-            or await _gs("AI_PROMPT_whatsapp_chat", "")
+            await _gs("AI_PROMPT_whatsapp_chat", "")
+            or await _gs("AI_PROMPT_whatsapp_chat_prompt", "")
             or None
         )
         system_prompt = build_prompt_for_type(
-            "whatsapp_chat_prompt",
-            lead_name=conversation.get("contact_name") or "there",
+            "whatsapp_chat",
+            lead_name=known_name or "there",
             business_name=business_name,
             service_type=service_type,
             saved_text=saved_prompt,
             kb=kb,
         )
         user_prompt = (
-            f"Customer name: {conversation.get('contact_name') or 'there'}\n"
+            f"Customer name: {known_name or 'there'}\n"
+            f"Conversation mode: {conversation_mode}\n"
             f"Conversation history:\n{history}\n\n"
             f"Customer just said: {inbound_text}\n\n"
             f"Reply as a WhatsApp sales assistant. Keep it short. "
+            f"Do not ask the name again when a customer name is known. "
             f"If this is about booking/demo/appointment/meeting, ask for preferred date and time. "
             f"If this is a price question, use the knowledge base or say the team will confirm."
         )
@@ -1880,7 +1936,7 @@ async def generate_whatsapp_ai_reply(
         import google.generativeai as genai
         api_key = await _gs("GOOGLE_API_KEY", "")
         if not api_key:
-            return {"reply": None, "reason": "gemini_not_configured", "provider": "gemini", "prompt_type": "whatsapp_chat_prompt"}
+            return {"reply": None, "reason": "gemini_not_configured", "provider": "gemini", "prompt_type": "whatsapp_chat"}
         genai.configure(api_key=api_key)
         model_name = await _gs("GEMINI_MODEL", "gemini-1.5-flash")
         safe_model = model_name if "flash" in model_name or "pro" in model_name else "gemini-1.5-flash"
@@ -1889,11 +1945,11 @@ async def generate_whatsapp_ai_reply(
         response = model.generate_content(user_prompt)
         reply = (response.text or "").strip()
         if not reply:
-            return {"reply": None, "reason": "ai_generation_failed", "provider": "gemini", "prompt_type": "whatsapp_chat_prompt"}
-        return {"reply": reply[:1000], "reason": "", "provider": "gemini", "prompt_type": "whatsapp_chat_prompt"}
+            return {"reply": None, "reason": "ai_generation_failed", "provider": "gemini", "prompt_type": "whatsapp_chat"}
+        return {"reply": reply[:1000], "reason": "", "provider": "gemini", "prompt_type": "whatsapp_chat"}
     except Exception as exc:
         logger.error("generate_whatsapp_ai_reply error: %s", exc)
-        return {"reply": None, "reason": "ai_generation_failed", "error": str(exc)[:500], "provider": "gemini", "prompt_type": "whatsapp_chat_prompt"}
+        return {"reply": None, "reason": "ai_generation_failed", "error": str(exc)[:500], "provider": "gemini", "prompt_type": "whatsapp_chat"}
 
 
 def parse_vobiz_webhook_messages(payload: dict) -> list:
@@ -2299,6 +2355,18 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
     conv_id = conv["id"]
     await _log_whatsapp_ai_event(phone, "conversation_found_or_created", f"conversation_id={conv_id} status={conv.get('status', '')}")
 
+    crm_contact = None
+    try:
+        from db import get_crm_contact_by_phone
+        crm_contact = await get_crm_contact_by_phone(phone)
+    except Exception as exc:
+        await _log_whatsapp_ai_event(phone, "crm_contact_found", f"found=false error={str(exc)[:200]}", "warning")
+    else:
+        crm_name = _usable_whatsapp_name((crm_contact or {}).get("lead_name"), (crm_contact or {}).get("name"))
+        await _log_whatsapp_ai_event(phone, "crm_contact_found", f"found={bool(crm_contact)} name={crm_name}")
+        if crm_name and not _usable_whatsapp_name(conv.get("contact_name")):
+            conv["contact_name"] = crm_name
+
     # CRM link (async, don't block)
     asyncio.create_task(link_conversation_to_crm(conv_id, phone, contact_name))
 
@@ -2381,10 +2449,26 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
             return
 
         recent = await get_messages(conv_id, limit=12)
-        await _log_whatsapp_ai_event(phone, "prompt_type_used", "whatsapp_chat_prompt")
+        inbound_row_id = (inbound_saved or {}).get("id") if isinstance(inbound_saved, dict) else ""
+        prior_messages = [
+            m for m in recent
+            if not inbound_row_id or str(m.get("id") or "") != str(inbound_row_id)
+        ]
+        useful_history = [
+            m for m in prior_messages
+            if (m.get("message_text") or "").strip() or m.get("message_type") in ("template", "button", "interactive")
+        ]
+        conversation_mode = "in_progress" if useful_history else "new"
+        await _log_whatsapp_ai_event(phone, "history_loaded", f"messages={len(recent)} prior_useful={len(useful_history)}")
+        await _log_whatsapp_ai_event(phone, "conversation_mode", conversation_mode)
+        await _log_whatsapp_ai_event(phone, "prompt_type_used", "whatsapp_chat")
         await _log_whatsapp_ai_event(phone, "ai_provider_selected", "gemini")
-        await _log_whatsapp_ai_event(phone, "ai_generation_started", f"history_messages={len(recent)}")
-        ai_result = await generate_whatsapp_ai_reply(latest_conv, text, recent)
+        await _log_whatsapp_ai_event(phone, "ai_generation_started", f"history_messages={len(recent)} mode={conversation_mode}")
+        latest_conv = dict(latest_conv or {})
+        crm_name = _usable_whatsapp_name((crm_contact or {}).get("lead_name"), (crm_contact or {}).get("name"))
+        if crm_name and not _usable_whatsapp_name(latest_conv.get("contact_name")):
+            latest_conv["contact_name"] = crm_name
+        ai_result = await generate_whatsapp_ai_reply(latest_conv, text, recent, conversation_mode, crm_contact)
         if isinstance(ai_result, dict):
             reply_text = (ai_result.get("reply") or "").strip()
             ai_reason = ai_result.get("reason") or ""
@@ -2395,7 +2479,7 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
             ai_error = ""
         if isinstance(ai_result, dict):
             await _log_whatsapp_ai_event(phone, "ai_provider_selected", ai_result.get("provider") or "gemini")
-            await _log_whatsapp_ai_event(phone, "prompt_type_used", ai_result.get("prompt_type") or "whatsapp_chat_prompt")
+            await _log_whatsapp_ai_event(phone, "prompt_type_used", ai_result.get("prompt_type") or "whatsapp_chat")
         if not reply_text:
             reason = ai_reason or "ai_generation_failed"
             await _log_whatsapp_ai_event(phone, "ai_generation_failed", ai_error or reason, "error" if reason == "ai_generation_failed" else "warning")
