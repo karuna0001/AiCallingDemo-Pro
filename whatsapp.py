@@ -357,14 +357,22 @@ async def send_whatsapp_template(
     Returns: {success, provider_message_id, error, reason}
     Also writes to whatsapp_logs table.
     """
+    async def log_and_record(status: str, provider_message_id: Optional[str], error_message: Optional[str]) -> None:
+        await _log_wa(phone, event_type, template_name, language, parameters, status, provider_message_id, error_message, source_type, source_id)
+        if phone:
+            await record_outbound_template_message(
+                phone, template_name, language, parameters, status,
+                provider_message_id, error_message, source_type, source_id,
+            )
+
     if not template_name:
         result = {"success": False, "provider_message_id": None, "error": "template_name is required", "reason": "template_missing"}
-        await _log_wa(phone, event_type, template_name, language, parameters, "failed", None, "template_name is required", source_type, source_id)
+        await log_and_record("failed", None, "template_name is required")
         return result
 
     if not await _is_wa_enabled():
         result = {"success": False, "provider_message_id": None, "error": "WhatsApp is disabled", "reason": "whatsapp_disabled"}
-        await _log_wa(phone, event_type, template_name, language, parameters, "skipped", None, "WhatsApp disabled", source_type, source_id)
+        await log_and_record("skipped", None, "WhatsApp disabled")
         return result
 
     cfg = await _wa_config()
@@ -375,7 +383,7 @@ async def send_whatsapp_template(
     # caller (automation rules / UI) can fall back gracefully.
     if provider == "vobiz":
         err = "Vobiz template send not configured — please configure template payload format"
-        await _log_wa(phone, event_type, template_name, language, parameters, "failed", None, err, source_type, source_id)
+        await log_and_record("failed", None, err)
         return {"success": False, "provider_message_id": None, "error": err, "reason": "vobiz_template_format_not_configured"}
 
     token = cfg.get("WHATSAPP_ACCESS_TOKEN", "").strip()
@@ -390,14 +398,14 @@ async def send_whatsapp_template(
             missing.append("WHATSAPP_PHONE_NUMBER_ID")
         err = f"Missing config: {', '.join(missing)}"
         result = {"success": False, "provider_message_id": None, "error": err, "reason": "whatsapp_not_configured"}
-        await _log_wa(phone, event_type, template_name, language, parameters, "failed", None, err, source_type, source_id)
+        await log_and_record("failed", None, err)
         return result
 
     # Normalize phone: Meta expects digits without leading +
     to_phone = phone.lstrip("+") if phone else ""
     if not to_phone:
         result = {"success": False, "provider_message_id": None, "error": "Invalid phone number", "reason": "invalid_phone"}
-        await _log_wa(phone, event_type, template_name, language, parameters, "failed", None, "Invalid phone", source_type, source_id)
+        await log_and_record("failed", None, "Invalid phone")
         return result
 
     payload: dict = {
@@ -438,7 +446,7 @@ async def send_whatsapp_template(
                     messages = resp_json.get("messages") or []
                     if messages and isinstance(messages, list):
                         msg_id = messages[0].get("id")
-                    await _log_wa(phone, event_type, template_name, language, parameters, "sent", msg_id, None, source_type, source_id)
+                    await log_and_record("sent", msg_id, None)
                     return {"success": True, "provider_message_id": msg_id, "error": None, "reason": None}
                 else:
                     error_data = resp_json.get("error") or resp_json
@@ -451,12 +459,12 @@ async def send_whatsapp_template(
                         if expected is not None:
                             detail += f" expected_params={expected}"
                         err_msg = (err_msg + detail)[:500]
-                    await _log_wa(phone, event_type, template_name, language, parameters, "failed", None, err_msg, source_type, source_id)
+                    await log_and_record("failed", None, err_msg)
                     return {"success": False, "provider_message_id": None, "error": err_msg, "reason": "provider_error"}
     except Exception as exc:
         err_msg = str(exc)[:500]
         logger.error("WhatsApp send error for %s: %s", phone, exc)
-        await _log_wa(phone, event_type, template_name, language, parameters, "failed", None, err_msg, source_type, source_id)
+        await log_and_record("failed", None, err_msg)
         return {"success": False, "provider_message_id": None, "error": err_msg, "reason": "send_error"}
 
 
@@ -1290,6 +1298,31 @@ _OPT_OUT_KEYWORDS = {"stop", "unsubscribe", "optout", "opt out", "opt-out",
 
 # ── Conversation helpers ───────────────────────────────────────────────────
 
+_wa_ai_locks: dict[str, asyncio.Lock] = {}
+
+
+def _conversation_lock(phone: str) -> asyncio.Lock:
+    lock = _wa_ai_locks.get(phone)
+    if lock is None:
+        lock = asyncio.Lock()
+        _wa_ai_locks[phone] = lock
+    return lock
+
+
+async def _log_whatsapp_ai_reason(phone: str, reason: str, detail: str = "", level: str = "warning") -> None:
+    msg = f"WhatsApp AI reply skipped for {phone}: {reason}"
+    if level == "error":
+        logger.error("%s %s", msg, detail)
+    elif level == "info":
+        logger.info("%s %s", msg, detail)
+    else:
+        logger.warning("%s %s", msg, detail)
+    try:
+        await _db().log_error("whatsapp_ai", msg, detail or reason, level)
+    except Exception:
+        pass
+
+
 async def get_or_create_conversation(phone: str, contact_name: str = "") -> dict:
     """Return existing open/any conversation for phone, or create a new one."""
     try:
@@ -1443,6 +1476,50 @@ async def save_wa_message(
         return row
     except Exception as exc:
         logger.error("save_wa_message error: %s", exc)
+        return {}
+
+
+async def record_outbound_template_message(
+    phone: str,
+    template_name: str,
+    language: str,
+    parameters,
+    status: str,
+    provider_message_id: Optional[str],
+    error_message: Optional[str],
+    source_type: str = "",
+    source_id: str = "",
+) -> dict:
+    try:
+        conv = await get_or_create_conversation(phone)
+        if not conv:
+            return {}
+        preview = f"[Template: {template_name}]"
+        if parameters:
+            preview += " " + ", ".join(str(p) for p in parameters if str(p).strip())[:250]
+        if status == "failed" and error_message:
+            preview += f" (failed: {error_message[:120]})"
+        saved = await save_wa_message(
+            conv_id=conv["id"],
+            phone=phone,
+            direction="outbound",
+            message_type="template",
+            message_text=preview,
+            template_name=template_name,
+            provider_message_id=provider_message_id or "",
+            provider_status=status,
+            raw_payload={
+                "language": language or "en",
+                "parameters": parameters or [],
+                "source_type": source_type,
+                "source_id": source_id,
+                "error_message": error_message or "",
+            },
+        )
+        await update_conversation_last_message(conv["id"], preview, increment_unread=False)
+        return saved
+    except Exception as exc:
+        logger.error("record_outbound_template_message error for %s: %s", phone, exc)
         return {}
 
 
@@ -1673,7 +1750,7 @@ def _is_opt_out(text: str) -> bool:
 
 # ── AI reply generation ────────────────────────────────────────────────────
 
-async def generate_whatsapp_ai_reply(
+async def _legacy_generate_whatsapp_ai_reply(
     conversation: dict,
     inbound_text: str,
     recent_messages: list,
@@ -1734,6 +1811,67 @@ async def generate_whatsapp_ai_reply(
 
 
 # ── Webhook payload parsing ────────────────────────────────────────────────
+
+async def generate_whatsapp_ai_reply(
+    conversation: dict,
+    inbound_text: str,
+    recent_messages: list,
+) -> dict:
+    """Generate a short WhatsApp chat reply using the WhatsApp-specific prompt."""
+    try:
+        from prompts import build_prompt_for_type
+        from db import get_knowledge_base, get_setting as _gs
+
+        kb = await get_knowledge_base()
+        history_lines = []
+        for m in recent_messages[-8:]:
+            role = "Customer" if m.get("direction") == "inbound" else "Agent"
+            history_lines.append(f"{role}: {m.get('message_text', '')}")
+        history = "\n".join(history_lines)
+
+        company_profile = kb.get("company_profile", {}) or {}
+        business_name = company_profile.get("business_name") or company_profile.get("name") or "our company"
+        service_type = company_profile.get("services_summary") or "our service"
+        saved_prompt = (
+            await _gs("AI_PROMPT_whatsapp_chat_prompt", "")
+            or await _gs("AI_PROMPT_whatsapp_chat", "")
+            or None
+        )
+        system_prompt = build_prompt_for_type(
+            "whatsapp_chat_prompt",
+            lead_name=conversation.get("contact_name") or "there",
+            business_name=business_name,
+            service_type=service_type,
+            saved_text=saved_prompt,
+            kb=kb,
+        )
+        user_prompt = (
+            f"Customer name: {conversation.get('contact_name') or 'there'}\n"
+            f"Conversation history:\n{history}\n\n"
+            f"Customer just said: {inbound_text}\n\n"
+            f"Reply as a WhatsApp sales assistant. Keep it short. "
+            f"If this is about booking/demo/appointment/meeting, ask for preferred date and time. "
+            f"If this is a price question, use the knowledge base or say the team will confirm."
+        )
+
+        import google.generativeai as genai
+        api_key = await _gs("GOOGLE_API_KEY", "")
+        if not api_key:
+            return {"reply": None, "reason": "gemini_not_configured"}
+        genai.configure(api_key=api_key)
+        model_name = await _gs("GEMINI_MODEL", "gemini-1.5-flash")
+        safe_model = model_name if "flash" in model_name or "pro" in model_name else "gemini-1.5-flash"
+        safe_model = safe_model.replace("-live-preview", "").replace("-live", "")
+        model = genai.GenerativeModel(safe_model, system_instruction=system_prompt)
+        response = model.generate_content(user_prompt)
+        reply = (response.text or "").strip()
+        if not reply:
+            return {"reply": None, "reason": "ai_generation_failed"}
+        return {"reply": reply[:1000], "reason": ""}
+    except Exception as exc:
+        logger.error("generate_whatsapp_ai_reply error: %s", exc)
+        return {"reply": None, "reason": "ai_generation_failed", "error": str(exc)[:500]}
+
 
 def parse_vobiz_webhook_messages(payload: dict) -> list:
     """Extract list of inbound message dicts from a Vobiz webhook payload.
@@ -2113,6 +2251,7 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
 
     phone_raw = parsed.get("phone", "")
     if not phone_raw:
+        await _log_whatsapp_ai_reason("", "webhook_not_received", "Inbound webhook had no phone", "warning")
         return
 
     try:
@@ -2139,7 +2278,7 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
     asyncio.create_task(link_conversation_to_crm(conv_id, phone, contact_name))
 
     # Save inbound message
-    await save_wa_message(
+    inbound_saved = await save_wa_message(
         conv_id=conv_id,
         phone=phone,
         direction="inbound",
@@ -2170,16 +2309,82 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
     # AI auto-reply
     ai_enabled = conv.get("ai_enabled", True)
     if not ai_enabled:
+        reason = "takeover_enabled" if conv.get("assigned_to") else "ai_disabled"
+        await _log_whatsapp_ai_reason(phone, reason, f"conversation_id={conv_id}", "info")
         return
 
     # Only reply to text/button/interactive messages
     if msg_type not in ("text", "button", "interactive"):
+        await _log_whatsapp_ai_reason(phone, "unsupported_message_type", f"type={msg_type}", "info")
         return
 
     # Fix 2: Intent detection (skip if we already promoted a waiting call
     # for this phone — that call covers the customer's request).
-    if promoted == 0:
-        intent = _detect_inbound_intent(text)
+    intent = _detect_inbound_intent(text)
+    if promoted == 0 and intent == "callback":
+        try:
+            await _handle_inbound_intent(phone, intent, conv)
+        except Exception as exc:
+            logger.error("Inbound callback intent handling failed for %s: %s", phone, exc)
+
+    lock = _conversation_lock(phone)
+    if lock.locked():
+        await _log_whatsapp_ai_reason(phone, "already_processing_same_conversation", f"conversation_id={conv_id}", "info")
+
+    async with lock:
+        # Check the latest conversation state inside the per-phone lock.
+        latest_conv = await get_conversation_by_id(conv_id) or conv
+        if not latest_conv.get("ai_enabled", True):
+            reason = "takeover_enabled" if latest_conv.get("assigned_to") else "ai_disabled"
+            await _log_whatsapp_ai_reason(phone, reason, f"conversation_id={conv_id}", "info")
+            return
+
+        # Check 24h window
+        window_open = await is_whatsapp_service_window_open(phone)
+        if not window_open:
+            await _log_whatsapp_ai_reason(phone, "outside_24h_window", f"conversation_id={conv_id}", "info")
+            return
+
+        if not (text or "").strip():
+            await _log_whatsapp_ai_reason(phone, "no_text_message", f"conversation_id={conv_id}", "info")
+            return
+
+        recent = await get_messages(conv_id, limit=12)
+        ai_result = await generate_whatsapp_ai_reply(latest_conv, text, recent)
+        if isinstance(ai_result, dict):
+            reply_text = (ai_result.get("reply") or "").strip()
+            ai_reason = ai_result.get("reason") or ""
+            ai_error = ai_result.get("error") or ""
+        else:
+            reply_text = (ai_result or "").strip()
+            ai_reason = "" if reply_text else "ai_generation_failed"
+            ai_error = ""
+        if not reply_text:
+            await _log_whatsapp_ai_reason(phone, ai_reason or "ai_generation_failed", ai_error or f"conversation_id={conv_id}", "error" if ai_reason == "ai_generation_failed" else "warning")
+            return
+
+        send_result = await send_whatsapp_text(phone, reply_text)
+        provider_id = send_result.get("provider_message_id") or ""
+        await save_wa_message(
+            conv_id=conv_id,
+            phone=phone,
+            direction="outbound",
+            message_type="text",
+            message_text=reply_text,
+            provider_message_id=provider_id,
+            provider_status="sent" if send_result.get("success") else "failed",
+            raw_payload={"reply_to_message_id": inbound_saved.get("id") if inbound_saved else ""},
+            ai_generated=True,
+        )
+        if send_result.get("success"):
+            await update_conversation_last_message(conv_id, reply_text, increment_unread=False)
+        else:
+            await _log_whatsapp_ai_reason(phone, "whatsapp_send_failed", send_result.get("error") or "", "error")
+        return
+
+    if False:
+        # Legacy flow below is intentionally unreachable; retained for context
+        # after the lock-safe flow above.
         if intent:
             try:
                 template_sent = await _handle_inbound_intent(phone, intent, conv)
