@@ -188,6 +188,7 @@ CREATE INDEX IF NOT EXISTS idx_wa_conv_status ON whatsapp_conversations(status);
 ALTER TABLE whatsapp_conversations ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE whatsapp_conversations ADD COLUMN IF NOT EXISTS deleted_at TEXT NOT NULL DEFAULT '';
 ALTER TABLE whatsapp_conversations ADD COLUMN IF NOT EXISTS deleted_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_conversations ADD COLUMN IF NOT EXISTS appointment_state TEXT NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS idx_wa_conv_is_deleted ON whatsapp_conversations(is_deleted);
 
 CREATE TABLE IF NOT EXISTS whatsapp_messages (
@@ -244,6 +245,10 @@ ALTER TABLE automation_actions DISABLE ROW LEVEL SECURITY;
 CREATE INDEX IF NOT EXISTS idx_automation_actions_status ON automation_actions(status);
 CREATE INDEX IF NOT EXISTS idx_automation_actions_phone ON automation_actions(phone_number);
 CREATE INDEX IF NOT EXISTS idx_automation_actions_scheduled_at ON automation_actions(scheduled_at);
+ALTER TABLE automation_actions ADD COLUMN IF NOT EXISTS idempotency_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE automation_actions ADD COLUMN IF NOT EXISTS cooldown_until TEXT NOT NULL DEFAULT '';
+ALTER TABLE automation_actions ADD COLUMN IF NOT EXISTS action_status TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_automation_actions_idempotency ON automation_actions(idempotency_key);
 
 -- ── Phase 7: WhatsApp Logs ─────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS whatsapp_logs (
@@ -270,3 +275,6 @@ ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS read_at TEXT NOT NULL DEFAULT
 ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS failed_at TEXT NOT NULL DEFAULT '';
 ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS failure_reason TEXT NOT NULL DEFAULT '';
 ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS error_code TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS idempotency_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS cooldown_until TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_idempotency ON whatsapp_logs(idempotency_key);

@@ -14,6 +14,7 @@ import asyncio
 import json as _json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -73,6 +74,14 @@ WA_TEMPLATE_PARAM_COUNTS = {
     "reminder_template": 3,
     "no_response_followup_template": 2,
     "re_enquiry_followup_template": 2,
+}
+
+WA_TEMPLATE_COOLDOWNS = {
+    "re_enquiry_followup_template": 24 * 60,
+    "no_response_followup_template": 24 * 60,
+    "missed_call_template": 2 * 60,
+    "missed_call_followup": 2 * 60,
+    "appointment_confirmation_template": 30 * 24 * 60,
 }
 
 # ── Backward-compat: old key → new purpose slot ───────────────────────────
@@ -370,6 +379,25 @@ async def send_whatsapp_template(
         await log_and_record("failed", None, "template_name is required")
         return result
 
+    cooldown_minutes = _template_cooldown_minutes(event_type, template_name, template_purpose)
+    if cooldown_minutes and not _template_cooldown_bypassed(source_type, event_type):
+        dup = await _template_duplicate_check(phone, event_type, template_name, cooldown_minutes)
+        if dup.get("duplicate"):
+            reason = "duplicate_suppressed_cooldown"
+            await _log_wa(
+                phone, event_type, template_name, language, parameters,
+                "skipped", None, reason, source_type, source_id,
+                idempotency_key=dup.get("idempotency_key", ""),
+                cooldown_until=dup.get("cooldown_until", ""),
+            )
+            return {
+                "success": False,
+                "provider_message_id": None,
+                "error": reason,
+                "reason": reason,
+                "cooldown_until": dup.get("cooldown_until", ""),
+            }
+
     if not await _is_wa_enabled():
         result = {"success": False, "provider_message_id": None, "error": "WhatsApp is disabled", "reason": "whatsapp_disabled"}
         await log_and_record("skipped", None, "WhatsApp disabled")
@@ -489,6 +517,8 @@ async def _log_wa(
     error_message: Optional[str],
     source_type: str = "",
     source_id: str = "",
+    idempotency_key: str = "",
+    cooldown_until: str = "",
 ) -> None:
     try:
         import json as _json
@@ -505,9 +535,17 @@ async def _log_wa(
             "error_message": (error_message or "")[:500],
             "source_type": source_type or "",
             "source_id": source_id or "",
+            "idempotency_key": idempotency_key or "",
+            "cooldown_until": cooldown_until or "",
             "created_at": datetime.now().isoformat(),
         }
-        await db.table("whatsapp_logs").insert(row).execute()
+        try:
+            await db.table("whatsapp_logs").insert(row).execute()
+        except Exception:
+            fallback = dict(row)
+            fallback.pop("idempotency_key", None)
+            fallback.pop("cooldown_until", None)
+            await db.table("whatsapp_logs").insert(fallback).execute()
     except Exception as exc:
         logger.debug("WA log insert failed: %s", exc)
 
@@ -523,6 +561,81 @@ async def get_whatsapp_logs(phone: Optional[str] = None, limit: int = 50) -> lis
     except Exception as exc:
         logger.debug("WA logs fetch failed: %s", exc)
         return []
+
+
+def _template_cooldown_minutes(event_type: str, template_name: str, template_purpose: str = "") -> int:
+    event = (event_type or "").strip().lower()
+    purpose = _template_purpose_key(template_purpose or template_name)
+    name = (template_name or "").strip().lower()
+    if event in ("appointment_reminder", "reminder_scheduled"):
+        return 0
+    if event in ("appointment_confirmed", "showroom_visit_confirmed"):
+        return WA_TEMPLATE_COOLDOWNS["appointment_confirmation_template"]
+    if purpose in WA_TEMPLATE_COOLDOWNS:
+        return WA_TEMPLATE_COOLDOWNS[purpose]
+    if name in WA_TEMPLATE_COOLDOWNS:
+        return WA_TEMPLATE_COOLDOWNS[name]
+    if "re_enquiry" in event or "re-enquiry" in event or "re_enquiry" in name:
+        return WA_TEMPLATE_COOLDOWNS["re_enquiry_followup_template"]
+    if "no_response" in name or "followup" in event:
+        return WA_TEMPLATE_COOLDOWNS["no_response_followup_template"]
+    if "missed" in event or "missed" in name:
+        return WA_TEMPLATE_COOLDOWNS["missed_call_template"]
+    return 0
+
+
+def _template_cooldown_bypassed(source_type: str, event_type: str) -> bool:
+    source = (source_type or "").strip().lower()
+    event = (event_type or "").strip().lower()
+    return source in {"manual", "dashboard", "inbox"} or event in {"manual_send", "manual_template"}
+
+
+async def _template_duplicate_check(phone: str, event_type: str, template_name: str, cooldown_minutes: int) -> dict:
+    if not (phone and template_name and cooldown_minutes > 0):
+        return {"duplicate": False}
+    cutoff = (datetime.now() - timedelta(minutes=cooldown_minutes)).isoformat()
+    idempotency_key = f"{phone}:{event_type}:{template_name}"
+    await _db().log_error(
+        "whatsapp_automation",
+        "whatsapp_template_duplicate_check",
+        f"phone={phone} event={event_type} template={template_name} cooldown_minutes={cooldown_minutes}",
+        "info",
+    )
+    try:
+        db = await _db()._adb()
+        res = await db.table("whatsapp_logs") \
+            .select("*") \
+            .eq("phone_number", phone) \
+            .eq("event_type", event_type or "") \
+            .eq("template_name", template_name or "") \
+            .gte("created_at", cutoff) \
+            .order("created_at", desc=True) \
+            .limit(5) \
+            .execute()
+        rows = res.data or []
+        for row in rows:
+            if (row.get("status") or "").lower() in {"sent", "delivered", "read"}:
+                try:
+                    base = datetime.fromisoformat((row.get("created_at") or "").replace("Z", "+00:00")).replace(tzinfo=None)
+                except Exception:
+                    base = datetime.now()
+                cooldown_until = (base + timedelta(minutes=cooldown_minutes)).isoformat()
+                await _db().log_error(
+                    "whatsapp_automation",
+                    "whatsapp_template_duplicate_suppressed",
+                    f"phone={phone} event={event_type} template={template_name} cooldown_until={cooldown_until}",
+                    "warning",
+                )
+                await _db().log_error(
+                    "whatsapp_automation",
+                    "automation_cooldown_active",
+                    f"idempotency_key={idempotency_key} cooldown_until={cooldown_until}",
+                    "warning",
+                )
+                return {"duplicate": True, "cooldown_until": cooldown_until, "idempotency_key": idempotency_key}
+    except Exception as exc:
+        logger.warning("whatsapp_template_duplicate_check failed: %s", exc)
+    return {"duplicate": False, "idempotency_key": idempotency_key}
 
 
 # ── Automation Rules ───────────────────────────────────────────────────────
@@ -739,13 +852,22 @@ async def insert_automation_action(
             "action_type": action_type,
             "scheduled_at": scheduled_at.isoformat(),
             "status": status or "pending",
+            "action_status": status or "pending",
+            "idempotency_key": (payload or {}).get("idempotency_key", ""),
+            "cooldown_until": (payload or {}).get("cooldown_until", ""),
             "payload": _json.dumps(payload or {}),
             "result": _json.dumps(result or {}),
             "error_message": (error or "")[:500],
             "created_at": datetime.now().isoformat(),
             "completed_at": datetime.now().isoformat() if status in ("completed", "failed", "cancelled", "skipped") else "",
         }
-        await db.table("automation_actions").insert(row).execute()
+        try:
+            await db.table("automation_actions").insert(row).execute()
+        except Exception:
+            fallback = dict(row)
+            for key in ("action_status", "idempotency_key", "cooldown_until"):
+                fallback.pop(key, None)
+            await db.table("automation_actions").insert(fallback).execute()
     except Exception as exc:
         logger.warning("insert_automation_action failed: %s", exc)
     return action_id
@@ -774,14 +896,19 @@ async def update_automation_action_status(action_id: str, status: str, result: O
     try:
         import json as _json
         db = await _db()._adb()
-        updates: dict = {"status": status}
+        updates: dict = {"status": status, "action_status": status}
         if result is not None:
             updates["result"] = _json.dumps(result)
         if error:
             updates["error_message"] = error[:500]
         if status in ("completed", "failed", "cancelled", "skipped"):
             updates["completed_at"] = datetime.now().isoformat()
-        await db.table("automation_actions").update(updates).eq("id", action_id).execute()
+        try:
+            await db.table("automation_actions").update(updates).eq("id", action_id).execute()
+        except Exception:
+            fallback = dict(updates)
+            fallback.pop("action_status", None)
+            await db.table("automation_actions").update(fallback).eq("id", action_id).execute()
         return True
     except Exception as exc:
         logger.debug("update_automation_action_status failed: %s", exc)
@@ -936,8 +1063,11 @@ async def execute_automation_rule(
     elif action == "whatsapp_only":
         wa_result = await _send_rule_whatsapp(phone, event_type, action_id, selected_template, template, language, params)
         whatsapp_status = "sent" if wa_result["success"] else (wa_result.get("reason") or "failed")
-        result = _automation_result(event_type, source, rule, action, "executed" if wa_result["success"] else "failed", whatsapp_status=whatsapp_status, error=wa_result.get("error") or "")
-        return await finish("completed" if wa_result["success"] else "failed", result, wa_result.get("error") or "")
+        skipped_duplicate = wa_result.get("reason") == "duplicate_suppressed_cooldown"
+        result = _automation_result(event_type, source, rule, action, "executed" if wa_result["success"] else ("skipped" if skipped_duplicate else "failed"), whatsapp_status=whatsapp_status, skip_reason="duplicate_suppressed_cooldown" if skipped_duplicate else "", error=wa_result.get("error") or "")
+        if wa_result.get("cooldown_until"):
+            result["cooldown_until"] = wa_result.get("cooldown_until")
+        return await finish("completed" if wa_result["success"] else ("skipped" if skipped_duplicate else "failed"), result, wa_result.get("error") or "")
 
     elif action == "call_only":
         call_result = await _schedule_or_start_call(phone, contact, call_type, event_type, source, delay_minutes=0, rule=rule, return_details=True)
@@ -951,10 +1081,11 @@ async def execute_automation_rule(
         wa_result = await _send_rule_whatsapp(phone, event_type, action_id, selected_template, template, language, params)
         call_result = await _schedule_or_start_call(phone, contact, call_type, event_type, source, delay_minutes=0, rule=rule, return_details=True)
         whatsapp_status = "sent" if wa_result["success"] else (wa_result.get("reason") or "failed")
-        result = _automation_result(event_type, source, rule, action, "executed" if wa_result["success"] else "failed", whatsapp_status=whatsapp_status, call_status=call_result.get("call_status"), queue_action_id=call_result.get("action_id"), error=wa_result.get("error") or call_result.get("error", ""))
+        skipped_duplicate = wa_result.get("reason") == "duplicate_suppressed_cooldown"
+        result = _automation_result(event_type, source, rule, action, "executed" if wa_result["success"] else ("skipped" if skipped_duplicate else "failed"), whatsapp_status=whatsapp_status, call_status=call_result.get("call_status"), queue_action_id=call_result.get("action_id"), skip_reason="duplicate_suppressed_cooldown" if skipped_duplicate else "", error=wa_result.get("error") or call_result.get("error", ""))
         result["next_allowed_at"] = call_result.get("next_allowed_at")
-        result["skip_reason"] = call_result.get("skip_reason", "")
-        return await finish("completed" if wa_result["success"] else "failed", result, result.get("error", ""))
+        result["skip_reason"] = call_result.get("skip_reason") or result.get("skip_reason", "")
+        return await finish("completed" if wa_result["success"] else ("skipped" if skipped_duplicate else "failed"), result, result.get("error", ""))
 
     elif action == "whatsapp_then_call_after_delay":
         wa_result = await _send_rule_whatsapp(phone, event_type, action_id, selected_template, template, language, params)
@@ -964,10 +1095,11 @@ async def execute_automation_rule(
             payload={**contact, "call_type": call_type, "rule": rule, "parent_action_id": action_id},
         )
         whatsapp_status = "sent" if wa_result["success"] else (wa_result.get("reason") or "failed")
-        result = _automation_result(event_type, source, rule, action, "queued" if wa_result["success"] else "failed", whatsapp_status=whatsapp_status, call_status="scheduled", queue_action_id=scheduled_id, error=wa_result.get("error") or "")
+        skipped_duplicate = wa_result.get("reason") == "duplicate_suppressed_cooldown"
+        result = _automation_result(event_type, source, rule, action, "queued" if wa_result["success"] else ("skipped" if skipped_duplicate else "failed"), whatsapp_status=whatsapp_status, call_status="scheduled", queue_action_id=scheduled_id, skip_reason="duplicate_suppressed_cooldown" if skipped_duplicate else "", error=wa_result.get("error") or "")
         result["parent_queue_action_id"] = action_id
         result["next_allowed_at"] = sched_at.isoformat()
-        await update_automation_action_status(action_id, "completed" if wa_result["success"] else "failed", result, wa_result.get("error") or "")
+        await update_automation_action_status(action_id, "completed" if wa_result["success"] else ("skipped" if skipped_duplicate else "failed"), result, wa_result.get("error") or "")
         logger.info("Automation result: %s", result)
         return result
 
@@ -989,9 +1121,10 @@ async def execute_automation_rule(
         )
         await update_automation_action_status(waiting_id, "waiting_schedule", {"waiting_for": "whatsapp_reply", "parent_action_id": action_id})
         whatsapp_status = "sent" if wa_result["success"] else (wa_result.get("reason") or "failed")
-        result = _automation_result(event_type, source, rule, action, "waiting_reply" if wa_result["success"] else "failed", whatsapp_status=whatsapp_status, call_status="waiting_reply", queue_action_id=waiting_id, error=wa_result.get("error") or "")
+        skipped_duplicate = wa_result.get("reason") == "duplicate_suppressed_cooldown"
+        result = _automation_result(event_type, source, rule, action, "waiting_reply" if wa_result["success"] else ("skipped" if skipped_duplicate else "failed"), whatsapp_status=whatsapp_status, call_status="waiting_reply", queue_action_id=waiting_id, skip_reason="duplicate_suppressed_cooldown" if skipped_duplicate else "", error=wa_result.get("error") or "")
         result["parent_queue_action_id"] = action_id
-        await update_automation_action_status(action_id, "completed" if wa_result["success"] else "failed", result, wa_result.get("error") or "")
+        await update_automation_action_status(action_id, "completed" if wa_result["success"] else ("skipped" if skipped_duplicate else "failed"), result, wa_result.get("error") or "")
         logger.info("Automation result: %s", result)
         return result
 
@@ -1271,6 +1404,15 @@ async def run_due_automation_actions() -> dict:
     processed = 0
     for action in due:
         action_id = action.get("id", "")
+        try:
+            db = await _db()._adb()
+            fresh = await db.table("automation_actions").select("status").eq("id", action_id).limit(1).execute()
+            fresh_status = ((fresh.data or [{}])[0].get("status") or "").lower()
+            if fresh_status and fresh_status not in {"pending", "waiting_schedule"}:
+                await _db().log_error("automation", "automation_action_already_completed", f"action_id={action_id} status={fresh_status}", "info")
+                continue
+        except Exception:
+            pass
         await update_automation_action_status(action_id, "running")
         try:
             import json as _json
@@ -1305,7 +1447,7 @@ async def run_due_automation_actions() -> dict:
                     event_type=event_type, source_type="automation_runner", source_id=action_id,
                     template_purpose=payload.get("template_purpose") or payload.get("selected_template") or "",
                 )
-                status = "completed" if wa_result["success"] else "failed"
+                status = "completed" if wa_result["success"] else ("skipped" if wa_result.get("reason") == "duplicate_suppressed_cooldown" else "failed")
                 await update_automation_action_status(action_id, status, wa_result, wa_result.get("error") or "")
 
             else:
@@ -1549,7 +1691,7 @@ async def patch_conversation(conv_id: str, updates: dict) -> dict:
     """Patch status/ai_enabled/assigned_to on a conversation."""
     try:
         db = await _db()._adb()
-        allowed = {"status", "ai_enabled", "assigned_to", "unread_count"}
+        allowed = {"status", "ai_enabled", "assigned_to", "unread_count", "appointment_state"}
         upd = {k: v for k, v in updates.items() if k in allowed}
         upd["updated_at"] = datetime.now().isoformat()
         await db.table("whatsapp_conversations").update(upd).eq("id", conv_id).execute()
@@ -2489,6 +2631,8 @@ _APPOINTMENT_INTENT_PATTERNS = (
     "schedule a demo", "demo", "google meet", "zoom", "showroom visit",
     "showroom", "book a slot", "book slot", "book a meeting",
 )
+_APPOINTMENT_CONFIRM_WORDS = ("yes", "ok", "okay", "done", "confirm", "confirmed", "book", "book it", "go ahead", "sure")
+_APPOINTMENT_CANCEL_WORDS = ("cancel", "stop", "never mind", "nevermind", "don't book", "do not book")
 
 
 def _detect_inbound_intent(text: str) -> Optional[str]:
@@ -2507,6 +2651,189 @@ def _detect_inbound_intent(text: str) -> Optional[str]:
         if pat in lower:
             return "appointment"
     return None
+
+
+def _conversation_appointment_state(conv: dict) -> dict:
+    raw = (conv or {}).get("appointment_state") or "{}"
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = _json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _parse_whatsapp_requested_datetime(text: str) -> Optional[dict]:
+    lower = (text or "").lower().strip()
+    time_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", lower)
+    if not time_match:
+        return None
+    hour = int(time_match.group(1))
+    minute = int(time_match.group(2) or 0)
+    meridiem = time_match.group(3)
+    if hour > 23 or minute > 59:
+        return None
+    if meridiem == "pm" and hour < 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+    elif not meridiem and ("evening" in lower or "afternoon" in lower or "night" in lower) and hour < 12:
+        hour += 12
+    base = datetime.now()
+    target_date = base.date()
+    if "tomorrow" in lower:
+        target_date = (base + timedelta(days=1)).date()
+    elif "today" in lower:
+        target_date = base.date()
+    else:
+        day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        for idx, name in enumerate(day_names):
+            if name in lower or name[:3] in lower:
+                days_ahead = (idx - base.weekday()) % 7
+                if days_ahead == 0:
+                    days_ahead = 7
+                target_date = (base + timedelta(days=days_ahead)).date()
+                break
+    scheduled = datetime.combine(target_date, datetime.min.time()).replace(hour=hour, minute=minute)
+    if scheduled < base and "today" not in lower:
+        scheduled += timedelta(days=1)
+    return {
+        "requested_date": scheduled.strftime("%Y-%m-%d"),
+        "requested_time": scheduled.strftime("%H:%M"),
+        "parsed_scheduled_at": scheduled.isoformat(),
+    }
+
+
+def _format_demo_slot(date_str: str, time_str: str) -> str:
+    try:
+        dt = datetime.strptime(f"{date_str} {time_str[:5]}", "%Y-%m-%d %H:%M")
+        day = "tomorrow" if dt.date() == (datetime.now() + timedelta(days=1)).date() else dt.strftime("%d %b %Y")
+        return f"{day} at {dt.strftime('%I:%M %p').lstrip('0')}"
+    except Exception:
+        return f"{date_str} at {time_str}"
+
+
+async def _send_and_save_whatsapp_ai_text(phone: str, conv_id: str, reply_text: str, inbound_saved: Optional[dict], raw_payload: Optional[dict] = None) -> dict:
+    await _log_whatsapp_ai_event(phone, "whatsapp_text_send_started", f"chars={len(reply_text)}")
+    send_result = await send_whatsapp_text(phone, reply_text)
+    provider_id = send_result.get("provider_message_id") or ""
+    if send_result.get("success"):
+        await _log_whatsapp_ai_event(phone, "whatsapp_text_send_success", f"provider_message_id={provider_id}")
+    else:
+        await _log_whatsapp_ai_event(phone, "whatsapp_text_send_failed", send_result.get("error") or "", "error")
+    payload = {"reply_to_message_id": inbound_saved.get("id") if inbound_saved else ""}
+    payload.update(raw_payload or {})
+    await save_wa_message(
+        conv_id=conv_id,
+        phone=phone,
+        direction="outbound",
+        message_type="text",
+        message_text=reply_text,
+        provider_message_id=provider_id,
+        provider_status="sent" if send_result.get("success") else "failed",
+        raw_payload=payload,
+        ai_generated=True,
+    )
+    await _log_whatsapp_ai_event(phone, "outbound_ai_message_saved", f"provider_status={'sent' if send_result.get('success') else 'failed'}")
+    if send_result.get("success"):
+        await update_conversation_last_message(conv_id, reply_text, increment_unread=False)
+    return send_result
+
+
+async def _suggest_available_demo_slots(start_date: str, start_time: str, count: int = 3) -> list:
+    try:
+        from db import check_slot, get_appointment_settings
+        settings = await get_appointment_settings()
+    except Exception:
+        return []
+    try:
+        cursor = datetime.strptime(f"{start_date} {start_time[:5]}", "%Y-%m-%d %H:%M")
+    except Exception:
+        cursor = datetime.now()
+    interval = max(int(settings.get("slot_interval_minutes") or 45), 5)
+    slots = []
+    for _ in range(24 * 12 * max(int(settings.get("max_booking_days_ahead") or 30), 1)):
+        cursor += timedelta(minutes=interval)
+        date_s, time_s = cursor.strftime("%Y-%m-%d"), cursor.strftime("%H:%M")
+        if await check_slot(date_s, time_s):
+            slots.append({"date": date_s, "time": time_s, "label": cursor.strftime("%I:%M %p").lstrip("0")})
+            if len(slots) >= count:
+                break
+    return slots
+
+
+async def _handle_whatsapp_appointment_state(phone: str, conv_id: str, text: str, conv: dict, inbound_saved: Optional[dict], crm_contact: Optional[dict]) -> bool:
+    lower = (text or "").lower().strip()
+    if not lower:
+        return False
+    state = _conversation_appointment_state(conv)
+    if any(word in lower for word in _APPOINTMENT_CANCEL_WORDS) and state.get("status") == "pending_confirmation":
+        await patch_conversation(conv_id, {"appointment_state": "{}"})
+        await _log_whatsapp_ai_event(phone, "appointment_pending_time_saved", "cleared_by_cancel")
+        await _send_and_save_whatsapp_ai_text(phone, conv_id, "No problem, I have not booked that demo slot.", inbound_saved, {"appointment_state": "cancelled"})
+        return True
+
+    parsed_dt = _parse_whatsapp_requested_datetime(text)
+    if parsed_dt:
+        await _log_whatsapp_ai_event(phone, "whatsapp_appointment_intent_detected", f"parsed_scheduled_at={parsed_dt['parsed_scheduled_at']}")
+        try:
+            from db import get_appointment_settings
+            settings = await get_appointment_settings()
+            duration = int(settings.get("demo_duration_minutes") or 30)
+        except Exception:
+            duration = 30
+        pending = {
+            **parsed_dt,
+            "appointment_type": "demo",
+            "status": "pending_confirmation",
+            "updated_at": datetime.now().isoformat(),
+        }
+        await patch_conversation(conv_id, {"appointment_state": _json.dumps(pending)})
+        await _log_whatsapp_ai_event(phone, "appointment_pending_time_saved", f"date={pending['requested_date']} time={pending['requested_time']}")
+        reply = f"A {duration}-minute demo {_format_demo_slot(pending['requested_date'], pending['requested_time'])} works for you. Shall I confirm this slot?"
+        await _send_and_save_whatsapp_ai_text(phone, conv_id, reply, inbound_saved, {"appointment_state": pending})
+        return True
+
+    if state.get("status") == "pending_confirmation" and any(word in lower for word in _APPOINTMENT_CONFIRM_WORDS):
+        await _log_whatsapp_ai_event(phone, "appointment_confirmation_detected", f"state={state}")
+        date_s = state.get("requested_date", "")
+        time_s = state.get("requested_time", "")
+        if not (date_s and time_s):
+            await patch_conversation(conv_id, {"appointment_state": "{}"})
+            return False
+        await _log_whatsapp_ai_event(phone, "appointment_booking_started", f"date={date_s} time={time_s}")
+        try:
+            from db import check_slot, get_appointments_by_phone, insert_appointment
+            if not await check_slot(date_s, time_s):
+                slots = await _suggest_available_demo_slots(date_s, time_s, 3)
+                labels = [s["label"] for s in slots]
+                await _log_whatsapp_ai_event(phone, "appointment_slot_unavailable", f"date={date_s} time={time_s} suggestions={labels}", "warning")
+                if labels:
+                    reply = f"That slot is already booked. Available slots are {', '.join(labels[:-1])}{' or ' if len(labels)>1 else ''}{labels[-1]}. Which one do you prefer?"
+                else:
+                    reply = "That slot is already booked. Please share another preferred time."
+                await _send_and_save_whatsapp_ai_text(phone, conv_id, reply, inbound_saved, {"appointment_state": state})
+                return True
+            lead_name = _usable_whatsapp_name((crm_contact or {}).get("lead_name"), (crm_contact or {}).get("name"), conv.get("contact_name")) or "WhatsApp Lead"
+            booking_id = await insert_appointment(lead_name, phone, date_s, time_s, "Google Meet demo")
+            appts = await get_appointments_by_phone(phone)
+            booked = next((a for a in appts if a.get("date") == date_s and (a.get("time") or "")[:5] == time_s and a.get("status") == "booked"), {})
+            staff_name = booked.get("staff_name") or "our team"
+            booked_state = {**state, "status": "booked", "booking_id": booking_id, "staff_name": staff_name, "booked_at": datetime.now().isoformat()}
+            await patch_conversation(conv_id, {"appointment_state": _json.dumps(booked_state)})
+            await _log_whatsapp_ai_event(phone, "appointment_booked", f"booking_id={booking_id} staff={staff_name}")
+            reply = f"Done, your demo is booked for {_format_demo_slot(date_s, time_s)} with {staff_name}. Our team will share the Google Meet link shortly."
+            await _send_and_save_whatsapp_ai_text(phone, conv_id, reply, inbound_saved, {"appointment_state": booked_state})
+            return True
+        except Exception as exc:
+            await _log_whatsapp_ai_event(phone, "appointment_booking_failed", str(exc)[:500], "error")
+            await _send_and_save_whatsapp_ai_text(phone, conv_id, "Sorry, I could not book that slot right now. Our team will confirm shortly.", inbound_saved, {"appointment_state": state, "error": str(exc)[:300]})
+            return True
+
+    if _detect_inbound_intent(text) == "appointment":
+        await _log_whatsapp_ai_event(phone, "whatsapp_appointment_intent_detected", "appointment_keyword")
+    return False
 
 
 async def _handle_inbound_intent(phone: str, intent: str, conv: dict) -> bool:
@@ -2792,6 +3119,9 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
 
         if not (text or "").strip():
             await _log_whatsapp_ai_reason(phone, "no_text_message", f"conversation_id={conv_id}", "info")
+            return
+
+        if await _handle_whatsapp_appointment_state(phone, conv_id, text, latest_conv, inbound_saved, crm_contact):
             return
 
         recent = await get_messages(conv_id, limit=12)
