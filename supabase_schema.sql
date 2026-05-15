@@ -186,6 +186,10 @@ ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS read_at TEXT NOT NULL DEF
 ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS failed_at TEXT NOT NULL DEFAULT '';
 ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS failure_reason TEXT NOT NULL DEFAULT '';
 ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS error_code TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS media_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS mime_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS file_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS caption TEXT NOT NULL DEFAULT '';
 
 -- ── Phase 7: Automation Actions Queue ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS automation_actions (

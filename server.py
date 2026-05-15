@@ -80,6 +80,7 @@ from whatsapp import (
     save_wa_message, send_whatsapp_text, is_whatsapp_service_window_open,
     get_or_create_conversation, update_conversation_last_message,
     parse_webhook_messages, handle_inbound_whatsapp_message,
+    fetch_whatsapp_media,
     get_whatsapp_gemini_model,
 )
 
@@ -1255,6 +1256,15 @@ async def api_wa_conversation_messages(
 ):
     msgs = await get_messages(conv_id, limit=limit, offset=offset)
     return {"messages": msgs}
+
+
+@app.get("/api/whatsapp/media/{media_id}")
+async def api_wa_media(media_id: str):
+    result = await fetch_whatsapp_media(media_id)
+    if not result.get("success"):
+        raise HTTPException(result.get("status", 502), result.get("error") or "Could not fetch WhatsApp media")
+    headers = {"Content-Disposition": f'inline; filename="{result.get("file_name") or media_id}"'}
+    return StreamingResponse(BytesIO(result.get("content") or b""), media_type=result.get("mime_type") or "application/octet-stream", headers=headers)
 
 
 class WaConvPatchRequest(BaseModel):

@@ -1557,6 +1557,10 @@ async def save_wa_message(
     message_text: str = "",
     template_name: str = "",
     media_url: str = "",
+    media_id: str = "",
+    mime_type: str = "",
+    file_name: str = "",
+    caption: str = "",
     provider_message_id: str = "",
     provider_status: str = "",
     raw_payload: Optional[dict] = None,
@@ -1575,6 +1579,10 @@ async def save_wa_message(
             "message_text": (message_text or "")[:4000],
             "template_name": template_name or "",
             "media_url": media_url or "",
+            "media_id": media_id or "",
+            "mime_type": mime_type or "",
+            "file_name": file_name or "",
+            "caption": caption or "",
             "provider_message_id": provider_message_id or "",
             "provider_status": provider_status or "",
             "raw_payload": _json.dumps(raw_payload or {}),
@@ -1582,7 +1590,13 @@ async def save_wa_message(
             "human_sent": human_sent,
             "created_at": now,
         }
-        await db.table("whatsapp_messages").insert(row).execute()
+        try:
+            await db.table("whatsapp_messages").insert(row).execute()
+        except Exception:
+            fallback = dict(row)
+            for key in ("media_id", "mime_type", "file_name", "caption"):
+                fallback.pop(key, None)
+            await db.table("whatsapp_messages").insert(fallback).execute()
         return row
     except Exception as exc:
         logger.error("save_wa_message error: %s", exc)
@@ -1665,6 +1679,49 @@ async def get_messages(conv_id: str, limit: int = 50, offset: int = 0) -> list:
 
 
 # ── CRM linking ────────────────────────────────────────────────────────────
+
+def _meta_media_proxy_url(media_id: str) -> str:
+    return f"/api/whatsapp/media/{media_id}" if media_id else ""
+
+
+async def fetch_whatsapp_media(media_id: str) -> dict:
+    """Fetch Meta WhatsApp media through the backend without exposing tokens."""
+    media_id = (media_id or "").strip()
+    if not media_id:
+        return {"success": False, "error": "media_id is required", "status": 400}
+    cfg = await _wa_config()
+    token = (cfg.get("WHATSAPP_ACCESS_TOKEN") or "").strip()
+    graph_version = (cfg.get("WHATSAPP_GRAPH_VERSION") or "v20.0").strip() or "v20.0"
+    if not token:
+        return {"success": False, "error": "WhatsApp access token is not configured", "status": 400}
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"https://graph.facebook.com/{graph_version}/{media_id}", headers=headers) as resp:
+                meta = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    return {"success": False, "error": str(meta)[:500], "status": resp.status}
+            media_url = meta.get("url") or ""
+            mime_type = meta.get("mime_type") or "application/octet-stream"
+            if not media_url:
+                return {"success": False, "error": "Media URL not returned by Meta", "status": 502}
+            async with session.get(media_url, headers=headers) as media_resp:
+                content = await media_resp.read()
+                if media_resp.status >= 400:
+                    err = content[:300].decode("utf-8", errors="ignore")
+                    return {"success": False, "error": err, "status": media_resp.status}
+                return {
+                    "success": True,
+                    "content": content,
+                    "mime_type": media_resp.headers.get("Content-Type") or mime_type,
+                    "file_name": meta.get("file_name") or media_id,
+                    "status": 200,
+                }
+    except Exception as exc:
+        logger.error("fetch_whatsapp_media error for %s: %s", media_id, exc)
+        return {"success": False, "error": str(exc)[:500], "status": 500}
+
 
 async def link_conversation_to_crm(conv_id: str, phone: str, contact_name: str = "") -> Optional[dict]:
     """Find or create CRM contact, link to conversation, add note."""
@@ -2136,6 +2193,10 @@ def parse_vobiz_webhook_messages(payload: dict) -> list:
 
                 text = ""
                 media_url = ""
+                media_id = ""
+                mime_type = ""
+                file_name = ""
+                caption = ""
                 if msg_type == "text":
                     text = (msg.get("text") or {}).get("body", "") or msg.get("body", "")
                 elif msg_type in ("button", "interactive"):
@@ -2143,19 +2204,32 @@ def parse_vobiz_webhook_messages(payload: dict) -> list:
                     btn = inter.get("button_reply") or inter.get("list_reply") or inter
                     text = (btn.get("title") if isinstance(btn, dict) else "") or (btn.get("id") if isinstance(btn, dict) else "") or ""
                 elif msg_type == "image":
-                    text = "[Image received]"
-                    media_url = (msg.get("image") or {}).get("url", "")
-                elif msg_type == "audio":
-                    text = "[Audio received]"
-                    media_url = (msg.get("audio") or {}).get("url", "")
+                    media = msg.get("image") or msg.get("media") or {}
+                    media_id = media.get("id", "") or msg.get("media_id", "")
+                    mime_type = media.get("mime_type", "") or msg.get("mime_type", "")
+                    caption = media.get("caption", "") or msg.get("caption", "")
+                    text = caption or "[image received]"
+                    media_url = media.get("url", "") or msg.get("media_url", "")
+                elif msg_type in ("audio", "voice"):
+                    media = msg.get("audio") or msg.get("media") or {}
+                    media_id = media.get("id", "") or msg.get("media_id", "")
+                    mime_type = media.get("mime_type", "") or msg.get("mime_type", "")
+                    msg_type = "voice" if msg_type == "voice" or media.get("voice") or msg.get("voice") else "audio"
+                    text = "[voice message received]" if msg_type == "voice" else "[audio received]"
+                    media_url = media.get("url", "") or msg.get("media_url", "")
                 elif msg_type == "document":
-                    text = "[Document received]"
-                    media_url = (msg.get("document") or {}).get("url", "")
+                    media = msg.get("document") or msg.get("media") or {}
+                    media_id = media.get("id", "") or msg.get("media_id", "")
+                    mime_type = media.get("mime_type", "") or msg.get("mime_type", "")
+                    file_name = media.get("filename", "") or media.get("file_name", "") or msg.get("file_name", "")
+                    caption = media.get("caption", "") or msg.get("caption", "")
+                    text = caption or f"[document received: {file_name or 'file'}]"
+                    media_url = media.get("url", "") or msg.get("media_url", "")
                 elif msg_type == "video":
                     text = "[Video received]"
                     media_url = (msg.get("video") or {}).get("url", "")
                 else:
-                    text = f"[{msg_type} message received]"
+                    text = f"[unsupported message received: {msg_type}]"
 
                 results.append({
                     "phone": phone,
@@ -2163,6 +2237,10 @@ def parse_vobiz_webhook_messages(payload: dict) -> list:
                     "message_type": msg_type,
                     "text": text,
                     "media_url": media_url,
+                    "media_id": media_id,
+                    "mime_type": mime_type,
+                    "file_name": file_name,
+                    "caption": caption,
                     "contact_name": contact_name,
                     "channel_id": channel_id,
                     "conversation_id": conversation_id,
@@ -2242,6 +2320,10 @@ def _parse_meta_webhook_messages(payload: dict) -> list:
 
                     text = ""
                     media_url = ""
+                    media_id = ""
+                    mime_type = ""
+                    file_name = ""
+                    caption = ""
                     if msg_type == "text":
                         text = (msg.get("text") or {}).get("body", "")
                     elif msg_type in ("button", "interactive"):
@@ -2249,16 +2331,31 @@ def _parse_meta_webhook_messages(payload: dict) -> list:
                         btn = inter.get("button_reply") or inter.get("list_reply") or {}
                         text = btn.get("title", "") or btn.get("id", "")
                     elif msg_type == "image":
-                        text = "[Image received]"
-                        media_url = (msg.get("image") or {}).get("url", "")
-                    elif msg_type == "audio":
-                        text = "[Audio received]"
+                        media = msg.get("image") or {}
+                        media_id = media.get("id", "")
+                        mime_type = media.get("mime_type", "")
+                        caption = media.get("caption", "")
+                        text = caption or "[image received]"
+                        media_url = media.get("url", "") or _meta_media_proxy_url(media_id)
+                    elif msg_type in ("audio", "voice"):
+                        media = msg.get("audio") or {}
+                        media_id = media.get("id", "")
+                        mime_type = media.get("mime_type", "")
+                        msg_type = "voice" if msg_type == "voice" or media.get("voice") else "audio"
+                        text = "[voice message received]" if msg_type == "voice" else "[audio received]"
+                        media_url = media.get("url", "") or _meta_media_proxy_url(media_id)
                     elif msg_type == "document":
-                        text = "[Document received]"
+                        media = msg.get("document") or {}
+                        media_id = media.get("id", "")
+                        mime_type = media.get("mime_type", "")
+                        file_name = media.get("filename", "") or media.get("file_name", "")
+                        caption = media.get("caption", "")
+                        text = caption or f"[document received: {file_name or 'file'}]"
+                        media_url = media.get("url", "") or _meta_media_proxy_url(media_id)
                     elif msg_type == "video":
                         text = "[Video received]"
                     else:
-                        text = f"[{msg_type} message received]"
+                        text = f"[unsupported message received: {msg_type}]"
 
                     results.append({
                         "phone": phone,
@@ -2266,9 +2363,14 @@ def _parse_meta_webhook_messages(payload: dict) -> list:
                         "message_type": msg_type,
                         "text": text,
                         "media_url": media_url,
+                        "media_id": media_id,
+                        "mime_type": mime_type,
+                        "file_name": file_name,
+                        "caption": caption,
                         "contact_name": contact_name,
                         "raw": msg,
                         "is_status_update": False,
+                        "provider": "meta",
                     })
     except Exception as exc:
         logger.error("parse_webhook_messages error: %s", exc)
@@ -2453,6 +2555,10 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
     text = parsed.get("text", "")
     msg_type = parsed.get("message_type", "text")
     media_url = parsed.get("media_url", "")
+    media_id = parsed.get("media_id", "")
+    mime_type = parsed.get("mime_type", "")
+    file_name = parsed.get("file_name", "")
+    caption = parsed.get("caption", "")
     contact_name = parsed.get("contact_name", "")
     provider_msg_id = parsed.get("message_id", "")
     raw = parsed.get("raw", {})
@@ -2489,8 +2595,19 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
         message_type=msg_type,
         message_text=text,
         media_url=media_url,
+        media_id=media_id,
+        mime_type=mime_type,
+        file_name=file_name,
+        caption=caption,
         provider_message_id=provider_msg_id,
-        raw_payload=raw,
+        raw_payload={
+            "raw": raw,
+            "media_id": media_id,
+            "media_url": media_url,
+            "mime_type": mime_type,
+            "file_name": file_name,
+            "caption": caption,
+        },
     )
 
     # Update conversation last message
