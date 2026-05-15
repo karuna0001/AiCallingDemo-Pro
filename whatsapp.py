@@ -1533,9 +1533,7 @@ async def record_outbound_template_message(
         conv = await get_or_create_conversation(phone)
         if not conv:
             return {}
-        preview = f"[Template: {template_name}]"
-        if parameters:
-            preview += " " + ", ".join(str(p) for p in parameters if str(p).strip())[:250]
+        preview = _render_template_preview(template_name, parameters)
         if status == "failed" and error_message:
             preview += f" (failed: {error_message[:120]})"
         saved = await save_wa_message(
@@ -1550,6 +1548,7 @@ async def record_outbound_template_message(
             raw_payload={
                 "language": language or "en",
                 "parameters": parameters or [],
+                "template_name": template_name or "",
                 "source_type": source_type,
                 "source_id": source_id,
                 "error_message": error_message or "",
@@ -1560,6 +1559,22 @@ async def record_outbound_template_message(
     except Exception as exc:
         logger.error("record_outbound_template_message error for %s: %s", phone, exc)
         return {}
+
+
+def _render_template_preview(template_name: str, parameters) -> str:
+    params = [str(p).strip() for p in (parameters or [])]
+    name = params[0] if len(params) > 0 and params[0] else "there"
+    business_name = params[1] if len(params) > 1 and params[1] else "your business"
+    if (template_name or "").strip() == "voice_ai_demo_welcome":
+        return (
+            f"Hi {name}, thank you for your enquiry about our AI Voice Agent service for {business_name}.\n\n"
+            "To suggest the right demo, may I know what you want to use the AI Voice Agent for — "
+            "lead follow-up, appointment booking, customer support, payment reminder, or something else?"
+        )
+    preview = f"[Template: {template_name}]"
+    if params:
+        preview += " " + ", ".join(p for p in params if p)[:250]
+    return preview
 
 
 async def get_messages(conv_id: str, limit: int = 50, offset: int = 0) -> list:
@@ -1869,7 +1884,31 @@ async def generate_whatsapp_ai_reply(
         saved_prompt_legacy = await _gs("AI_PROMPT_whatsapp_chat_prompt", "")
         saved_prompt = saved_prompt_primary or saved_prompt_legacy or None
         prompt_source = "db" if saved_prompt else "default"
-        if any(word in lower_text for word in ("booking", "book demo", "demo", "appointment", "meeting", "google meet")):
+        if "lead follow" in lower_text or "follow-up" in lower_text or "follow up" in lower_text:
+            return {
+                "reply": "Our AI Voice Agent can follow up with leads automatically, answer basic questions, and help book demos. May I know your preferred time for a quick Google Meet demo?",
+                "reason": "",
+                "provider": "deterministic_intent",
+                "prompt_type": "whatsapp_chat",
+                "prompt_source": prompt_source,
+            }
+        if "customer support" in lower_text or "support" in lower_text:
+            return {
+                "reply": "Our AI Voice Agent can handle customer support follow-ups, answer common questions, and route important queries to your team. May I know your preferred time for a quick demo?",
+                "reason": "",
+                "provider": "deterministic_intent",
+                "prompt_type": "whatsapp_chat",
+                "prompt_source": prompt_source,
+            }
+        if "payment reminder" in lower_text or "payment follow" in lower_text or "payment" in lower_text:
+            return {
+                "reply": "Our AI Voice Agent can send payment reminders, follow up politely, and update your team on responses. May I know your preferred time for a quick demo?",
+                "reason": "",
+                "provider": "deterministic_intent",
+                "prompt_type": "whatsapp_chat",
+                "prompt_source": prompt_source,
+            }
+        if any(word in lower_text for word in ("booking", "book demo", "demo", "appointment", "meeting", "google meet", "interested")):
             return {
                 "reply": "Sure, I can help you book a demo. May I know your preferred date and time for a quick Google Meet demo?",
                 "reason": "",
