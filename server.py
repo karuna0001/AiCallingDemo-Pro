@@ -80,6 +80,7 @@ from whatsapp import (
     save_wa_message, send_whatsapp_text, is_whatsapp_service_window_open,
     get_or_create_conversation, update_conversation_last_message,
     parse_webhook_messages, handle_inbound_whatsapp_message,
+    get_whatsapp_gemini_model,
 )
 
 load_dotenv(".env", override=False)
@@ -504,6 +505,11 @@ async def api_health():
         recording_retention_days = max(int(await status_value("RECORDING_RETENTION_DAYS") or "7"), 1)
     except ValueError:
         recording_retention_days = 7
+    whatsapp_gemini_model = await get_whatsapp_gemini_model()
+    whatsapp_chat_prompt = (
+        await get_setting("AI_PROMPT_whatsapp_chat", "")
+        or await get_setting("AI_PROMPT_whatsapp_chat_prompt", "")
+    )
     supabase_configured, supabase_error = await supabase_status(supabase_url, supabase_key)
     response = {
         "status": "ok",
@@ -515,6 +521,10 @@ async def api_health():
         "gemini_tts_voice_configured": bool(gemini_voice),
         "prompt_configured": bool(prompt_saved),
         "prompt_mode": "custom" if prompt_saved else "unknown",
+        "whatsapp_ai_provider": "gemini",
+        "whatsapp_gemini_model": whatsapp_gemini_model,
+        "whatsapp_gemini_model_configured": bool(whatsapp_gemini_model),
+        "whatsapp_chat_prompt_configured": bool(whatsapp_chat_prompt),
         "s3_configured": bool(s3_key and s3_secret and s3_bucket),
         "recording_auto_delete_enabled": recording_auto_delete,
         "recording_retention_days": recording_retention_days,

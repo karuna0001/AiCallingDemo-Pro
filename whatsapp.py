@@ -1337,6 +1337,16 @@ async def _log_whatsapp_ai_event(phone: str, event: str, detail: str = "", level
         pass
 
 
+async def get_whatsapp_gemini_model() -> str:
+    from db import get_setting as _gs
+
+    for key in ("WHATSAPP_GEMINI_MODEL", "GEMINI_TEXT_MODEL"):
+        model = (await _gs(key, "") or "").strip()
+        if model and "live" not in model.lower():
+            return model
+    return "gemini-2.5-flash"
+
+
 def _usable_whatsapp_name(*values: str) -> str:
     for value in values:
         name = str(value or "").strip()
@@ -1822,11 +1832,7 @@ async def _legacy_generate_whatsapp_ai_reply(
         if not api_key:
             return None
         genai.configure(api_key=api_key)
-        model_name = await _gs("GEMINI_MODEL", "gemini-1.5-flash")
-        # Use a non-live model for text generation
-        safe_model = model_name if "flash" in model_name or "pro" in model_name else "gemini-1.5-flash"
-        # Strip -live-preview suffix if present
-        safe_model = safe_model.replace("-live-preview", "").replace("-live", "")
+        safe_model = await get_whatsapp_gemini_model()
         model = genai.GenerativeModel(safe_model, system_instruction=system_prompt)
         response = model.generate_content(user_prompt)
         reply = (response.text or "").strip()
@@ -1938,15 +1944,13 @@ async def generate_whatsapp_ai_reply(
         if not api_key:
             return {"reply": None, "reason": "gemini_not_configured", "provider": "gemini", "prompt_type": "whatsapp_chat"}
         genai.configure(api_key=api_key)
-        model_name = await _gs("GEMINI_MODEL", "gemini-1.5-flash")
-        safe_model = model_name if "flash" in model_name or "pro" in model_name else "gemini-1.5-flash"
-        safe_model = safe_model.replace("-live-preview", "").replace("-live", "")
+        safe_model = await get_whatsapp_gemini_model()
         model = genai.GenerativeModel(safe_model, system_instruction=system_prompt)
         response = model.generate_content(user_prompt)
         reply = (response.text or "").strip()
         if not reply:
-            return {"reply": None, "reason": "ai_generation_failed", "provider": "gemini", "prompt_type": "whatsapp_chat"}
-        return {"reply": reply[:1000], "reason": "", "provider": "gemini", "prompt_type": "whatsapp_chat"}
+            return {"reply": None, "reason": "ai_generation_failed", "provider": "gemini", "prompt_type": "whatsapp_chat", "model": safe_model}
+        return {"reply": reply[:1000], "reason": "", "provider": "gemini", "prompt_type": "whatsapp_chat", "model": safe_model}
     except Exception as exc:
         logger.error("generate_whatsapp_ai_reply error: %s", exc)
         return {"reply": None, "reason": "ai_generation_failed", "error": str(exc)[:500], "provider": "gemini", "prompt_type": "whatsapp_chat"}
@@ -2463,6 +2467,8 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
         await _log_whatsapp_ai_event(phone, "conversation_mode", conversation_mode)
         await _log_whatsapp_ai_event(phone, "prompt_type_used", "whatsapp_chat")
         await _log_whatsapp_ai_event(phone, "ai_provider_selected", "gemini")
+        whatsapp_model = await get_whatsapp_gemini_model()
+        await _log_whatsapp_ai_event(phone, "whatsapp_gemini_model", f"whatsapp_gemini_model={whatsapp_model}")
         await _log_whatsapp_ai_event(phone, "ai_generation_started", f"history_messages={len(recent)} mode={conversation_mode}")
         latest_conv = dict(latest_conv or {})
         crm_name = _usable_whatsapp_name((crm_contact or {}).get("lead_name"), (crm_contact or {}).get("name"))
@@ -2480,6 +2486,8 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
         if isinstance(ai_result, dict):
             await _log_whatsapp_ai_event(phone, "ai_provider_selected", ai_result.get("provider") or "gemini")
             await _log_whatsapp_ai_event(phone, "prompt_type_used", ai_result.get("prompt_type") or "whatsapp_chat")
+            if ai_result.get("model"):
+                await _log_whatsapp_ai_event(phone, "whatsapp_gemini_model", f"whatsapp_gemini_model={ai_result.get('model')}")
         if not reply_text:
             reason = ai_reason or "ai_generation_failed"
             await _log_whatsapp_ai_event(phone, "ai_generation_failed", ai_error or reason, "error" if reason == "ai_generation_failed" else "warning")
