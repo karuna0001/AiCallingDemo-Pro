@@ -1263,7 +1263,11 @@ async def api_wa_media(media_id: str):
     result = await fetch_whatsapp_media(media_id)
     if not result.get("success"):
         raise HTTPException(result.get("status", 502), result.get("error") or "Could not fetch WhatsApp media")
-    headers = {"Content-Disposition": f'inline; filename="{result.get("file_name") or media_id}"'}
+    safe_name = os.path.basename(str(result.get("file_name") or media_id)).replace('"', "")
+    headers = {
+        "Content-Disposition": f'inline; filename="{safe_name}"',
+        "Cache-Control": "private, max-age=300",
+    }
     return StreamingResponse(BytesIO(result.get("content") or b""), media_type=result.get("mime_type") or "application/octet-stream", headers=headers)
 
 

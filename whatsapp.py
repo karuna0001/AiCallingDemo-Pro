@@ -1690,10 +1690,14 @@ async def fetch_whatsapp_media(media_id: str) -> dict:
     if not media_id:
         return {"success": False, "error": "media_id is required", "status": 400}
     cfg = await _wa_config()
+    provider = (cfg.get("WHATSAPP_PROVIDER") or "meta").strip().lower()
     token = (cfg.get("WHATSAPP_ACCESS_TOKEN") or "").strip()
     graph_version = (cfg.get("WHATSAPP_GRAPH_VERSION") or "v20.0").strip() or "v20.0"
+    await _db().log_error("whatsapp_media", "whatsapp_media_fetch_started", f"media_id={media_id} provider={provider}", "info")
     if not token:
-        return {"success": False, "error": "WhatsApp access token is not configured", "status": 400}
+        err = "WhatsApp access token is not configured"
+        await _db().log_error("whatsapp_media", "whatsapp_media_fetch_failed", f"media_id={media_id} http_status=400 error={err}", "error")
+        return {"success": False, "error": err, "status": 400}
     headers = {"Authorization": f"Bearer {token}"}
     try:
         timeout = aiohttp.ClientTimeout(total=30)
@@ -1701,25 +1705,33 @@ async def fetch_whatsapp_media(media_id: str) -> dict:
             async with session.get(f"https://graph.facebook.com/{graph_version}/{media_id}", headers=headers) as resp:
                 meta = await resp.json(content_type=None)
                 if resp.status >= 400:
-                    return {"success": False, "error": str(meta)[:500], "status": resp.status}
+                    err = str(meta)[:500]
+                    await _db().log_error("whatsapp_media", "whatsapp_media_fetch_failed", f"media_id={media_id} http_status={resp.status} error={err}", "error")
+                    return {"success": False, "error": err, "status": resp.status}
             media_url = meta.get("url") or ""
             mime_type = meta.get("mime_type") or "application/octet-stream"
             if not media_url:
-                return {"success": False, "error": "Media URL not returned by Meta", "status": 502}
+                err = "Media URL not returned by Meta"
+                await _db().log_error("whatsapp_media", "whatsapp_media_fetch_failed", f"media_id={media_id} mime_type={mime_type} http_status=502 error={err}", "error")
+                return {"success": False, "error": err, "status": 502}
             async with session.get(media_url, headers=headers) as media_resp:
                 content = await media_resp.read()
                 if media_resp.status >= 400:
                     err = content[:300].decode("utf-8", errors="ignore")
+                    await _db().log_error("whatsapp_media", "whatsapp_media_fetch_failed", f"media_id={media_id} mime_type={mime_type} http_status={media_resp.status} error={err}", "error")
                     return {"success": False, "error": err, "status": media_resp.status}
+                final_mime = media_resp.headers.get("Content-Type") or mime_type
+                await _db().log_error("whatsapp_media", "whatsapp_media_fetch_success", f"media_id={media_id} mime_type={final_mime} http_status={media_resp.status}", "info")
                 return {
                     "success": True,
                     "content": content,
-                    "mime_type": media_resp.headers.get("Content-Type") or mime_type,
+                    "mime_type": final_mime,
                     "file_name": meta.get("file_name") or media_id,
                     "status": 200,
                 }
     except Exception as exc:
         logger.error("fetch_whatsapp_media error for %s: %s", media_id, exc)
+        await _db().log_error("whatsapp_media", "whatsapp_media_fetch_failed", f"media_id={media_id} http_status=500 error={str(exc)[:500]}", "error")
         return {"success": False, "error": str(exc)[:500], "status": 500}
 
 
