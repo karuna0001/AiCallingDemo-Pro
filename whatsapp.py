@@ -2619,6 +2619,9 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
             "mime_type": mime_type,
             "file_name": file_name,
             "caption": caption,
+            "image": raw.get("image") if isinstance(raw, dict) else {},
+            "document": raw.get("document") if isinstance(raw, dict) else {},
+            "audio": raw.get("audio") if isinstance(raw, dict) else {},
         },
     )
 
