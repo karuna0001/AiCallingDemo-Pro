@@ -1408,6 +1408,42 @@ async def _log_whatsapp_ai_event(phone: str, event: str, detail: str = "", level
         pass
 
 
+def _safe_media_auto_reply_text(message_type: str) -> str:
+    msg_type = (message_type or "").lower()
+    if msg_type == "image":
+        return "Thanks, I received the image. Our team will check and confirm shortly."
+    if msg_type == "document":
+        return "Thanks, I received the document. Our team will review it and confirm shortly."
+    if msg_type in ("audio", "voice"):
+        return "Thanks, I received your voice message. Our team will check and get back shortly."
+    if msg_type == "video":
+        return "Thanks, I received the video. Our team will check and confirm shortly."
+    return "Thanks, I received your message. Our team will check and confirm shortly."
+
+
+async def _send_whatsapp_media_auto_reply(phone: str, conv_id: str, msg_type: str, inbound_saved: Optional[dict]) -> None:
+    reply_text = _safe_media_auto_reply_text(msg_type)
+    await _log_whatsapp_ai_event(phone, "whatsapp_media_auto_reply_started", f"type={msg_type} conversation_id={conv_id}")
+    send_result = await send_whatsapp_text(phone, reply_text)
+    provider_id = send_result.get("provider_message_id") or ""
+    await save_wa_message(
+        conv_id=conv_id,
+        phone=phone,
+        direction="outbound",
+        message_type="text",
+        message_text=reply_text,
+        provider_message_id=provider_id,
+        provider_status="sent" if send_result.get("success") else "failed",
+        raw_payload={"reply_to_message_id": inbound_saved.get("id") if inbound_saved else "", "auto_reply_for": msg_type},
+        ai_generated=True,
+    )
+    if send_result.get("success"):
+        await _log_whatsapp_ai_event(phone, "whatsapp_media_auto_reply_success", f"type={msg_type} provider_message_id={provider_id}")
+        await update_conversation_last_message(conv_id, reply_text, increment_unread=False)
+    else:
+        await _log_whatsapp_ai_event(phone, "whatsapp_media_auto_reply_failed", send_result.get("error") or "", "error")
+
+
 async def get_whatsapp_gemini_model() -> str:
     from db import get_setting as _gs
 
@@ -2654,7 +2690,21 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
     # Only reply to text/button/interactive messages
     await _log_whatsapp_ai_event(phone, "message_type", f"type={msg_type}")
     if msg_type not in ("text", "button", "interactive"):
-        await _log_whatsapp_ai_reason(phone, "unsupported_message_type", f"type={msg_type}", "info")
+        lock = _conversation_lock(phone)
+        if lock.locked():
+            await _log_whatsapp_ai_reason(phone, "already_processing_same_conversation", f"conversation_id={conv_id}", "info")
+        async with lock:
+            latest_conv = await get_conversation_by_id(conv_id) or conv
+            if not latest_conv.get("ai_enabled", True):
+                reason = "takeover_enabled" if latest_conv.get("assigned_to") else "ai_disabled"
+                await _log_whatsapp_ai_reason(phone, reason, f"conversation_id={conv_id}", "info")
+                return
+            window_open = await is_whatsapp_service_window_open(phone)
+            await _log_whatsapp_ai_event(phone, "service_window_status", f"open={window_open} conversation_id={conv_id}")
+            if not window_open:
+                await _log_whatsapp_ai_reason(phone, "outside_24h_window", f"conversation_id={conv_id}", "info")
+                return
+            await _send_whatsapp_media_auto_reply(phone, conv_id, msg_type, inbound_saved)
         return
 
     # Fix 2: Intent detection (skip if we already promoted a waiting call
