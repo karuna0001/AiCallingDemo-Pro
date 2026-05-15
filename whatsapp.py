@@ -1323,6 +1323,20 @@ async def _log_whatsapp_ai_reason(phone: str, reason: str, detail: str = "", lev
         pass
 
 
+async def _log_whatsapp_ai_event(phone: str, event: str, detail: str = "", level: str = "info") -> None:
+    msg = f"WhatsApp AI event for {phone}: {event}"
+    if level == "error":
+        logger.error("%s %s", msg, detail)
+    elif level == "warning":
+        logger.warning("%s %s", msg, detail)
+    else:
+        logger.info("%s %s", msg, detail)
+    try:
+        await _db().log_error("whatsapp_ai", msg, detail or event, level)
+    except Exception:
+        pass
+
+
 async def get_or_create_conversation(phone: str, contact_name: str = "") -> dict:
     """Return existing open/any conversation for phone, or create a new one."""
     try:
@@ -1822,6 +1836,15 @@ async def generate_whatsapp_ai_reply(
         from prompts import build_prompt_for_type
         from db import get_knowledge_base, get_setting as _gs
 
+        lower_text = (inbound_text or "").strip().lower()
+        if any(word in lower_text for word in ("booking", "book demo", "demo", "appointment", "meeting", "google meet")):
+            return {
+                "reply": "Sure, I can help you book a demo. May I know your preferred date and time for a quick Google Meet demo?",
+                "reason": "",
+                "provider": "deterministic_intent",
+                "prompt_type": "whatsapp_chat_prompt",
+            }
+
         kb = await get_knowledge_base()
         history_lines = []
         for m in recent_messages[-8:]:
@@ -1857,7 +1880,7 @@ async def generate_whatsapp_ai_reply(
         import google.generativeai as genai
         api_key = await _gs("GOOGLE_API_KEY", "")
         if not api_key:
-            return {"reply": None, "reason": "gemini_not_configured"}
+            return {"reply": None, "reason": "gemini_not_configured", "provider": "gemini", "prompt_type": "whatsapp_chat_prompt"}
         genai.configure(api_key=api_key)
         model_name = await _gs("GEMINI_MODEL", "gemini-1.5-flash")
         safe_model = model_name if "flash" in model_name or "pro" in model_name else "gemini-1.5-flash"
@@ -1866,11 +1889,11 @@ async def generate_whatsapp_ai_reply(
         response = model.generate_content(user_prompt)
         reply = (response.text or "").strip()
         if not reply:
-            return {"reply": None, "reason": "ai_generation_failed"}
-        return {"reply": reply[:1000], "reason": ""}
+            return {"reply": None, "reason": "ai_generation_failed", "provider": "gemini", "prompt_type": "whatsapp_chat_prompt"}
+        return {"reply": reply[:1000], "reason": "", "provider": "gemini", "prompt_type": "whatsapp_chat_prompt"}
     except Exception as exc:
         logger.error("generate_whatsapp_ai_reply error: %s", exc)
-        return {"reply": None, "reason": "ai_generation_failed", "error": str(exc)[:500]}
+        return {"reply": None, "reason": "ai_generation_failed", "error": str(exc)[:500], "provider": "gemini", "prompt_type": "whatsapp_chat_prompt"}
 
 
 def parse_vobiz_webhook_messages(payload: dict) -> list:
@@ -2266,6 +2289,7 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
     contact_name = parsed.get("contact_name", "")
     provider_msg_id = parsed.get("message_id", "")
     raw = parsed.get("raw", {})
+    await _log_whatsapp_ai_event(phone, "inbound_received", f"type={msg_type} message_id={provider_msg_id} text={text[:120]}")
 
     # Get/create conversation
     conv = await get_or_create_conversation(phone, contact_name)
@@ -2273,6 +2297,7 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
         logger.error("Could not get/create conversation for %s", phone)
         return
     conv_id = conv["id"]
+    await _log_whatsapp_ai_event(phone, "conversation_found_or_created", f"conversation_id={conv_id} status={conv.get('status', '')}")
 
     # CRM link (async, don't block)
     asyncio.create_task(link_conversation_to_crm(conv_id, phone, contact_name))
@@ -2308,12 +2333,15 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
 
     # AI auto-reply
     ai_enabled = conv.get("ai_enabled", True)
+    await _log_whatsapp_ai_event(phone, "ai_enabled_status", f"ai_enabled={ai_enabled} conversation_id={conv_id}")
+    await _log_whatsapp_ai_event(phone, "takeover_status", f"takeover_enabled={bool(conv.get('assigned_to'))} assigned_to={conv.get('assigned_to', '')}")
     if not ai_enabled:
         reason = "takeover_enabled" if conv.get("assigned_to") else "ai_disabled"
         await _log_whatsapp_ai_reason(phone, reason, f"conversation_id={conv_id}", "info")
         return
 
     # Only reply to text/button/interactive messages
+    await _log_whatsapp_ai_event(phone, "message_type", f"type={msg_type}")
     if msg_type not in ("text", "button", "interactive"):
         await _log_whatsapp_ai_reason(phone, "unsupported_message_type", f"type={msg_type}", "info")
         return
@@ -2334,6 +2362,8 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
     async with lock:
         # Check the latest conversation state inside the per-phone lock.
         latest_conv = await get_conversation_by_id(conv_id) or conv
+        await _log_whatsapp_ai_event(phone, "ai_enabled_status", f"latest_ai_enabled={latest_conv.get('ai_enabled', True)} conversation_id={conv_id}")
+        await _log_whatsapp_ai_event(phone, "takeover_status", f"latest_takeover_enabled={bool(latest_conv.get('assigned_to'))} assigned_to={latest_conv.get('assigned_to', '')}")
         if not latest_conv.get("ai_enabled", True):
             reason = "takeover_enabled" if latest_conv.get("assigned_to") else "ai_disabled"
             await _log_whatsapp_ai_reason(phone, reason, f"conversation_id={conv_id}", "info")
@@ -2341,6 +2371,7 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
 
         # Check 24h window
         window_open = await is_whatsapp_service_window_open(phone)
+        await _log_whatsapp_ai_event(phone, "service_window_status", f"open={window_open} conversation_id={conv_id}")
         if not window_open:
             await _log_whatsapp_ai_reason(phone, "outside_24h_window", f"conversation_id={conv_id}", "info")
             return
@@ -2350,6 +2381,9 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
             return
 
         recent = await get_messages(conv_id, limit=12)
+        await _log_whatsapp_ai_event(phone, "prompt_type_used", "whatsapp_chat_prompt")
+        await _log_whatsapp_ai_event(phone, "ai_provider_selected", "gemini")
+        await _log_whatsapp_ai_event(phone, "ai_generation_started", f"history_messages={len(recent)}")
         ai_result = await generate_whatsapp_ai_reply(latest_conv, text, recent)
         if isinstance(ai_result, dict):
             reply_text = (ai_result.get("reply") or "").strip()
@@ -2359,12 +2393,24 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
             reply_text = (ai_result or "").strip()
             ai_reason = "" if reply_text else "ai_generation_failed"
             ai_error = ""
+        if isinstance(ai_result, dict):
+            await _log_whatsapp_ai_event(phone, "ai_provider_selected", ai_result.get("provider") or "gemini")
+            await _log_whatsapp_ai_event(phone, "prompt_type_used", ai_result.get("prompt_type") or "whatsapp_chat_prompt")
         if not reply_text:
-            await _log_whatsapp_ai_reason(phone, ai_reason or "ai_generation_failed", ai_error or f"conversation_id={conv_id}", "error" if ai_reason == "ai_generation_failed" else "warning")
-            return
+            reason = ai_reason or "ai_generation_failed"
+            await _log_whatsapp_ai_event(phone, "ai_generation_failed", ai_error or reason, "error" if reason == "ai_generation_failed" else "warning")
+            await _log_whatsapp_ai_reason(phone, reason, ai_error or f"conversation_id={conv_id}", "error" if reason == "ai_generation_failed" else "warning")
+            reply_text = "Thanks for your message. Our team will confirm shortly."
+        else:
+            await _log_whatsapp_ai_event(phone, "ai_generation_success", f"chars={len(reply_text)}")
 
+        await _log_whatsapp_ai_event(phone, "whatsapp_text_send_started", f"chars={len(reply_text)}")
         send_result = await send_whatsapp_text(phone, reply_text)
         provider_id = send_result.get("provider_message_id") or ""
+        if send_result.get("success"):
+            await _log_whatsapp_ai_event(phone, "whatsapp_text_send_success", f"provider_message_id={provider_id}")
+        else:
+            await _log_whatsapp_ai_event(phone, "whatsapp_text_send_failed", send_result.get("error") or "", "error")
         await save_wa_message(
             conv_id=conv_id,
             phone=phone,
@@ -2376,6 +2422,7 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
             raw_payload={"reply_to_message_id": inbound_saved.get("id") if inbound_saved else ""},
             ai_generated=True,
         )
+        await _log_whatsapp_ai_event(phone, "outbound_ai_message_saved", f"provider_status={'sent' if send_result.get('success') else 'failed'}")
         if send_result.get("success"):
             await update_conversation_last_message(conv_id, reply_text, increment_unread=False)
         else:
