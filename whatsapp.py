@@ -381,7 +381,7 @@ async def send_whatsapp_template(
 
     cooldown_minutes = _template_cooldown_minutes(event_type, template_name, template_purpose)
     if cooldown_minutes and not _template_cooldown_bypassed(source_type, event_type):
-        dup = await _template_duplicate_check(phone, event_type, template_name, cooldown_minutes)
+        dup = await _template_duplicate_check(phone, event_type, template_name, cooldown_minutes, source_id=source_id)
         if dup.get("duplicate"):
             reason = "duplicate_suppressed_cooldown"
             await _log_wa(
@@ -590,7 +590,7 @@ def _template_cooldown_bypassed(source_type: str, event_type: str) -> bool:
     return source in {"manual", "dashboard", "inbox"} or event in {"manual_send", "manual_template"}
 
 
-async def _template_duplicate_check(phone: str, event_type: str, template_name: str, cooldown_minutes: int) -> dict:
+async def _template_duplicate_check(phone: str, event_type: str, template_name: str, cooldown_minutes: int, source_id: str = "") -> dict:
     if not (phone and template_name and cooldown_minutes > 0):
         return {"duplicate": False}
     cutoff = (datetime.now() - timedelta(minutes=cooldown_minutes)).isoformat()
@@ -613,6 +613,8 @@ async def _template_duplicate_check(phone: str, event_type: str, template_name: 
             .limit(5) \
             .execute()
         rows = res.data or []
+        if (event_type or "").strip().lower() in {"appointment_confirmed", "showroom_visit_confirmed"} and source_id:
+            rows = [r for r in rows if (r.get("source_id") or "") == source_id]
         for row in rows:
             if (row.get("status") or "").lower() in {"sent", "delivered", "read"}:
                 try:
@@ -2763,6 +2765,151 @@ async def _suggest_available_demo_slots(start_date: str, start_time: str, count:
     return slots
 
 
+def _appointment_confirmation_text(customer_name: str, appointment: dict, staff_name: str, duration_minutes: int, meet_link: str = "") -> str:
+    slot = _format_demo_slot(appointment.get("date", ""), appointment.get("time", ""))
+    meet = meet_link or "Our team will share the Google Meet link shortly."
+    return (
+        f"Done, your demo is booked for {slot} with {staff_name}. "
+        f"Duration: {duration_minutes} minutes. {meet}"
+    )
+
+
+def _appointment_internal_notification_text(customer_name: str, phone: str, company: str, appointment: dict, staff_name: str, meet_link: str = "") -> str:
+    slot = _format_demo_slot(appointment.get("date", ""), appointment.get("time", ""))
+    return (
+        "New demo appointment booked ✅\n"
+        f"Customer: {customer_name}\n"
+        f"Phone: {phone}\n"
+        f"Company: {company or 'Not provided'}\n"
+        f"Time: {slot}\n"
+        f"Assigned to: {staff_name}\n"
+        "Source: WhatsApp AI\n"
+        f"Meet link: {meet_link or 'Will be shared shortly'}"
+    )
+
+
+async def _send_telegram_appointment_notification(message: str) -> dict:
+    try:
+        from db import get_setting
+        enabled = (await get_setting("TELEGRAM_NOTIFICATIONS_ENABLED", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
+        token = (await get_setting("TELEGRAM_BOT_TOKEN", "") or "").strip()
+        chat_id = (await get_setting("TELEGRAM_CHAT_ID", "") or "").strip()
+    except Exception as exc:
+        await _db().log_error("appointments", "telegram_notification_failed", str(exc)[:500], "error")
+        return {"success": False, "error": str(exc)[:500], "reason": "settings_error"}
+    if not (enabled and token and chat_id):
+        await _db().log_error("appointments", "telegram_not_configured", "Telegram notifications disabled or missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID", "warning")
+        return {"success": False, "error": "telegram_not_configured", "reason": "telegram_not_configured"}
+    await _db().log_error("appointments", "telegram_notification_started", f"chat_id={chat_id}", "info")
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": message}) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status in (200, 201) and data.get("ok", True):
+                    await _db().log_error("appointments", "telegram_notification_sent", f"chat_id={chat_id}", "info")
+                    return {"success": True}
+                err = str(data)[:500]
+                await _db().log_error("appointments", "telegram_notification_failed", f"http_status={resp.status} error={err}", "error")
+                return {"success": False, "error": err, "reason": "telegram_send_failed"}
+    except Exception as exc:
+        await _db().log_error("appointments", "telegram_notification_failed", str(exc)[:500], "error")
+        return {"success": False, "error": str(exc)[:500], "reason": "telegram_send_failed"}
+
+
+async def _notify_appointment_booked(phone: str, appointment: dict, customer_name: str, company: str, staff_name: str, inbound_saved: Optional[dict]) -> dict:
+    appointment_id = appointment.get("id", "")
+    duration_minutes = int(appointment.get("duration_minutes") or 30)
+    meet_link = appointment.get("google_meet_link") or appointment.get("meet_link") or ""
+    errors = []
+    confirmation_sent = False
+    staff_notified = False
+    telegram_notified = False
+
+    await _log_whatsapp_ai_event(phone, "appointment_confirmation_started", f"appointment_id={appointment_id}")
+    customer_text = _appointment_confirmation_text(customer_name, appointment, staff_name, duration_minutes, meet_link)
+    try:
+        template = await resolve_wa_template("appointment_confirmation_template")
+        if template:
+            language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
+            params = _build_template_params(
+                "appointment_confirmation_template",
+                {"lead_name": customer_name, "business_name": company or "your business"},
+                {"appointment_date": appointment.get("date"), "appointment_time": appointment.get("time")},
+            )
+            result = await send_whatsapp_template(
+                phone, template, language, params,
+                event_type="appointment_confirmed",
+                source_type="whatsapp_ai",
+                source_id=appointment_id or phone,
+                template_purpose="appointment_confirmation_template",
+            )
+            confirmation_sent = bool(result.get("success"))
+            if confirmation_sent:
+                await _log_whatsapp_ai_event(phone, "appointment_confirmation_sent", f"template={template}")
+            else:
+                errors.append(f"customer_confirmation_template: {result.get('error') or result.get('reason')}")
+                await _log_whatsapp_ai_event(phone, "appointment_confirmation_failed", result.get("error") or result.get("reason") or "", "error")
+        else:
+            errors.append("customer_confirmation_template: template_missing")
+            await _log_whatsapp_ai_event(phone, "appointment_confirmation_failed", "template_missing", "warning")
+        if not confirmation_sent:
+            fallback = await _send_and_save_whatsapp_ai_text(phone, appointment.get("conversation_id", "") or "", customer_text, inbound_saved, {"appointment_id": appointment_id, "notification_type": "appointment_confirmation_fallback"})
+            confirmation_sent = bool(fallback.get("success"))
+            if not confirmation_sent:
+                errors.append(f"customer_confirmation_text: {fallback.get('error') or fallback.get('reason')}")
+    except Exception as exc:
+        errors.append(f"customer_confirmation: {str(exc)[:200]}")
+        await _log_whatsapp_ai_event(phone, "appointment_confirmation_failed", str(exc)[:500], "error")
+
+    staff_phone = ""
+    try:
+        from db import get_appointment_staff
+        staff_id = appointment.get("staff_id") or ""
+        staff = next((s for s in await get_appointment_staff(include_inactive=True) if s.get("id") == staff_id), {})
+        staff_phone = staff.get("whatsapp_number") or ""
+    except Exception as exc:
+        errors.append(f"staff_lookup: {str(exc)[:200]}")
+    staff_message = _appointment_internal_notification_text(customer_name, phone, company, appointment, staff_name, meet_link)
+    await _log_whatsapp_ai_event(phone, "staff_notification_started", f"appointment_id={appointment_id} staff_phone={staff_phone}")
+    if staff_phone:
+        staff_result = await send_whatsapp_text(staff_phone, staff_message)
+        staff_notified = bool(staff_result.get("success"))
+        if staff_notified:
+            await _log_whatsapp_ai_event(phone, "staff_notification_sent", f"staff_phone={staff_phone}")
+        else:
+            errors.append(f"staff_whatsapp: {staff_result.get('error') or staff_result.get('reason')}")
+            await _log_whatsapp_ai_event(phone, "staff_notification_failed", staff_result.get("error") or staff_result.get("reason") or "", "error")
+    else:
+        errors.append("staff_whatsapp: missing_staff_whatsapp_number")
+        await _log_whatsapp_ai_event(phone, "staff_notification_failed", "missing_staff_whatsapp_number", "warning")
+
+    telegram_result = await _send_telegram_appointment_notification(staff_message)
+    telegram_notified = bool(telegram_result.get("success"))
+    if not telegram_notified and telegram_result.get("reason") != "telegram_not_configured":
+        errors.append(f"telegram: {telegram_result.get('error') or telegram_result.get('reason')}")
+
+    try:
+        from db import update_appointment_notifications
+        if appointment_id:
+            await update_appointment_notifications(appointment_id, {
+                "confirmation_sent": confirmation_sent,
+                "confirmation_sent_at": datetime.now().isoformat() if confirmation_sent else "",
+                "staff_notified": staff_notified,
+                "telegram_notified": telegram_notified,
+                "notification_error": "; ".join(errors)[:1000],
+            })
+    except Exception as exc:
+        await _log_whatsapp_ai_event(phone, "appointment_notification_update_failed", str(exc)[:500], "error")
+
+    return {
+        "confirmation_sent": confirmation_sent,
+        "staff_notified": staff_notified,
+        "telegram_notified": telegram_notified,
+        "notification_error": "; ".join(errors)[:1000],
+    }
+
+
 async def _handle_whatsapp_appointment_state(phone: str, conv_id: str, text: str, conv: dict, inbound_saved: Optional[dict], crm_contact: Optional[dict]) -> bool:
     lower = (text or "").lower().strip()
     if not lower:
@@ -2820,9 +2967,14 @@ async def _handle_whatsapp_appointment_state(phone: str, conv_id: str, text: str
             appts = await get_appointments_by_phone(phone)
             booked = next((a for a in appts if a.get("date") == date_s and (a.get("time") or "")[:5] == time_s and a.get("status") == "booked"), {})
             staff_name = booked.get("staff_name") or "our team"
+            booked = {**booked, "conversation_id": conv_id}
             booked_state = {**state, "status": "booked", "booking_id": booking_id, "staff_name": staff_name, "booked_at": datetime.now().isoformat()}
             await patch_conversation(conv_id, {"appointment_state": _json.dumps(booked_state)})
             await _log_whatsapp_ai_event(phone, "appointment_booked", f"booking_id={booking_id} staff={staff_name}")
+            company = _first_value((crm_contact or {}).get("business_name"), (crm_contact or {}).get("company_name"), (crm_contact or {}).get("business"), fallback="Not provided")
+            notification_result = await _notify_appointment_booked(phone, booked, lead_name, company, staff_name, inbound_saved)
+            booked_state["notifications"] = notification_result
+            await patch_conversation(conv_id, {"appointment_state": _json.dumps(booked_state)})
             reply = f"Done, your demo is booked for {_format_demo_slot(date_s, time_s)} with {staff_name}. Our team will share the Google Meet link shortly."
             await _send_and_save_whatsapp_ai_text(phone, conv_id, reply, inbound_saved, {"appointment_state": booked_state})
             return True

@@ -75,6 +75,9 @@ DEFAULTS = {
     "RECORDING_AUTO_DELETE_ENABLED": os.getenv("RECORDING_AUTO_DELETE_ENABLED", "false"),
     "RECORDING_RETENTION_DAYS":      os.getenv("RECORDING_RETENTION_DAYS", "7"),
     "RECORDING_CLEANUP_TIME":        os.getenv("RECORDING_CLEANUP_TIME", "02:00"),
+    "TELEGRAM_BOT_TOKEN":            os.getenv("TELEGRAM_BOT_TOKEN", ""),
+    "TELEGRAM_CHAT_ID":              os.getenv("TELEGRAM_CHAT_ID", ""),
+    "TELEGRAM_NOTIFICATIONS_ENABLED": os.getenv("TELEGRAM_NOTIFICATIONS_ENABLED", "false"),
 }
 
 DEFAULT_LEAD_STATUSES = [
@@ -649,6 +652,30 @@ async def get_appointments_by_phone(phone: str) -> list:
     db = await _adb()
     result = await db.table("appointments").select("*").eq("phone", phone).order("date", desc=True).execute()
     return result.data or []
+
+
+async def update_appointment_notifications(appointment_id: str, updates: dict) -> bool:
+    allowed = {
+        "confirmation_sent",
+        "confirmation_sent_at",
+        "staff_notified",
+        "telegram_notified",
+        "notification_error",
+    }
+    clean = {k: v for k, v in (updates or {}).items() if k in allowed}
+    if not clean:
+        return False
+    db = await _adb()
+    try:
+        result = await db.table("appointments").update(clean).eq("id", appointment_id).execute()
+    except Exception:
+        fallback = dict(clean)
+        for key in ("confirmation_sent", "confirmation_sent_at", "staff_notified", "telegram_notified", "notification_error"):
+            fallback.pop(key, None)
+        if not fallback:
+            return False
+        result = await db.table("appointments").update(fallback).eq("id", appointment_id).execute()
+    return len(result.data or []) > 0
 
 
 async def log_call(phone_number: str, lead_name: Optional[str], outcome: str, reason: str, duration_seconds: int, recording_url: Optional[str] = None, notes: Optional[str] = None, recording_object_key: Optional[str] = None, recording_size_bytes: int = 0) -> None:
