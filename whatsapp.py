@@ -3392,3 +3392,125 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
         await update_conversation_last_message(conv_id, reply_text, increment_unread=False)
     else:
         logger.warning("AI reply send failed for %s: %s", phone, send_result.get("error"))
+
+
+# ── Appointment Reminders Runner ──────────────────────────────────────────
+
+async def run_due_appointment_reminders() -> None:
+    try:
+        from db import get_due_reminder_appointments, get_appointment_settings, get_appointment_staff, update_appointment_notifications, log_error
+        settings = await get_appointment_settings()
+        window_minutes = settings.get("reminder_before_minutes", 60)
+        due_appointments = await get_due_reminder_appointments(window_minutes)
+
+        if not due_appointments:
+            return
+
+        await log_error("appointment_reminder", "appointment_reminder_scan_started", f"Found {len(due_appointments)} due appointments", "info")
+
+        staff_list = await get_appointment_staff(include_inactive=True)
+
+        for appt in due_appointments:
+            appt_id = appt.get("id")
+            phone = appt.get("phone", "")
+            customer_name = appt.get("name", "")
+            date_s = appt.get("date", "")
+            time_s = appt.get("time", "")
+            staff_id = appt.get("staff_id", "")
+            staff_name = appt.get("staff_name", "")
+
+            # Get staff details
+            staff = next((s for s in staff_list if s.get("id") == staff_id), {})
+            staff_phone = staff.get("whatsapp_number") or ""
+
+            updates = {}
+            errors = []
+            now_str = datetime.now().isoformat()
+
+            # 1. Customer Reminder
+            if settings.get("customer_reminder_enabled") and not appt.get("customer_reminder_sent"):
+                template = await resolve_wa_template("appointment_reminder_template")
+                if template:
+                    language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
+                    params = _build_template_params(
+                        "appointment_reminder_template",
+                        {"lead_name": customer_name, "business_name": "our company"},
+                        {"appointment_date": date_s, "appointment_time": time_s},
+                    )
+                    result = await send_whatsapp_template(
+                        phone, template, language, params,
+                        event_type="appointment_reminder",
+                        source_type="whatsapp_ai",
+                        source_id=appt_id or phone,
+                        template_purpose="appointment_reminder_template",
+                    )
+                    if result.get("success"):
+                        updates["customer_reminder_sent"] = True
+                        updates["customer_reminder_sent_at"] = now_str
+                    else:
+                        errors.append(f"customer_template_failed: {result.get('error') or result.get('reason')}")
+                        # Fallback to normal text
+                        customer_text = f"Hi {customer_name}, this is a reminder for your upcoming appointment on {_format_demo_slot(date_s, time_s)} with {staff_name}. See you soon!"
+                        fallback = await send_whatsapp_text(phone, customer_text)
+                        if fallback.get("success"):
+                            updates["customer_reminder_sent"] = True
+                            updates["customer_reminder_sent_at"] = now_str
+                        else:
+                            errors.append(f"customer_text_failed: {fallback.get('error') or fallback.get('reason')}")
+                else:
+                    # Template missing, fallback to text directly
+                    errors.append("customer_reminder_template_missing")
+                    customer_text = f"Hi {customer_name}, this is a reminder for your upcoming appointment on {_format_demo_slot(date_s, time_s)} with {staff_name}. See you soon!"
+                    fallback = await send_whatsapp_text(phone, customer_text)
+                    if fallback.get("success"):
+                        updates["customer_reminder_sent"] = True
+                        updates["customer_reminder_sent_at"] = now_str
+                    else:
+                        errors.append(f"customer_text_failed: {fallback.get('error') or fallback.get('reason')}")
+            elif not settings.get("customer_reminder_enabled"):
+                errors.append("skipped_customer_disabled")
+
+            # 2. Staff Reminder
+            if settings.get("staff_reminder_enabled") and not appt.get("staff_reminder_sent"):
+                if staff_phone:
+                    staff_msg = f"Reminder: You have an upcoming appointment with {customer_name} on {_format_demo_slot(date_s, time_s)}."
+                    staff_result = await send_whatsapp_text(staff_phone, staff_msg)
+                    if staff_result.get("success"):
+                        updates["staff_reminder_sent"] = True
+                        updates["staff_reminder_sent_at"] = now_str
+                    else:
+                        errors.append(f"staff_whatsapp_failed: {staff_result.get('error') or staff_result.get('reason')}")
+                else:
+                    errors.append("staff_whatsapp_missing")
+            elif not settings.get("staff_reminder_enabled"):
+                errors.append("skipped_staff_disabled")
+
+            # 3. Telegram Reminder
+            if settings.get("telegram_reminder_enabled") and not appt.get("telegram_reminder_sent"):
+                tg_msg = f"Reminder: Upcoming appointment with {customer_name} on {_format_demo_slot(date_s, time_s)}. Assigned to: {staff_name}."
+                tg_result = await _send_telegram_appointment_notification(tg_msg)
+                if tg_result.get("success"):
+                    updates["telegram_reminder_sent"] = True
+                    updates["telegram_reminder_sent_at"] = now_str
+                else:
+                    if tg_result.get("reason") == "telegram_not_configured":
+                        errors.append("telegram_not_configured")
+                    else:
+                        errors.append(f"telegram_failed: {tg_result.get('error') or tg_result.get('reason')}")
+            elif not settings.get("telegram_reminder_enabled"):
+                errors.append("skipped_telegram_disabled")
+
+            updates["reminder_processed"] = True
+            updates["reminder_processed_at"] = now_str
+            if errors:
+                updates["reminder_error"] = "; ".join(errors)[:1000]
+
+            await update_appointment_notifications(appt_id, updates)
+            await log_error("appointment_reminder", "appointment_reminder_processed", f"Processed reminder for {appt_id}, errors: {updates.get('reminder_error')}", "info")
+
+    except Exception as exc:
+        import traceback
+        trace = traceback.format_exc()
+        logger.error("run_due_appointment_reminders error: %s", exc)
+        from db import log_error
+        await log_error("appointment_reminder", "appointment_reminder_runner_failed", str(trace)[:2000], "error")

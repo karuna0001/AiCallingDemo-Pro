@@ -1,4 +1,4 @@
-﻿import json as _json_mod
+import json as _json_mod
 import logging
 import os
 import re
@@ -389,6 +389,16 @@ APPOINTMENT_SETTING_DEFAULTS = {
     "timezone": "Asia/Kolkata",
     "minimum_notice_minutes": 30,
     "max_booking_days_ahead": 30,
+    "customer_reminder_enabled": 1,
+    "staff_reminder_enabled": 1,
+    "telegram_reminder_enabled": 1,
+    "reminder_before_minutes": 60,
+}
+
+APPOINTMENT_BOOL_SETTINGS = {
+    "customer_reminder_enabled",
+    "staff_reminder_enabled",
+    "telegram_reminder_enabled",
 }
 
 
@@ -661,6 +671,15 @@ async def update_appointment_notifications(appointment_id: str, updates: dict) -
         "staff_notified",
         "telegram_notified",
         "notification_error",
+        "customer_reminder_sent",
+        "customer_reminder_sent_at",
+        "staff_reminder_sent",
+        "staff_reminder_sent_at",
+        "telegram_reminder_sent",
+        "telegram_reminder_sent_at",
+        "reminder_error",
+        "reminder_processed",
+        "reminder_processed_at",
     }
     clean = {k: v for k, v in (updates or {}).items() if k in allowed}
     if not clean:
@@ -669,13 +688,57 @@ async def update_appointment_notifications(appointment_id: str, updates: dict) -
     try:
         result = await db.table("appointments").update(clean).eq("id", appointment_id).execute()
     except Exception:
-        fallback = dict(clean)
-        for key in ("confirmation_sent", "confirmation_sent_at", "staff_notified", "telegram_notified", "notification_error"):
-            fallback.pop(key, None)
+        # Schema may be missing newer columns; retry with the legacy subset.
+        legacy_allowed = {
+            "confirmation_sent",
+            "confirmation_sent_at",
+            "staff_notified",
+            "telegram_notified",
+            "notification_error",
+        }
+        fallback = {k: v for k, v in clean.items() if k in legacy_allowed}
         if not fallback:
             return False
         result = await db.table("appointments").update(fallback).eq("id", appointment_id).execute()
     return len(result.data or []) > 0
+
+
+async def get_due_reminder_appointments(window_minutes: int) -> list:
+    """Return booked appointments within the next ``window_minutes`` whose
+    reminder flags are not yet all satisfied.
+
+    Skips cancelled / completed / no_show / past appointments."""
+    if window_minutes <= 0:
+        return []
+    db = await _adb()
+    now = datetime.now()
+    window_end = now + timedelta(minutes=window_minutes)
+    today = now.strftime("%Y-%m-%d")
+    end_date = window_end.strftime("%Y-%m-%d")
+    try:
+        result = await db.table("appointments") \
+            .select("*") \
+            .eq("status", "booked") \
+            .gte("date", today) \
+            .lte("date", end_date) \
+            .order("date").order("time") \
+            .execute()
+        rows = result.data or []
+    except Exception as exc:
+        logger.warning("get_due_reminder_appointments fetch failed: %s", exc)
+        return []
+    due = []
+    for row in rows:
+        start = _appointment_start(row)
+        if not start:
+            continue
+        if start <= now or start > window_end:
+            continue
+        # If already processed by the reminder runner, skip.
+        if bool(row.get("reminder_processed")):
+            continue
+        due.append(row)
+    return due
 
 
 async def log_call(phone_number: str, lead_name: Optional[str], outcome: str, reason: str, duration_seconds: int, recording_url: Optional[str] = None, notes: Optional[str] = None, recording_object_key: Optional[str] = None, recording_size_bytes: int = 0) -> None:

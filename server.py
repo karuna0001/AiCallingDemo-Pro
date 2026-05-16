@@ -85,6 +85,7 @@ from whatsapp import (
     parse_webhook_messages, handle_inbound_whatsapp_message,
     fetch_whatsapp_media,
     get_whatsapp_gemini_model,
+    run_due_appointment_reminders,
 )
 
 load_dotenv(".env", override=False)
@@ -201,6 +202,14 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
     logger.exception("Unhandled error on %s: %s", request.url.path, exc)
     return JSONResponse(status_code=500, content={"error": msg})
 
+def _run_due_appointment_reminders_sync():
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        asyncio.run_coroutine_threadsafe(run_due_appointment_reminders(), loop)
+    else:
+        asyncio.run(run_due_appointment_reminders())
+
+
 
 @app.on_event("startup")
 async def _startup():
@@ -217,8 +226,14 @@ async def _startup():
                 id="automation_runner",
                 replace_existing=True,
             )
+            _scheduler.add_job(
+                _run_due_appointment_reminders_sync,
+                trigger=IntervalTrigger(seconds=60),
+                id="appointment_reminder_runner",
+                replace_existing=True,
+            )
         except Exception as _e:
-            logger.warning("Automation runner schedule failed: %s", _e)
+            logger.warning("Runners schedule failed: %s", _e)
 
 
 @app.on_event("shutdown")

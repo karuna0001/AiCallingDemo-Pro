@@ -77,8 +77,18 @@ ALTER TABLE appointments ADD COLUMN IF NOT EXISTS confirmation_sent_at TEXT NOT 
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS staff_notified BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS telegram_notified BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS notification_error TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS customer_reminder_sent BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS customer_reminder_sent_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS staff_reminder_sent BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS staff_reminder_sent_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS telegram_reminder_sent BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS telegram_reminder_sent_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_error TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_processed BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_processed_at TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_appointments_staff ON appointments(staff_id);
 CREATE INDEX IF NOT EXISTS idx_appointments_date_time ON appointments(date, time);
+CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);
 
 CREATE TABLE IF NOT EXISTS appointment_staff (
     id TEXT PRIMARY KEY,
