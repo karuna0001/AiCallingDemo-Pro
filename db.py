@@ -643,19 +643,127 @@ async def get_next_available(date: str, time: str) -> str:
     return f"no open slots found in the next {settings['max_booking_days_ahead']} days"
 
 
-async def get_all_appointments(date_filter: Optional[str] = None) -> list:
+async def get_all_appointments(date_filter: Optional[str] = None, status_filter: Optional[str] = None, search_query: Optional[str] = None) -> list:
     db = await _adb()
-    query = db.table("appointments").select("*").order("date").order("time")
+    query = db.table("appointments").select("*").order("date", desc=True).order("time", desc=True)
     if date_filter:
         query = query.eq("date", date_filter)
+    if status_filter:
+        query = query.eq("status", status_filter)
+
     result = await query.execute()
-    return result.data or []
+    rows = result.data or []
+
+    if search_query:
+        sq = search_query.lower()
+        rows = [r for r in rows if sq in (r.get("name") or "").lower() or sq in (r.get("phone") or "").lower()]
+
+    return rows
+
+
+async def update_appointment_status(appointment_id: str, status: str) -> bool:
+    if status not in ("booked", "completed", "no_show", "cancelled", "rescheduled"):
+        return False
+
+    updates = {"status": status}
+    now_iso = datetime.now().isoformat()
+
+    if status == "completed":
+        updates["completed_at"] = now_iso
+    elif status == "no_show":
+        updates["no_show_at"] = now_iso
+    elif status == "cancelled":
+        updates["cancelled_at"] = now_iso
+    elif status == "rescheduled":
+        updates["rescheduled_at"] = now_iso
+
+    if status in ("completed", "no_show", "cancelled", "rescheduled"):
+        updates["reminder_processed"] = True
+
+    db = await _adb()
+    result = await db.table("appointments").update(updates).eq("id", appointment_id).execute()
+    return len(result.data or []) > 0
+
+
+async def update_appointment_notes(appointment_id: str, notes: str) -> bool:
+    db = await _adb()
+    result = await db.table("appointments").update({"notes": notes}).eq("id", appointment_id).execute()
+    return len(result.data or []) > 0
+
+
+async def reschedule_appointment(appointment_id: str, new_date: str, new_time: str) -> dict:
+    db = await _adb()
+    old = await db.table("appointments").select("*").eq("id", appointment_id).maybe_single().execute()
+    if not old or not old.data:
+        raise ValueError("Appointment not found")
+
+    old_data = old.data
+    settings = await get_appointment_settings()
+
+    try:
+        start = datetime.strptime(f"{new_date} {new_time[:5]}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        raise ValueError("Invalid appointment date or time")
+
+    now = datetime.now()
+    if start < now + timedelta(minutes=settings["minimum_notice_minutes"]):
+        raise ValueError("Appointment is too soon")
+    if start.date() > (now + timedelta(days=settings["max_booking_days_ahead"])).date():
+        raise ValueError("Appointment is too far ahead")
+
+    old_staff_id = old_data.get("staff_id")
+    staff_to_assign = None
+
+    if old_staff_id:
+        old_staff_obj = await db.table("appointment_staff").select("*").eq("id", old_staff_id).maybe_single().execute()
+        if old_staff_obj and old_staff_obj.data:
+            if _staff_available_for(old_staff_obj.data, start) and not await _appointment_conflicts(old_staff_id, start, settings):
+                staff_to_assign = old_staff_obj.data
+
+    if not staff_to_assign:
+        staff_to_assign = await _select_staff_round_robin(start)
+
+    if not staff_to_assign and await get_appointment_staff(include_inactive=True):
+        raise ValueError("No staff available for this slot")
+
+    if not staff_to_assign and not await check_slot(new_date, new_time):
+        raise ValueError("Slot is unavailable")
+
+    new_id = str(uuid.uuid4())
+    new_row = {
+        "id": new_id,
+        "name": old_data.get("name", ""),
+        "phone": old_data.get("phone", ""),
+        "date": new_date,
+        "time": new_time[:5],
+        "service": old_data.get("service", ""),
+        "status": "booked",
+        "staff_id": (staff_to_assign or {}).get("id", ""),
+        "staff_name": (staff_to_assign or {}).get("name", ""),
+        "duration_minutes": old_data.get("duration_minutes") or settings["demo_duration_minutes"],
+        "buffer_minutes": old_data.get("buffer_minutes") or settings["buffer_minutes"],
+        "timezone": old_data.get("timezone") or settings["timezone"],
+        "created_at": datetime.now().isoformat(),
+        "rescheduled_from": appointment_id,
+        "notes": old_data.get("notes", ""),
+        "customer_reminder_sent": False,
+        "staff_reminder_sent": False,
+        "telegram_reminder_sent": False,
+        "reminder_processed": False,
+        "reminder_error": "",
+    }
+
+    await db.table("appointments").insert(new_row).execute()
+    await update_appointment_status(appointment_id, "rescheduled")
+
+    if staff_to_assign:
+        await set_setting("APPOINTMENT_LAST_STAFF_ID", staff_to_assign["id"])
+
+    return new_row
 
 
 async def cancel_appointment(appointment_id: str) -> bool:
-    db = await _adb()
-    result = await db.table("appointments").update({"status": "cancelled"}).eq("id", appointment_id).eq("status", "booked").execute()
-    return len(result.data or []) > 0
+    return await update_appointment_status(appointment_id, "cancelled")
 
 
 async def get_appointments_by_phone(phone: str) -> list:

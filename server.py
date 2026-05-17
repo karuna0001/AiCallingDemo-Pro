@@ -39,6 +39,7 @@ from db import (
     ConfigError, CRM_TERMINAL_STATUSES, DuplicateContactError,
     cancel_appointment, clear_all_test_data, clear_appointments,
     delete_appointment_staff, get_appointment_settings, get_appointment_staff,
+    update_appointment_status, update_appointment_notes, reschedule_appointment,
     clear_call_logs, clear_campaigns, clear_contact_memory, clear_error_logs,
     clear_errors, create_agent_profile, create_campaign, delete_agent_profile,
     delete_campaign, get_agent_profile,
@@ -296,6 +297,15 @@ class CampaignRequest(BaseModel):
     call_delay_seconds: int = 3
     system_prompt: Optional[str] = None
     agent_profile_id: Optional[str] = None
+
+
+class AppointmentStatusRequest(BaseModel):
+    status: str
+
+
+class AppointmentRescheduleRequest(BaseModel):
+    date: str
+    time: str
 
 
 class StatusRequest(BaseModel):
@@ -880,8 +890,8 @@ async def api_recordings_cleanup(req: Optional[RecordingCleanupRequest] = None):
 
 
 @app.get("/api/appointments")
-async def api_get_appointments(date: Optional[str] = None):
-    return await get_all_appointments(date_filter=date)
+async def api_get_appointments(date: Optional[str] = None, status: Optional[str] = None, q: Optional[str] = None):
+    return await get_all_appointments(date_filter=date, status_filter=status, search_query=q)
 
 
 @app.get("/api/appointments/settings")
@@ -931,6 +941,34 @@ async def api_cancel_appointment(appointment_id: str):
     if not ok:
         raise HTTPException(404, "Appointment not found or already cancelled")
     return {"status": "cancelled"}
+
+
+@app.patch("/api/appointments/{appointment_id}/status")
+async def api_patch_appointment_status(appointment_id: str, req: AppointmentStatusRequest):
+    ok = await update_appointment_status(appointment_id, req.status)
+    if not ok:
+        raise HTTPException(400, "Update failed. Check status value or appointment ID.")
+    return {"success": True, "status": req.status}
+
+
+@app.patch("/api/appointments/{appointment_id}/reschedule")
+async def api_patch_appointment_reschedule(appointment_id: str, req: AppointmentRescheduleRequest):
+    try:
+        new_appt = await reschedule_appointment(appointment_id, req.date, req.time)
+        return {"success": True, "appointment": new_appt}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.exception("Reschedule failed")
+        raise HTTPException(500, "Internal error during rescheduling")
+
+
+@app.patch("/api/appointments/{appointment_id}/notes")
+async def api_patch_appointment_notes(appointment_id: str, req: NotesRequest):
+    ok = await update_appointment_notes(appointment_id, req.notes)
+    if not ok:
+        raise HTTPException(404, "Appointment not found")
+    return {"success": True}
 
 
 @app.get("/api/prompt")

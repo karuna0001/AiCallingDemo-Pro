@@ -67,6 +67,12 @@ CREATE TABLE IF NOT EXISTS campaigns (
 ALTER TABLE campaigns DISABLE ROW LEVEL SECURITY;
 
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS calcom_booking_uid TEXT;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS cancelled_at timestamptz;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS completed_at timestamptz;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS no_show_at timestamptz;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS rescheduled_at timestamptz;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS rescheduled_from text;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS notes text;
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS staff_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS staff_name TEXT NOT NULL DEFAULT '';
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 30;
