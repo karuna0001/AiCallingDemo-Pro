@@ -889,6 +889,58 @@ async def api_recordings_cleanup(req: Optional[RecordingCleanupRequest] = None):
     return {"success": True, **result, "message": "Old recordings cleaned up"}
 
 
+@app.get("/api/recordings/file")
+async def api_recordings_file(key: str = Query(...)):
+    import boto3
+    import botocore.exceptions
+
+    aws_key = await eff("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
+    aws_secret = await eff("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    bucket = await eff("S3_BUCKET") or os.getenv("AWS_BUCKET_NAME", "")
+    endpoint = await eff("S3_ENDPOINT_URL") or os.getenv("S3_ENDPOINT", "")
+    region = await eff("S3_REGION") or os.getenv("AWS_REGION", "ap-northeast-1")
+
+    if not (aws_key and aws_secret and bucket):
+        logger.error("recording_playback_failed: credentials not configured")
+        raise HTTPException(503, "Storage not configured")
+
+    client = boto3.client(
+        "s3",
+        aws_access_key_id=aws_key,
+        aws_secret_access_key=aws_secret,
+        endpoint_url=endpoint or None,
+        region_name=region,
+    )
+
+    try:
+        logger.info(f"recording_playback_requested: key={key}")
+        response = client.get_object(Bucket=bucket, Key=key)
+
+        ext = key.lower().split('.')[-1]
+        content_type = {
+            "ogg": "audio/ogg",
+            "mp3": "audio/mpeg",
+            "wav": "audio/wav",
+            "webm": "audio/webm",
+        }.get(ext, "application/octet-stream")
+
+        def iterfile():
+            yield from response['Body']
+
+        logger.info(f"recording_playback_success: key={key}")
+        return StreamingResponse(
+            iterfile(),
+            media_type=content_type,
+            headers={"Content-Disposition": "inline"}
+        )
+    except botocore.exceptions.ClientError as exc:
+        logger.error(f"recording_playback_failed: {exc}")
+        raise HTTPException(404, "Recording unavailable")
+    except Exception as exc:
+        logger.error(f"recording_playback_failed: {exc}")
+        raise HTTPException(500, "Internal error")
+
+
 @app.get("/api/appointments")
 async def api_get_appointments(date: Optional[str] = None, status: Optional[str] = None, q: Optional[str] = None):
     return await get_all_appointments(date_filter=date, status_filter=status, search_query=q)
