@@ -18,7 +18,7 @@ import certifi
 import aiohttp
 from pathlib import Path
 from urllib.parse import urlparse, unquote
-from typing import Optional
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -815,7 +815,17 @@ async def _recording_cleanup_time() -> str:
     return await get_setting("RECORDING_CLEANUP_TIME", "02:00") or "02:00"
 
 
-def _derive_recording_key(recording_url: str, bucket: str) -> Optional[str]:
+def _derive_recording_key(recording: Any, bucket: str = "") -> Optional[str]:
+    if not recording:
+        return None
+    if isinstance(recording, dict):
+        direct_key = recording.get("recording_object_key") or recording.get("object_key")
+        if direct_key:
+            key = str(direct_key).strip().lstrip("/")
+            return None if not key or ".." in key.split("/") else key
+        recording_url = recording.get("recording_url") or recording.get("recording_download_url") or ""
+    else:
+        recording_url = str(recording)
     if not recording_url:
         return None
     parsed = urlparse(recording_url)
