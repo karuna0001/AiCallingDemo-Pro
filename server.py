@@ -2275,6 +2275,10 @@ async def api_get_crm_contacts(
     assigned_to: Optional[str] = None,
     recording_available: Optional[str] = None,
     has_followup: Optional[str] = None,
+    page: Optional[int] = None,
+    page_size: Optional[int] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
 ):
     filters = _crm_filter_dict(
         status=status, outcome=outcome, q=q,
@@ -2286,7 +2290,27 @@ async def api_get_crm_contacts(
         recording_available=recording_available, has_followup=has_followup,
     )
     data = await _crm_contacts_from_filters(filters)
-    return {"data": data, "total": len(data), "filters": filters}
+    total = len(data)
+    safe_page_size = page_size or limit or 50
+    safe_page_size = max(1, min(int(safe_page_size or 50), 100))
+    if offset is not None:
+        safe_offset = max(0, int(offset or 0))
+        safe_page = (safe_offset // safe_page_size) + 1
+    else:
+        safe_page = max(1, int(page or 1))
+        safe_offset = (safe_page - 1) * safe_page_size
+    paged = data[safe_offset:safe_offset + safe_page_size]
+    return {
+        "data": paged,
+        "contacts": paged,
+        "page": safe_page,
+        "page_size": safe_page_size,
+        "limit": safe_page_size,
+        "offset": safe_offset,
+        "total": total,
+        "has_next": safe_offset + len(paged) < total,
+        "filters": filters,
+    }
 
 
 @app.get("/api/crm/summary")
