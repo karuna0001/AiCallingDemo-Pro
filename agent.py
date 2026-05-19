@@ -125,8 +125,6 @@ async def _fixed_greeting_config(phone_number: str | None) -> dict:
     greeting_text = (greeting_text or "").strip()
     greeting_text_present = bool(greeting_text)
     disabled_reasons = []
-    if not phone_number:
-        disabled_reasons.append("no outbound phone_number")
     if not greeting_text_present:
         disabled_reasons.append("fixed greeting text is empty")
     if disabled_reasons:
@@ -142,6 +140,7 @@ async def _fixed_greeting_config(phone_number: str | None) -> dict:
         "mode": mode_raw or "default",
         "enabled_raw": enabled_raw,
         "greeting_source": greeting_source,
+        "phone_number_present": bool(phone_number),
     }
 
 
@@ -314,6 +313,7 @@ async def entrypoint(ctx: agents.JobContext):
             f"source={fixed_greeting_config['source']}; "
             f"greeting_source={fixed_greeting_config['greeting_source']}; "
             f"mode={fixed_greeting_config['mode']}; "
+            f"phone_number_present={str(fixed_greeting_config['phone_number_present']).lower()}; "
             f"reason={fixed_greeting_config['reason']}"
         ),
     )
@@ -437,6 +437,7 @@ async def entrypoint(ctx: agents.JobContext):
             await _log("warning", "fixed_greeting_failed_no_autonomous_fallback", str(exc))
     else:
         await _log("info", "fixed_greeting_disabled", fixed_greeting_config["reason"])
+        await _log("info", "autonomous_greeting_selected", f"reason={fixed_greeting_config['reason']}")
         if "3.1" in active_model or "2.5" in active_model:
             await _log(
                 "info",
