@@ -446,7 +446,7 @@ class AutomationTestRequest(BaseModel):
     phone: str
     event_type: str
     source: Optional[str] = None
-    lead_name: Optional[str] = "Test Lead"
+    lead_name: Optional[str] = "Demo Contact"
     dry_run: bool = True
 
 
@@ -1700,7 +1700,7 @@ async def api_test_automation(req: AutomationTestRequest):
             "planned_action": rule.get("action") if rule else "no_matching_rule",
             "whatsapp_enabled": await get_wa_health(),
         }
-    contact = {"phone": phone, "lead_name": req.lead_name or "Test Lead", "source": req.source or ""}
+    contact = {"phone": phone, "lead_name": req.lead_name or "Demo Contact", "source": req.source or ""}
     result = await execute_automation_rule(req.event_type, contact)
     return {"dry_run": False, "event_type": req.event_type, **result}
 
@@ -1746,7 +1746,7 @@ async def api_incoming_lead(req: LeadIncomingRequest):
         return JSONResponse(status_code=400, content={"success": False, "error": str(e)})
 
     source = (req.source or "api").strip().lower()
-    lead_name = (req.name or "").strip() or "Unknown Lead"
+    lead_name = (req.name or "").strip() or "New Contact"
 
     lead_data = {
         "phone_number": phone,
@@ -2352,8 +2352,8 @@ async def api_upload_crm_leads(file: UploadFile = File(...)):
 async def api_sample_leads_csv():
     rows = [
         ["lead_name","phone_number","email","city","location","requirement","budget","source","business_name","campaign_name","service_type","crm_status","crm_notes","next_followup_at","assigned_to"],
-        ["Sample Lead","+919876543210","sample@example.com","Chennai","Tambaram","Villa plot","2500000","Facebook","Abhi Properties","Tambaram Villa Plot","Home visit","New","Interested in site visit","",""],
-        ["Suresh","9876543211","suresh@gmail.com","Chennai","Velachery","Apartment","5000000","Website","Abhi Properties","Website Leads","Property consultation","New","Call after 5 PM","",""],
+        ["Example Contact A","+919876543210","sample@example.com","Chennai","Tambaram","Villa plot","2500000","Facebook","Abhi Properties","Tambaram Villa Plot","Home visit","New","Interested in site visit","",""],
+        ["Example Contact","9876543211","example@example.com","Chennai","Velachery","Apartment","5000000","Website","Abhi Properties","Website Leads","Property consultation","New","Call after 5 PM","",""],
     ]
     out = StringIO()
     csv.writer(out).writerows(rows)

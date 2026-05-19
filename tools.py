@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Optional
 
@@ -14,6 +15,7 @@ from db import (
 )
 
 logger = logging.getLogger("appointment-tools")
+_STALE_SAMPLE_NAMES = ("Prasanth", "Prashanth", "Ramesh", "Sample Lead", "Suresh", "Test Lead", "Unknown Lead")
 
 
 async def _log(msg: str, detail: str = "", level: str = "info") -> None:
@@ -30,6 +32,10 @@ class AppointmentTools(llm.ToolContext):
         self.ctx = ctx
         self.phone_number = phone_number
         self.lead_name = lead_name
+        self.current_customer_name: Optional[str] = lead_name
+        self.current_business_name: Optional[str] = None
+        self.current_service_type: Optional[str] = None
+        self.current_call_type: Optional[str] = None
         self._call_start_time = time.time()
         self._sip_domain = os.getenv("VOBIZ_SIP_DOMAIN", "")
         self.recording_url: Optional[str] = None
@@ -164,6 +170,12 @@ class AppointmentTools(llm.ToolContext):
             if not calls and not appointments and not memories:
                 return f"No history for {phone}. First-time contact."
             lines = [f"Contact history for {phone}:"]
+            if self.current_customer_name:
+                lines.append(
+                    "CURRENT CALL OVERRIDE: "
+                    f"customer name is {self.current_customer_name}. "
+                    "Ignore any other customer names in prior history or memory."
+                )
             if memories:
                 lines.append(f"\nREMEMBERED ({len(memories)} notes):")
                 for m in memories[:10]:
@@ -177,9 +189,20 @@ class AppointmentTools(llm.ToolContext):
                 lines.append(f"\nAPPOINTMENTS ({len(appointments)}):")
                 for a in appointments[:3]:
                     lines.append(f"  • {a.get('date')} {a.get('time')} — {a.get('service')} [{a.get('status')}]")
-            return "\n".join(lines)
+            return self._sanitize_contact_history("\n".join(lines))
         except Exception:
             return "Unable to retrieve contact history."
+
+    def _sanitize_contact_history(self, text: str) -> str:
+        if not self.current_customer_name:
+            return text
+        cleaned = text
+        current_lower = self.current_customer_name.strip().lower()
+        for name in _STALE_SAMPLE_NAMES:
+            if name.lower() == current_lower:
+                continue
+            cleaned = re.sub(re.escape(name), "[stale name removed]", cleaned, flags=re.IGNORECASE)
+        return cleaned
 
     @llm.function_tool
     async def remember_details(self, insight: str) -> str:

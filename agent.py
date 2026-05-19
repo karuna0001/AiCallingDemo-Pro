@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import ssl
 import time
 import certifi
@@ -90,6 +91,7 @@ _TRUTHY = {"1", "true", "yes", "on", "enabled", "fixed"}
 _FALSEY = {"0", "false", "no", "off", "disabled"}
 _AI_GREETING_MODES = {"ai", "auto", "autonomous", "dynamic", "gemini", "model"}
 _DEFAULT_FIXED_GREETING = "Hi, this is AI assistant. Am I speaking with you?"
+_STALE_SAMPLE_NAMES = ("Prasanth", "Prashanth", "Ramesh", "Sample Lead", "Suresh", "Test Lead", "Unknown Lead")
 
 
 async def _setting_with_source(key: str, default: str = "") -> tuple[str, str]:
@@ -152,6 +154,60 @@ async def _fixed_greeting_config(phone_number: str | None) -> dict:
         "greeting_source": greeting_source,
         "phone_number_present": bool(phone_number),
     }
+
+
+def _prompt_contains_wrong_names(prompt: str, customer_name: str) -> bool:
+    prompt_lower = prompt.lower()
+    customer_lower = (customer_name or "").strip().lower()
+    for name in _STALE_SAMPLE_NAMES:
+        name_lower = name.lower()
+        if name_lower in prompt_lower and name_lower != customer_lower:
+            return True
+    return False
+
+
+async def _strip_stale_names_from_prompt(prompt: str, customer_name: str) -> tuple[str, bool]:
+    replacement = customer_name.strip() if customer_name else "the customer"
+    changed = False
+    cleaned = prompt
+    customer_lower = (customer_name or "").strip().lower()
+    for name in _STALE_SAMPLE_NAMES:
+        if name.lower() == customer_lower:
+            continue
+        if name.lower() in cleaned.lower():
+            cleaned = re.sub(re.escape(name), replacement, cleaned, flags=re.IGNORECASE)
+            changed = True
+    if changed:
+        await _log("warning", "stale_name_detected_in_prompt", f"replaced_with={replacement}")
+    return cleaned, changed
+
+
+def _final_call_override(
+    customer_name: str,
+    business_name: str,
+    company_name: str,
+    service_type: str,
+    call_type: str,
+) -> str:
+    name_line = customer_name or "unknown"
+    lines = [
+        "FINAL CURRENT CALL DATA OVERRIDE:",
+        f"- Customer name: {name_line}",
+        f"- Business/company: {company_name or business_name or 'unknown'}",
+        f"- Service type: {service_type or 'unknown'}",
+        f"- Call type: {call_type or 'welcome_call'}",
+        "These values override all previous prompt examples, CRM memory, contact memory, agent profiles, and old conversation history.",
+        "Never use any other customer name.",
+    ]
+    if customer_name:
+        lines.extend([
+            f"Customer name is {customer_name}. Do not ask for the customer name again. Do not use any other name.",
+            f"Do not say 'Am I speaking to...' or 'Am I speaking with...' unless you use exactly '{customer_name}'.",
+            "Do not say 'May I know your name?'",
+        ])
+    else:
+        lines.append("Customer name is not provided. You may ask for the name politely if needed.")
+    return "\n".join(lines)
 
 
 def load_db_settings_to_env() -> None:
@@ -388,6 +444,18 @@ async def entrypoint(ctx: agents.JobContext):
     else:
         known_context.append("Customer name is not provided. You may ask for the name politely if needed.")
     _base_prompt = "\n".join(known_context) + "\n\n" + _base_prompt
+    _base_prompt, _ = await _strip_stale_names_from_prompt(_base_prompt, customer_name)
+    final_override = _final_call_override(customer_name, business_name, company_name, service_type, call_type)
+    _base_prompt = _base_prompt + "\n\n" + final_override
+    final_contains_wrong_names = _prompt_contains_wrong_names(_base_prompt, customer_name)
+    if final_contains_wrong_names:
+        _base_prompt, _ = await _strip_stale_names_from_prompt(_base_prompt, customer_name)
+        final_contains_wrong_names = _prompt_contains_wrong_names(_base_prompt, customer_name)
+    await _log("info", "final_voice_context_customer_name", customer_name or "missing")
+    await _log("info", "final_voice_context_business_name", business_name)
+    await _log("info", "final_voice_context_service_type", service_type)
+    await _log("info", "final_voice_context_call_type", call_type)
+    await _log("info", "final_voice_prompt_contains_wrong_names", str(final_contains_wrong_names).lower())
     if fixed_greeting_config["enabled"]:
         # Prevent Gemini from autonomously producing an opening greeting.
         # The fixed greeting will be injected via session.say() after session.start().
@@ -397,7 +465,12 @@ async def entrypoint(ctx: agents.JobContext):
         ) + _base_prompt
     else:
         system_prompt = _base_prompt
+    system_prompt = system_prompt + "\n\n" + final_override
     tool_ctx = AppointmentTools(ctx, phone_number=phone_number, lead_name=lead_name)
+    tool_ctx.current_customer_name = customer_name
+    tool_ctx.current_business_name = business_name
+    tool_ctx.current_service_type = service_type
+    tool_ctx.current_call_type = call_type
     active_tools = tool_ctx.build_tool_list(enabled_tools)
     session = _build_session(tools=active_tools, system_prompt=system_prompt)
 
