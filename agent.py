@@ -230,9 +230,33 @@ def _build_realtime_model(system_prompt: str):
         return klass(**kwargs)
 
 
+def _build_tts_model():
+    if not _google_tts:
+        return None
+    return _google_tts(voice_name=os.getenv("GEMINI_TTS_VOICE", "Aoede"))
+
+
 def _build_session(tools: list, system_prompt: str) -> AgentSession:
     realtime_model = _build_realtime_model(system_prompt)
     if realtime_model:
+        tts_model = _build_tts_model()
+        realtime_kwargs = {"tools": tools}
+        if tts_model:
+            realtime_kwargs["tts"] = tts_model
+        else:
+            logger.warning("Google TTS unavailable; fixed greeting session.say() may not be able to speak")
+        try:
+            return AgentSession(llm=realtime_model, **realtime_kwargs)
+        except TypeError as exc:
+            if "tts" not in str(exc).lower():
+                raise
+            logger.warning("AgentSession rejected TTS with realtime llm argument: %s", exc)
+        try:
+            return AgentSession(realtime_model=realtime_model, **realtime_kwargs)
+        except TypeError as exc:
+            if "tts" not in str(exc).lower():
+                raise
+            logger.warning("AgentSession rejected TTS with realtime_model argument: %s", exc)
         try:
             return AgentSession(llm=realtime_model, tools=tools)
         except TypeError:
@@ -243,7 +267,7 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
         vad=silero.VAD.load(),
         stt=_deepgram_stt(model="nova-2", language="en"),
         llm=_google_llm(model="gemini-2.0-flash"),
-        tts=_google_tts(voice_name=os.getenv("GEMINI_TTS_VOICE", "Aoede")),
+        tts=_build_tts_model(),
         tools=tools,
     )
 
