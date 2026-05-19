@@ -76,6 +76,16 @@ def _ms_since(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
 
 
+def _first_text(*values, default: str = "") -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return default
+
+
 _TRUTHY = {"1", "true", "yes", "on", "enabled", "fixed"}
 _FALSEY = {"0", "false", "no", "off", "disabled"}
 _AI_GREETING_MODES = {"ai", "auto", "autonomous", "dynamic", "gemini", "model"}
@@ -286,10 +296,29 @@ async def entrypoint(ctx: agents.JobContext):
     except Exception:
         pass
 
-    phone_number = metadata.get("phone_number")
-    lead_name = metadata.get("lead_name", "there")
-    business_name = metadata.get("business_name", "our company")
-    service_type = metadata.get("service_type", "our service")
+    phone_number = _first_text(metadata.get("phone_number"), metadata.get("phone"), default="")
+    customer_name = _first_text(metadata.get("customer_name"), metadata.get("name"), default="")
+    lead_name_from_metadata = _first_text(metadata.get("lead_name"), default="")
+    if not customer_name and lead_name_from_metadata.lower() not in ("", "there", "customer", "lead"):
+        customer_name = lead_name_from_metadata
+    lead_name = customer_name or "there"
+    business_name = _first_text(metadata.get("business_name"), metadata.get("company_name"), default="our company")
+    company_name = _first_text(metadata.get("company_name"), metadata.get("business_name"), default=business_name)
+    service_type = _first_text(metadata.get("service_type"), metadata.get("service"), default="our service")
+    requirement = _first_text(metadata.get("requirement"), metadata.get("notes"), metadata.get("crm_notes"), default="")
+    source = _first_text(metadata.get("source"), default="")
+    call_type = _first_text(metadata.get("call_type"), default="welcome_call")
+    await _log(
+        "info",
+        "agent_metadata_loaded",
+        (
+            f"phone_present={str(bool(phone_number)).lower()}; "
+            f"keys={','.join(sorted(metadata.keys()))}"
+        ),
+    )
+    await _log("info", "agent_context_customer_name", customer_name or "missing")
+    await _log("info", "agent_context_business_name", business_name)
+    await _log("info", "agent_context_service_type", service_type)
 
     if metadata.get("voice_override"):
         os.environ["GEMINI_TTS_VOICE"] = metadata["voice_override"]
@@ -320,7 +349,29 @@ async def entrypoint(ctx: agents.JobContext):
     if not fixed_greeting_config["enabled"]:
         await _log("info", "fixed_greeting_disabled", fixed_greeting_config["reason"])
 
-    _base_prompt = build_prompt(lead_name, business_name, service_type, metadata.get("system_prompt"))
+    _base_prompt = build_prompt(
+        lead_name,
+        business_name,
+        service_type,
+        metadata.get("system_prompt"),
+        customer_name=customer_name,
+        company_name=company_name,
+        requirement=requirement,
+        source=source,
+        call_type=call_type,
+    )
+    known_context = [
+        "CALL CONTEXT:",
+        f"- Customer name: {customer_name}" if customer_name else "- Customer name: unknown. Ask politely only if needed.",
+        f"- Business/company: {business_name}" if business_name else "- Business/company: unknown. Ask politely only if needed.",
+        f"- Service/interest: {service_type}" if service_type else "- Service/interest: unknown. Ask politely only if needed.",
+        f"- Requirement/notes: {requirement}" if requirement else "- Requirement/notes: not provided.",
+        f"- Source: {source}" if source else "- Source: not provided.",
+        f"- Call type: {call_type}",
+    ]
+    if customer_name:
+        known_context.append("The customer name is already known. Do not ask 'May I know your name?' unless the customer says it is incorrect.")
+    _base_prompt = "\n".join(known_context) + "\n\n" + _base_prompt
     if fixed_greeting_config["enabled"]:
         # Prevent Gemini from autonomously producing an opening greeting.
         # The fixed greeting will be injected via session.say() after session.start().

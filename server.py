@@ -252,9 +252,15 @@ async def eff(key: str) -> str:
 
 class CallRequest(BaseModel):
     phone: str
+    name: Optional[str] = None
+    customer_name: Optional[str] = None
     lead_name: str = "there"
     business_name: str = "our company"
+    company_name: Optional[str] = None
     service_type: str = "our service"
+    source: Optional[str] = None
+    notes: Optional[str] = None
+    requirement: Optional[str] = None
     system_prompt: Optional[str] = None
     agent_profile_id: Optional[str] = None
     call_type: Optional[str] = None
@@ -656,6 +662,26 @@ async def api_dispatch_call(req: CallRequest):
     phone = req.phone.strip()
     if not phone.startswith("+"):
         raise HTTPException(400, "Phone must be in E.164 format: +919876543210")
+    customer_name = (req.customer_name or req.name or "").strip()
+    if not customer_name and (req.lead_name or "").strip().lower() not in ("", "there", "customer", "lead"):
+        customer_name = (req.lead_name or "").strip()
+    lead_name = customer_name or "there"
+    business_name = (req.business_name or req.company_name or "").strip() or "our company"
+    company_name = (req.company_name or req.business_name or "").strip() or business_name
+    service_type = (req.service_type or "").strip() or "our service"
+    requirement = (req.requirement or req.notes or "").strip()
+    source = (req.source or "").strip()
+    call_type = (req.call_type or "welcome_call").strip()
+    await log_error(
+        "server",
+        "single_call_payload_received",
+        (
+            f"phone={phone}; customer_name={customer_name}; business_name={business_name}; "
+            f"service_type={service_type}; source={source}; call_type={call_type}; "
+            f"requirement_present={str(bool(requirement)).lower()}"
+        ),
+        "info",
+    )
 
     effective_prompt = req.system_prompt
     effective_voice = effective_model = effective_tools = None
@@ -671,22 +697,44 @@ async def api_dispatch_call(req: CallRequest):
         # Try legacy global prompt first, then resolve by call_type
         effective_prompt = await get_setting("system_prompt", "") or None
     if not effective_prompt:
-        call_type = (req.call_type or "welcome_call").strip()
         effective_prompt = await resolve_ai_prompt(
             call_type=call_type,
-            lead_name=req.lead_name,
-            business_name=req.business_name,
-            service_type=req.service_type,
+            lead_name=lead_name,
+            business_name=business_name,
+            service_type=service_type,
         )
 
     room_name = f"call-{phone.replace('+', '')}-{random.randint(1000, 9999)}"
-    metadata = {"phone_number": phone, "lead_name": req.lead_name, "business_name": req.business_name, "service_type": req.service_type, "system_prompt": effective_prompt}
+    metadata = {
+        "phone_number": phone,
+        "lead_name": lead_name,
+        "name": customer_name,
+        "customer_name": customer_name,
+        "business_name": business_name,
+        "company_name": company_name,
+        "service_type": service_type,
+        "requirement": requirement,
+        "notes": req.notes or "",
+        "source": source,
+        "call_type": call_type,
+        "system_prompt": effective_prompt,
+    }
     if effective_voice:
         metadata["voice_override"] = effective_voice
     if effective_model:
         metadata["model_override"] = effective_model
     if effective_tools:
         metadata["tools_override"] = effective_tools
+    await log_error(
+        "server",
+        "outbound_metadata_prepared",
+        (
+            f"room={room_name}; phone={phone}; customer_name={customer_name}; "
+            f"business_name={business_name}; company_name={company_name}; "
+            f"service_type={service_type}; source={source}; call_type={call_type}"
+        ),
+        "info",
+    )
     try:
         from livekit import api as lk_api
         ctx = ssl.create_default_context()
@@ -2439,8 +2487,14 @@ async def api_call_selected(req: CrmCallSelectedRequest):
             contacts.append({
                 "phone": clean,
                 "lead_name": contact.get("lead_name") or "there",
+                "customer_name": contact.get("lead_name") or "there",
                 "business_name": req.business_name or contact.get("business_name") or "our company",
+                "company_name": req.business_name or contact.get("business_name") or "our company",
                 "service_type": req.service_type or contact.get("service_type") or "our service",
+                "requirement": contact.get("requirement") or "",
+                "notes": contact.get("crm_notes") or "",
+                "source": contact.get("source") or "",
+                "call_type": _crm_status_to_call_type(contact.get("crm_status") or ""),
             })
         except Exception:
             failed += 1
@@ -2879,16 +2933,19 @@ def _norm_lead_status(value: Optional[str]) -> str:
 
 
 async def _build_dispatch_metadata(contact: dict, prompt: Optional[str], profile: Optional[dict]) -> dict:
-    lead_name = contact.get("lead_name", "there")
-    business_name = contact.get("business_name", "our company")
-    service_type = contact.get("service_type", "our service")
+    lead_name = (contact.get("customer_name") or contact.get("name") or contact.get("lead_name") or "there").strip()
+    business_name = (contact.get("business_name") or contact.get("company_name") or "our company").strip()
+    company_name = (contact.get("company_name") or contact.get("business_name") or business_name).strip()
+    service_type = (contact.get("service_type") or contact.get("service") or "our service").strip()
+    requirement = (contact.get("requirement") or contact.get("notes") or contact.get("crm_notes") or "").strip()
+    source = (contact.get("source") or "").strip()
+    call_type = (contact.get("call_type") or "welcome_call").strip()
 
     # Prompt priority: explicit > agent profile > legacy global > call-type resolved
     saved_prompt = prompt or (await get_setting("system_prompt", "")) or None
     if profile and not saved_prompt and profile.get("system_prompt"):
         saved_prompt = profile["system_prompt"]
     if not saved_prompt:
-        call_type = contact.get("call_type") or "welcome_call"
         saved_prompt = await resolve_ai_prompt(
             call_type=call_type,
             lead_name=lead_name,
@@ -2899,8 +2956,15 @@ async def _build_dispatch_metadata(contact: dict, prompt: Optional[str], profile
     metadata = {
         "phone_number": contact["phone"],
         "lead_name": lead_name,
+        "name": lead_name,
+        "customer_name": lead_name,
         "business_name": business_name,
+        "company_name": company_name,
         "service_type": service_type,
+        "requirement": requirement,
+        "notes": contact.get("notes") or contact.get("crm_notes") or "",
+        "source": source,
+        "call_type": call_type,
         "system_prompt": saved_prompt,
     }
     if profile:

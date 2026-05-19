@@ -70,22 +70,38 @@ Do NOT ask "anything else?" — the booking is done, end the call cleanly.
 """
 
 
+class _SafePromptFields(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
 def build_prompt(
     lead_name: str = "there",
     business_name: str = "our company",
     service_type: str = "our service",
     custom_prompt: str = None,
+    customer_name: str = None,
+    company_name: str = None,
+    requirement: str = "",
+    source: str = "",
+    call_type: str = "",
 ) -> str:
     """Interpolate lead/business details into the prompt template."""
     template = custom_prompt if custom_prompt else DEFAULT_SYSTEM_PROMPT
-    try:
-        return template.format(
-            lead_name=lead_name,
-            business_name=business_name,
-            service_type=service_type,
-        )
-    except KeyError:
-        return template
+    customer_name = customer_name if customer_name is not None else lead_name
+    company_name = company_name or business_name
+    values = {
+        "name": customer_name,
+        "customer_name": customer_name,
+        "lead_name": lead_name,
+        "business_name": business_name,
+        "company_name": company_name,
+        "service_type": service_type,
+        "requirement": requirement or service_type,
+        "source": source,
+        "call_type": call_type,
+    }
+    return template.format_map(_SafePromptFields(values))
 
 
 # ── Call-type prompt defaults ────────────────────────────────────────────────
@@ -487,18 +503,28 @@ def build_prompt_for_type(
     service_type: str = "our service",
     saved_text: str = None,
     kb: dict = None,
+    customer_name: str = None,
+    company_name: str = None,
+    requirement: str = "",
+    source: str = "",
 ) -> str:
     """Build final prompt: use saved_text if provided, else built-in default for type.
     If kb is provided, prepend the KB context block."""
     template = saved_text if saved_text else get_default_prompt(prompt_type)
-    try:
-        body = template.format(
-            lead_name=lead_name,
-            business_name=business_name,
-            service_type=service_type,
-        )
-    except KeyError:
-        body = template
+    customer_name = customer_name if customer_name is not None else lead_name
+    company_name = company_name or business_name
+    values = {
+        "name": customer_name,
+        "customer_name": customer_name,
+        "lead_name": lead_name,
+        "business_name": business_name,
+        "company_name": company_name,
+        "service_type": service_type,
+        "requirement": requirement or service_type,
+        "source": source,
+        "call_type": prompt_type,
+    }
+    body = template.format_map(_SafePromptFields(values))
     if kb:
         prefix = get_kb_prompt_prefix(kb)
         if prefix:
