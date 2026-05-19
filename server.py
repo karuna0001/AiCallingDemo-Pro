@@ -204,11 +204,13 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"error": msg})
 
 def _run_due_appointment_reminders_sync():
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        asyncio.run_coroutine_threadsafe(run_due_appointment_reminders(), loop)
-    else:
+    """Sync wrapper for APScheduler appointment reminders."""
+    logger.info("Running due appointment reminders")
+    try:
         asyncio.run(run_due_appointment_reminders())
+        logger.info("Due appointment reminders completed")
+    except Exception as exc:
+        logger.exception("Due appointment reminders failed: %s", exc)
 
 
 
