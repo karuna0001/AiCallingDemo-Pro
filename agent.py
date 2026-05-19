@@ -26,7 +26,7 @@ except ImportError:
     _HAS_ROOM_OPTIONS = False
 from livekit.plugins import noise_cancellation, silero
 
-from db import init_db, log_error, get_enabled_tools
+from db import init_db, log_error, get_enabled_tools, get_setting
 from prompts import build_prompt
 from tools import AppointmentTools
 
@@ -74,6 +74,75 @@ def _log_bg(level: str, msg: str, detail: str = "") -> None:
 
 def _ms_since(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
+
+
+_TRUTHY = {"1", "true", "yes", "on", "enabled", "fixed"}
+_FALSEY = {"0", "false", "no", "off", "disabled"}
+_AI_GREETING_MODES = {"ai", "auto", "autonomous", "dynamic", "gemini", "model"}
+_DEFAULT_FIXED_GREETING = "Hi, this is AI assistant. Am I speaking with you?"
+
+
+async def _setting_with_source(key: str, default: str = "") -> tuple[str, str]:
+    env_val = os.getenv(key, "")
+    if env_val:
+        return env_val, "env"
+    try:
+        db_val = await get_setting(key, "")
+        if db_val:
+            return db_val, "db"
+    except Exception as exc:
+        logger.warning("Could not read setting %s: %s", key, exc)
+    return default, "default"
+
+
+async def _fixed_greeting_config(phone_number: str | None) -> dict:
+    enabled_raw, enabled_source = await _setting_with_source("OUTBOUND_FIXED_GREETING_ENABLED", "")
+    mode_raw, mode_source = await _setting_with_source("OUTBOUND_GREETING_MODE", "")
+    greeting_text, greeting_source = await _setting_with_source("OUTBOUND_FIXED_GREETING", _DEFAULT_FIXED_GREETING)
+
+    enabled_value = enabled_raw.strip().lower()
+    mode_value = mode_raw.strip().lower()
+    source = "default"
+    reason = "default_fixed_greeting"
+
+    if enabled_value:
+        source = enabled_source
+        enabled = enabled_value in _TRUTHY
+        if not enabled and enabled_value not in _FALSEY:
+            enabled = False
+            reason = f"unsupported OUTBOUND_FIXED_GREETING_ENABLED={enabled_raw}"
+        else:
+            reason = f"OUTBOUND_FIXED_GREETING_ENABLED={enabled_raw}"
+    elif mode_value:
+        source = mode_source
+        enabled = mode_value == "fixed" or mode_value in _TRUTHY
+        if mode_value in _AI_GREETING_MODES or mode_value in _FALSEY:
+            enabled = False
+        reason = f"OUTBOUND_GREETING_MODE={mode_raw}"
+    else:
+        enabled = True
+
+    greeting_text = (greeting_text or "").strip()
+    greeting_text_present = bool(greeting_text)
+    disabled_reasons = []
+    if not phone_number:
+        disabled_reasons.append("no outbound phone_number")
+    if not greeting_text_present:
+        disabled_reasons.append("fixed greeting text is empty")
+    if disabled_reasons:
+        enabled = False
+        reason = "; ".join([reason, *disabled_reasons])
+
+    return {
+        "enabled": enabled,
+        "greeting": greeting_text,
+        "greeting_text_present": greeting_text_present,
+        "source": source,
+        "reason": reason,
+        "mode": mode_raw or "default",
+        "enabled_raw": enabled_raw,
+        "greeting_source": greeting_source,
+    }
 
 
 def load_db_settings_to_env() -> None:
@@ -211,9 +280,24 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception:
             pass
 
-    _greeting_mode_pre = (os.getenv("OUTBOUND_GREETING_MODE") or "fixed").strip().lower()
+    fixed_greeting_config = await _fixed_greeting_config(phone_number)
+    await _log(
+        "info",
+        "fixed_greeting_config",
+        (
+            f"enabled={str(fixed_greeting_config['enabled']).lower()}; "
+            f"greeting_text_present={str(fixed_greeting_config['greeting_text_present']).lower()}; "
+            f"source={fixed_greeting_config['source']}; "
+            f"greeting_source={fixed_greeting_config['greeting_source']}; "
+            f"mode={fixed_greeting_config['mode']}; "
+            f"reason={fixed_greeting_config['reason']}"
+        ),
+    )
+    if not fixed_greeting_config["enabled"]:
+        await _log("info", "fixed_greeting_disabled", fixed_greeting_config["reason"])
+
     _base_prompt = build_prompt(lead_name, business_name, service_type, metadata.get("system_prompt"))
-    if _greeting_mode_pre == "fixed" and phone_number:
+    if fixed_greeting_config["enabled"]:
         # Prevent Gemini from autonomously producing an opening greeting.
         # The fixed greeting will be injected via session.say() after session.start().
         system_prompt = (
@@ -300,12 +384,11 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as exc:
             await _log("warning", f"Recording start failed (non-fatal): {exc}")
 
-    greeting_mode = (os.getenv("OUTBOUND_GREETING_MODE") or "fixed").strip().lower()
-    fixed_greeting = (os.getenv("OUTBOUND_FIXED_GREETING") or "Hi, this is AI assistant. Am I speaking with you?").strip()
+    fixed_greeting = fixed_greeting_config["greeting"]
     active_model = os.getenv("GEMINI_MODEL", "")
     recording_task = asyncio.create_task(_start_recording_after_greeting()) if phone_number else None
 
-    if greeting_mode == "fixed" and fixed_greeting and phone_number:
+    if fixed_greeting_config["enabled"]:
         try:
             greeting_requested_at = time.perf_counter()
             greeting_start_delay_ms = _ms_since(call_started_at)
@@ -327,17 +410,15 @@ async def entrypoint(ctx: agents.JobContext):
             await _log("info", "Fixed outbound greeting sent — Gemini realtime conversation continues")
             await _log("info", "ai_context_loaded_after_greeting", "not_applicable; prompt_context_loaded_before_session_start")
         except Exception as exc:
-            await _log("warning", f"Fixed greeting failed, falling back to AI autonomous greeting: {exc}")
-            if "3.1" in active_model or "2.5" in active_model:
-                await _log("info", "Gemini native-audio: model will greet autonomously from system prompt")
-            else:
-                try:
-                    await session.generate_reply(instructions=f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}.")
-                except Exception as exc2:
-                    await _log("warning", f"generate_reply fallback also failed: {exc2}")
+            await _log("warning", "fixed_greeting_failed_no_autonomous_fallback", str(exc))
     else:
+        await _log("info", "fixed_greeting_disabled", fixed_greeting_config["reason"])
         if "3.1" in active_model or "2.5" in active_model:
-            await _log("info", "Gemini native-audio: model will greet autonomously from system prompt")
+            await _log(
+                "info",
+                "Gemini native-audio: model will greet autonomously from system prompt",
+                f"fixed_greeting_disabled_reason={fixed_greeting_config['reason']}",
+            )
         else:
             try:
                 await session.generate_reply(instructions=f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}.")

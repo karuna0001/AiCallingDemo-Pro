@@ -524,6 +524,18 @@ async def api_health():
                 return val
         return ""
 
+    async def setting_value_with_source(key: str, default: str = "") -> tuple[str, str]:
+        env_val = os.getenv(key, "")
+        if env_val:
+            return env_val, "env"
+        try:
+            db_val = await get_setting(key, "")
+            if db_val:
+                return db_val, "db"
+        except Exception:
+            pass
+        return default, "default"
+
     async def supabase_status(url: str, key: str) -> tuple[bool, Optional[str]]:
         if not (url and key):
             return False, None
@@ -551,6 +563,26 @@ async def api_health():
     s3_key = await status_value("S3_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")
     s3_secret = await status_value("S3_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY")
     s3_bucket = await status_value("S3_BUCKET", "AWS_BUCKET_NAME")
+    fixed_enabled_raw, fixed_enabled_source = await setting_value_with_source("OUTBOUND_FIXED_GREETING_ENABLED", "")
+    greeting_mode_raw, greeting_mode_source = await setting_value_with_source("OUTBOUND_GREETING_MODE", "")
+    fixed_greeting_text, fixed_greeting_text_source = await setting_value_with_source(
+        "OUTBOUND_FIXED_GREETING",
+        "Hi, this is AI assistant. Am I speaking with you?",
+    )
+    fixed_enabled_value = fixed_enabled_raw.strip().lower()
+    greeting_mode_value = greeting_mode_raw.strip().lower()
+    if fixed_enabled_value:
+        fixed_greeting_enabled = fixed_enabled_value in ("1", "true", "yes", "on", "enabled", "fixed")
+        fixed_greeting_source = fixed_enabled_source
+        fixed_greeting_reason = f"OUTBOUND_FIXED_GREETING_ENABLED={fixed_enabled_raw}"
+    elif greeting_mode_value:
+        fixed_greeting_enabled = greeting_mode_value == "fixed" or greeting_mode_value in ("1", "true", "yes", "on", "enabled")
+        fixed_greeting_source = greeting_mode_source
+        fixed_greeting_reason = f"OUTBOUND_GREETING_MODE={greeting_mode_raw}"
+    else:
+        fixed_greeting_enabled = True
+        fixed_greeting_source = "default"
+        fixed_greeting_reason = "default_fixed_greeting"
     recording_auto_delete = (await status_value("RECORDING_AUTO_DELETE_ENABLED") or "false").strip().lower() in ("1", "true", "yes", "on")
     try:
         recording_retention_days = max(int(await status_value("RECORDING_RETENTION_DAYS") or "7"), 1)
@@ -578,6 +610,12 @@ async def api_health():
         "whatsapp_gemini_model_configured": bool(whatsapp_gemini_model),
         "whatsapp_chat_prompt_configured": bool(whatsapp_chat_prompt),
         "s3_configured": bool(s3_key and s3_secret and s3_bucket),
+        "fixed_greeting_enabled": fixed_greeting_enabled,
+        "fixed_greeting_text_present": bool((fixed_greeting_text or "").strip()),
+        "fixed_greeting_source": fixed_greeting_source,
+        "fixed_greeting_text_source": fixed_greeting_text_source,
+        "fixed_greeting_mode": greeting_mode_raw or "default",
+        "fixed_greeting_reason": fixed_greeting_reason,
         "recording_auto_delete_enabled": recording_auto_delete,
         "recording_retention_days": recording_retention_days,
     }
