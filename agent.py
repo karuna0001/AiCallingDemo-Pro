@@ -285,14 +285,18 @@ async def entrypoint(ctx: agents.JobContext):
     call_started_at = time.perf_counter()
     await _log("info", "outbound_call_started", f"room={getattr(ctx.room, 'name', '')}")
     metadata = {}
+    raw_job_metadata = getattr(ctx.job, "metadata", "") or ""
+    raw_room_metadata = getattr(ctx.room, "metadata", "") or ""
+    await _log("info", "agent_raw_job_metadata", raw_job_metadata or "{}")
+    await _log("info", "agent_raw_room_metadata", raw_room_metadata or "{}")
     try:
-        if ctx.job.metadata:
-            metadata.update(json.loads(ctx.job.metadata))
+        if raw_job_metadata:
+            metadata.update(json.loads(raw_job_metadata))
     except Exception:
         pass
     try:
-        if ctx.room.metadata:
-            metadata.update(json.loads(ctx.room.metadata))
+        if raw_room_metadata:
+            metadata.update(json.loads(raw_room_metadata))
     except Exception:
         pass
 
@@ -312,6 +316,10 @@ async def entrypoint(ctx: agents.JobContext):
         "info",
         "agent_metadata_loaded",
         (
+            f"customer_name={customer_name or 'missing'}; "
+            f"business_name={business_name}; "
+            f"service_type={service_type}; "
+            f"call_type={call_type}; "
             f"phone_present={str(bool(phone_number)).lower()}; "
             f"keys={','.join(sorted(metadata.keys()))}"
         ),
@@ -319,6 +327,7 @@ async def entrypoint(ctx: agents.JobContext):
     await _log("info", "agent_context_customer_name", customer_name or "missing")
     await _log("info", "agent_context_business_name", business_name)
     await _log("info", "agent_context_service_type", service_type)
+    await _log("info", "agent_context_call_type", call_type)
 
     if metadata.get("voice_override"):
         os.environ["GEMINI_TTS_VOICE"] = metadata["voice_override"]
@@ -361,6 +370,8 @@ async def entrypoint(ctx: agents.JobContext):
         call_type=call_type,
     )
     known_context = [
+        "CURRENT SINGLE CALL METADATA OVERRIDE:",
+        "These current call details override old CRM memory, old conversation memory, default prompt examples, and agent profile examples.",
         "CALL CONTEXT:",
         f"- Customer name: {customer_name}" if customer_name else "- Customer name: unknown. Ask politely only if needed.",
         f"- Business/company: {business_name}" if business_name else "- Business/company: unknown. Ask politely only if needed.",
@@ -370,7 +381,12 @@ async def entrypoint(ctx: agents.JobContext):
         f"- Call type: {call_type}",
     ]
     if customer_name:
-        known_context.append("The customer name is already known. Do not ask 'May I know your name?' unless the customer says it is incorrect.")
+        known_context.append(f"Customer name is {customer_name}. Do not ask for the customer name again. Do not use any other name.")
+        known_context.append(f"If you need to confirm identity, only use the exact name '{customer_name}', or avoid saying a name.")
+        known_context.append("Do not ask 'Am I speaking to...' or 'Am I speaking with...' using any name other than the exact customer name above.")
+        known_context.append("Ignore any conflicting customer name from tools, memory, CRM lookup, examples, or saved prompt text.")
+    else:
+        known_context.append("Customer name is not provided. You may ask for the name politely if needed.")
     _base_prompt = "\n".join(known_context) + "\n\n" + _base_prompt
     if fixed_greeting_config["enabled"]:
         # Prevent Gemini from autonomously producing an opening greeting.

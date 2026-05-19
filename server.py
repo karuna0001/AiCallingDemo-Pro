@@ -742,7 +742,12 @@ async def api_dispatch_call(req: CallRequest):
         ctx.verify_mode = ssl.CERT_NONE
         session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ctx))
         lk = lk_api.LiveKitAPI(url=url, api_key=key, api_secret=secret, session=session)
-        await lk.room.create_room(lk_api.CreateRoomRequest(name=room_name, empty_timeout=300, max_participants=5))
+        room_kwargs = {"name": room_name, "empty_timeout": 300, "max_participants": 5}
+        try:
+            room_req = lk_api.CreateRoomRequest(**room_kwargs, metadata=json.dumps(metadata))
+        except TypeError:
+            room_req = lk_api.CreateRoomRequest(**room_kwargs)
+        await lk.room.create_room(room_req)
         await lk.agent_dispatch.create_dispatch(lk_api.CreateAgentDispatchRequest(agent_name="outbound-caller", room=room_name, metadata=json.dumps(metadata)))
         await lk.aclose()
         await session.close()
@@ -2347,7 +2352,7 @@ async def api_upload_crm_leads(file: UploadFile = File(...)):
 async def api_sample_leads_csv():
     rows = [
         ["lead_name","phone_number","email","city","location","requirement","budget","source","business_name","campaign_name","service_type","crm_status","crm_notes","next_followup_at","assigned_to"],
-        ["Ramesh","+919876543210","ramesh@gmail.com","Chennai","Tambaram","Villa plot","2500000","Facebook","Abhi Properties","Tambaram Villa Plot","Home visit","New","Interested in site visit","",""],
+        ["Sample Lead","+919876543210","sample@example.com","Chennai","Tambaram","Villa plot","2500000","Facebook","Abhi Properties","Tambaram Villa Plot","Home visit","New","Interested in site visit","",""],
         ["Suresh","9876543211","suresh@gmail.com","Chennai","Velachery","Apartment","5000000","Website","Abhi Properties","Website Leads","Property consultation","New","Call after 5 PM","",""],
     ]
     out = StringIO()
@@ -2979,8 +2984,13 @@ async def _build_dispatch_metadata(contact: dict, prompt: Optional[str], profile
 
 async def _dispatch_one(lk, lk_api, contact: dict, room_name: str, prompt: Optional[str], profile: Optional[dict] = None) -> bool:
     try:
-        await lk.room.create_room(lk_api.CreateRoomRequest(name=room_name, empty_timeout=300, max_participants=5))
         metadata = await _build_dispatch_metadata(contact, prompt, profile)
+        room_kwargs = {"name": room_name, "empty_timeout": 300, "max_participants": 5}
+        try:
+            room_req = lk_api.CreateRoomRequest(**room_kwargs, metadata=json.dumps(metadata))
+        except TypeError:
+            room_req = lk_api.CreateRoomRequest(**room_kwargs)
+        await lk.room.create_room(room_req)
         await lk.agent_dispatch.create_dispatch(lk_api.CreateAgentDispatchRequest(agent_name="outbound-caller", room=room_name, metadata=json.dumps(metadata)))
         return True
     except Exception as exc:
