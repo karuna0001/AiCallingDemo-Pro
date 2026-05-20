@@ -97,6 +97,47 @@ _FALSEY = {"0", "false", "no", "off", "disabled"}
 _AI_GREETING_MODES = {"ai", "auto", "autonomous", "dynamic", "gemini", "model"}
 _DEFAULT_FIXED_GREETING = "Hi, this is AI assistant. Am I speaking with you?"
 _STALE_SAMPLE_NAMES = ("Prasanth", "Prashanth", "Ramesh", "Sample Lead", "Suresh", "Test Lead", "Unknown Lead")
+_SOURCE_LABELS = {
+    "facebook": "Facebook",
+    "fb": "Facebook",
+    "meta": "Facebook",
+    "facebook_ads": "Facebook",
+    "facebook_ad": "Facebook",
+    "facebook_lead": "Facebook",
+    "instagram": "Instagram",
+    "ig": "Instagram",
+    "instagram_ads": "Instagram",
+    "instagram_ad": "Instagram",
+    "instagram_lead": "Instagram",
+    "website": "our website",
+    "web": "our website",
+    "site": "our website",
+    "google": "Google",
+    "google_ads": "Google",
+    "google_ad": "Google",
+    "whatsapp": "WhatsApp",
+    "wa": "WhatsApp",
+    "database": "database",
+    "db": "database",
+    "cold_call": "database",
+    "coldcall": "database",
+    "data": "database",
+    "data_base": "database",
+}
+_GENERIC_SOURCE_VALUES = {
+    "",
+    "manual",
+    "uploaded",
+    "upload",
+    "csv",
+    "xlsx",
+    "google_sheet",
+    "google_sheets",
+    "googlesheet",
+    "googlesheets",
+    "n8n",
+    "unknown",
+}
 
 
 async def _setting_with_source(key: str, default: str = "") -> tuple[str, str]:
@@ -187,12 +228,58 @@ async def _strip_stale_names_from_prompt(prompt: str, customer_name: str) -> tup
     return cleaned, changed
 
 
+def _normalize_source_value(source: str) -> str:
+    return (source or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _voice_opening_context(source: str, business_name: str, service_type: str) -> dict:
+    norm = _normalize_source_value(source)
+    compact = norm.replace("_", "")
+    if norm in _SOURCE_LABELS:
+        label = _SOURCE_LABELS[norm]
+    elif compact in {"facebooklead", "facebookads", "fblead", "fbads", "metalead", "metaads"}:
+        label = "Facebook"
+        norm = "facebook"
+    elif compact in {"instagramlead", "instagramads", "iglead", "igads"}:
+        label = "Instagram"
+        norm = "instagram"
+    elif compact in {"googleads", "googlelead"}:
+        label = "Google"
+        norm = "google"
+    elif norm in _GENERIC_SOURCE_VALUES:
+        label = "our records"
+    else:
+        label = "our records"
+
+    if label == "database":
+        mode = "cold_call"
+        opening = (
+            f"I'm calling from {business_name}. We provide fully automated bulk AI voice calling, "
+            "WhatsApp messaging, and CRM follow-up automation for businesses. "
+            "Are you interested in a quick 10-minute Google Meet demo?"
+        )
+    elif label in {"Facebook", "Instagram", "our website", "Google", "WhatsApp"}:
+        mode = "enquiry"
+        opening = (
+            f"We received your enquiry from {label} regarding {service_type}. "
+            "Can I arrange a quick 10-minute demo for you?"
+        )
+    else:
+        mode = "generic"
+        opening = (
+            f"I'm calling from {business_name} regarding AI voice calling and WhatsApp CRM automation. "
+            "Can I arrange a quick 10-minute demo for you?"
+        )
+    return {"source": norm, "label": label, "mode": mode, "opening": opening}
+
+
 def _final_call_override(
     customer_name: str,
     business_name: str,
     company_name: str,
     service_type: str,
     call_type: str,
+    opening_context: dict,
 ) -> str:
     name_line = customer_name or "unknown"
     lines = [
@@ -201,8 +288,14 @@ def _final_call_override(
         f"- Business/company: {company_name or business_name or 'unknown'}",
         f"- Service type: {service_type or 'unknown'}",
         f"- Call type: {call_type or 'welcome_call'}",
+        f"- Source label: {opening_context.get('label') or 'our records'}",
+        f"- Opening mode: {opening_context.get('mode') or 'generic'}",
         "These values override all previous prompt examples, CRM memory, contact memory, agent profiles, and old conversation history.",
         "Never use any other customer name.",
+        "After the fixed greeting and after the customer responds, use this exact opening intent:",
+        f"\"{opening_context.get('opening') or ''}\"",
+        "Do not say 'we received your enquiry' for database or generic record sources.",
+        "Do not hardcode Facebook; only mention Facebook when the current source label is Facebook.",
     ]
     if customer_name:
         lines.extend([
@@ -450,7 +543,12 @@ async def entrypoint(ctx: agents.JobContext):
         known_context.append("Customer name is not provided. You may ask for the name politely if needed.")
     _base_prompt = "\n".join(known_context) + "\n\n" + _base_prompt
     _base_prompt, _ = await _strip_stale_names_from_prompt(_base_prompt, customer_name)
-    final_override = _final_call_override(customer_name, business_name, company_name, service_type, call_type)
+    opening_context = _voice_opening_context(source, company_name or business_name or "Ladder Hub", service_type or "AI voice calling and WhatsApp CRM automation")
+    await _log("info", "voice_opening_source", source or "unknown")
+    await _log("info", "voice_opening_source_label", opening_context["label"])
+    await _log("info", "voice_opening_mode", opening_context["mode"])
+    await _log("info", "voice_opening_context_built", opening_context["opening"])
+    final_override = _final_call_override(customer_name, business_name, company_name, service_type, call_type, opening_context)
     _base_prompt = _base_prompt + "\n\n" + final_override
     final_contains_wrong_names = _prompt_contains_wrong_names(_base_prompt, customer_name)
     if final_contains_wrong_names:
