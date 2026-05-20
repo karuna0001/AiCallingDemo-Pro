@@ -802,22 +802,26 @@ def find_automation_rule(rules: list, event_type: str, source: Optional[str] = N
 def source_to_event_type(source: str) -> str:
     """Map a lead source string to an automation event type."""
     s = (source or "").strip().lower()
+    norm = s.replace("-", "_").replace(" ", "_")
+    compact = norm.replace("_", "")
+    if norm in {"facebook", "fb", "meta", "facebook_ads", "facebook_ad", "facebook_lead", "fb_lead", "fb_ads", "meta_ads", "meta_lead"} or compact in {"facebookads", "facebooklead", "fblead", "fbads", "metalead", "metaads"}:
+        return "facebook_lead"
+    if norm in {"instagram", "ig", "instagram_ads", "instagram_ad", "instagram_lead", "ig_lead", "ig_ads"} or compact in {"instagramads", "instagramlead", "iglead", "igads"}:
+        return "instagram_lead"
+    if norm in {"whatsapp", "wa", "whatsapp_lead"}:
+        return "whatsapp_lead" if "whatsapp_lead" in AUTOMATION_EVENT_TYPES else "uploaded_lead"
     mapping = {
-        "facebook": "facebook_lead",
-        "fb": "facebook_lead",
-        "instagram": "instagram_lead",
-        "ig": "instagram_lead",
         "website": "website_lead",
         "web": "website_lead",
-        "google_sheet": "google_sheet_lead",
-        "google sheet": "google_sheet_lead",
-        "google sheets": "google_sheet_lead",
-        "googlesheet": "google_sheet_lead",
-        "googlesheets": "google_sheet_lead",
-        "n8n": "google_sheet_lead",
-        "n8n_google_sheet": "google_sheet_lead",
-        "n8n_google_sheets": "google_sheet_lead",
-        "manual": "manual_lead",
+        "google_sheet": "uploaded_lead",
+        "google sheets": "uploaded_lead",
+        "googlesheet": "uploaded_lead",
+        "googlesheets": "uploaded_lead",
+        "n8n": "uploaded_lead",
+        "n8n_google_sheet": "uploaded_lead",
+        "n8n_google_sheets": "uploaded_lead",
+        "manual": "uploaded_lead",
+        "uploaded": "uploaded_lead",
         "csv": "uploaded_lead",
         "xlsx": "uploaded_lead",
         "file_upload": "uploaded_lead",
@@ -826,7 +830,7 @@ def source_to_event_type(source: str) -> str:
         "re_enquiry": "re_enquiry",
         "re-enquiry": "re_enquiry",
     }
-    return mapping.get(s, "new_lead")
+    return mapping.get(norm, mapping.get(s, "uploaded_lead"))
 
 
 # ── Automation Action Queue ────────────────────────────────────────────────

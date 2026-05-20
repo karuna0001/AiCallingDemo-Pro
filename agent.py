@@ -27,7 +27,7 @@ except ImportError:
     _HAS_ROOM_OPTIONS = False
 from livekit.plugins import noise_cancellation, silero
 
-from db import init_db, log_error, get_enabled_tools, get_setting
+from db import init_db, log_call, log_error, get_enabled_tools, get_setting
 from prompts import build_prompt
 from tools import AppointmentTools
 
@@ -75,6 +75,11 @@ def _log_bg(level: str, msg: str, detail: str = "") -> None:
 
 def _ms_since(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
+
+
+def _is_sip_busy_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "486" in text or "busy here" in text or "busy" in text
 
 
 def _first_text(*values, default: str = "") -> str:
@@ -496,6 +501,13 @@ async def entrypoint(ctx: agents.JobContext):
             )
         except Exception as exc:
             await _log("error", f"SIP dial FAILED for {phone_number}: {exc}")
+            if _is_sip_busy_error(exc):
+                try:
+                    await log_call(phone_number, lead_name, "busy", "SIP 486 Busy Here", 0)
+                    await _log("info", "call_outcome_busy_saved", f"phone={phone_number}; reason={exc}")
+                    await _log("info", "crm_call_outcome_updated", f"phone={phone_number}; last_call_outcome=busy")
+                except Exception as log_exc:
+                    await _log("error", "call_outcome_busy_save_failed", str(log_exc))
             ctx.shutdown()
             return
         call_started_at = time.perf_counter()

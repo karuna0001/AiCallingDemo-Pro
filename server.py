@@ -1761,6 +1761,7 @@ async def api_incoming_lead(req: LeadIncomingRequest):
     }
 
     try:
+        await log_error("lead_import", "lead_import_received", f"phone={phone}; source={source}; import_endpoint=/api/leads/incoming", "info")
         upsert_result = await upsert_crm_lead(lead_data, import_source=source)
         contact_status = upsert_result.get("status", "unknown")
     except Exception as exc:
@@ -1768,10 +1769,9 @@ async def api_incoming_lead(req: LeadIncomingRequest):
         return JSONResponse(status_code=500, content={"success": False, "error": str(exc)})
 
     # Determine event type
-    if contact_status == "duplicate":
-        event_type = "re_enquiry"
-    else:
-        event_type = source_to_event_type(source)
+    event_type = source_to_event_type(source)
+    await log_error("lead_import", "lead_source_detected", f"phone={phone}; source={source}; selected_event={event_type}; contact_status={contact_status}", "info")
+    await log_error("lead_import", "automation_event_selected", f"phone={phone}; source={source}; selected_event={event_type}", "info")
 
     # Build contact dict for automation
     contact = {
@@ -1784,6 +1784,10 @@ async def api_incoming_lead(req: LeadIncomingRequest):
 
     # Execute automation rule
     automation_result = await execute_automation_rule(event_type, contact)
+    rule_action = automation_result.get("selected_action") or automation_result.get("action") or ""
+    await log_error("lead_import", "automation_rule_matched", f"phone={phone}; source={source}; selected_event={event_type}; rule_action={rule_action}; matched_rule={automation_result.get('matched_rule_key')}", "info")
+    log_name = "automation_action_queued" if automation_result.get("queue_action_id") and automation_result.get("automation_status") != "skipped" else "automation_action_skipped"
+    await log_error("lead_import", log_name, f"phone={phone}; source={source}; selected_event={event_type}; rule_action={rule_action}; queue_action_id={automation_result.get('queue_action_id')}; skip_reason={automation_result.get('skip_reason','')}", "info")
 
     return {
         "success": True,
@@ -2179,7 +2183,10 @@ async def _run_lead_automation_for_imports(processed_leads: list, default_source
             continue
         source = (lead.get("source") or default_source or "api").strip().lower()
         contact_status = item.get("contact_status") or ""
-        event_type = "re_enquiry" if contact_status == "duplicate" else source_to_event_type(source)
+        await log_error("lead_import", "lead_import_received", f"phone={phone}; source={source}; contact_status={contact_status}", "info")
+        event_type = source_to_event_type(source)
+        await log_error("lead_import", "lead_source_detected", f"phone={phone}; source={source}; selected_event={event_type}", "info")
+        await log_error("lead_import", "automation_event_selected", f"phone={phone}; source={source}; selected_event={event_type}", "info")
         contact = {
             "phone": phone,
             "lead_name": lead.get("lead_name") or lead.get("name") or "",
@@ -2188,6 +2195,10 @@ async def _run_lead_automation_for_imports(processed_leads: list, default_source
             "source": source,
         }
         result = await execute_automation_rule(event_type, contact)
+        rule_action = result.get("selected_action") or result.get("action") or ""
+        await log_error("lead_import", "automation_rule_matched", f"phone={phone}; source={source}; selected_event={event_type}; rule_action={rule_action}; matched_rule={result.get('matched_rule_key')}", "info")
+        log_name = "automation_action_queued" if result.get("queue_action_id") and result.get("automation_status") != "skipped" else "automation_action_skipped"
+        await log_error("lead_import", log_name, f"phone={phone}; source={source}; selected_event={event_type}; rule_action={rule_action}; queue_action_id={result.get('queue_action_id')}; skip_reason={result.get('skip_reason','')}", "info")
         results.append({"phone": phone, "event_type": event_type, **result})
     return results
 
