@@ -95,8 +95,26 @@ def _first_text(*values, default: str = "") -> str:
 _TRUTHY = {"1", "true", "yes", "on", "enabled", "fixed"}
 _FALSEY = {"0", "false", "no", "off", "disabled"}
 _AI_GREETING_MODES = {"ai", "auto", "autonomous", "dynamic", "gemini", "model"}
-_DEFAULT_FIXED_GREETING = "Hi, this is AI assistant. Am I speaking with you?"
+_DEFAULT_FIXED_GREETING = "Hi, this is Priya calling from Ladder Hub. We help businesses automate calls, WhatsApp follow-up, and CRM tracking. Is this a good time to speak for a minute?"
 _STALE_SAMPLE_NAMES = ("Prasanth", "Prashanth", "Ramesh", "Sample Lead", "Suresh", "Test Lead", "Unknown Lead")
+_IDENTITY_BAN_PATTERNS = (
+    r"am\s+i\s+speaking",
+    r"am\s+i\s+talking",
+    r"speaking\s+to\s+the\s+right\s+person",
+    r"speaking\s+with\s+the\s+right\s+person",
+    r"may\s+i\s+know\s+your\s+name",
+    r"can\s+i\s+confirm\s+your\s+name",
+    r"is\s+this\s+\{?customer_name\}?",
+    r"hi\s+\{?customer_name\}?",
+    r"hello\s+\{?customer_name\}?",
+    r"hi\s+\{?lead_name\}?",
+    r"hello\s+\{?lead_name\}?",
+    r"confirm\s+identity",
+    r"step\s*1\s*[—-]\s*confirm\s+identity",
+    r"use\s+the\s+lookup_contact\s+tool\s+at\s+the\s+start[^\n]*",
+    r"lookup_contact\s+at\s+call\s+start",
+    r"lookup_contact\s*â†’\s*call\s+at\s+call\s+start[^\n]*",
+)
 _SOURCE_LABELS = {
     "facebook": "Facebook",
     "fb": "Facebook",
@@ -224,7 +242,7 @@ async def _sanitize_legacy_prompt_behavior(prompt: str) -> str:
     )
     cleaned = prompt
     changed = False
-    for pattern in patterns:
+    for pattern in (*patterns, *_IDENTITY_BAN_PATTERNS):
         cleaned_new = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
         if cleaned_new != cleaned:
             changed = True
@@ -232,6 +250,23 @@ async def _sanitize_legacy_prompt_behavior(prompt: str) -> str:
     if changed:
         await _log("warning", "legacy_prompt_behavior_removed", "removed identity opening or forced lookup_contact instruction")
     return cleaned
+
+
+async def _sanitize_identity_confirmation(prompt: str) -> tuple[str, bool]:
+    cleaned = prompt
+    removed = False
+    for pattern in _IDENTITY_BAN_PATTERNS:
+        cleaned_new = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+        if cleaned_new != cleaned:
+            removed = True
+            cleaned = cleaned_new
+    if removed:
+        await _log("warning", "banned_identity_phrase_removed", "true")
+    return cleaned, removed
+
+
+def _identity_prompt_safe(prompt: str) -> bool:
+    return not any(re.search(pattern, prompt, flags=re.IGNORECASE) for pattern in _IDENTITY_BAN_PATTERNS)
 
 
 async def _strip_stale_names_from_prompt(prompt: str, customer_name: str) -> tuple[str, bool]:
@@ -284,13 +319,13 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
         mode = "enquiry"
         opening = (
             f"We received your enquiry from {label} regarding {service_type}. "
-            "Can I arrange a quick 10-minute demo for you?"
+            "Can I arrange a quick 10-minute Google Meet demo for you?"
         )
     else:
         mode = "generic"
         opening = (
             f"I'm calling from {business_name} regarding AI voice calling and WhatsApp CRM automation. "
-            "Can I arrange a quick 10-minute demo for you?"
+            "Can I arrange a quick 10-minute Google Meet demo for you?"
         )
     return {"source": norm, "label": label, "mode": mode, "opening": opening}
 
@@ -316,17 +351,17 @@ def _final_call_override(
         "Never use any other customer name.",
         "After the fixed greeting and after the customer responds, use this exact opening intent:",
         f"\"{opening_context.get('opening') or ''}\"",
+        "HARD IDENTITY RULE: Never ask identity confirmation. Never ask if this is the correct person. Never request the customer's name. Start directly with enquiry/source/demo context.",
         "Do not say 'we received your enquiry' for database or generic record sources.",
         "Do not hardcode Facebook; only mention Facebook when the current source label is Facebook.",
     ]
     if customer_name:
         lines.extend([
-            f"Customer name is {customer_name}. Do not ask for the customer name again. Do not use any other name.",
-            f"Do not use identity-confirmation wording unless you use exactly '{customer_name}'.",
-            "Do not say 'May I know your name?'",
+            f"Customer name is {customer_name}. Use it only as internal context. Do not start with the customer's name.",
+            "Do not request, verify, or confirm the customer's name.",
         ])
     else:
-        lines.append("Customer name is not provided. You may ask for the name politely if needed.")
+        lines.append("Customer name is not provided. Still do not ask for it in the opening.")
     return "\n".join(lines)
 
 
@@ -568,11 +603,10 @@ async def entrypoint(ctx: agents.JobContext):
     ]
     if customer_name:
         known_context.append(f"Customer name is {customer_name}. Do not ask for the customer name again. Do not use any other name.")
-        known_context.append(f"If you need to confirm identity, only use the exact name '{customer_name}', or avoid saying a name.")
-        known_context.append("Do not use identity-confirmation wording with any name other than the exact customer name above.")
+        known_context.append("Do not verify identity or ask whether this is the correct person.")
         known_context.append("Ignore any conflicting customer name from tools, memory, CRM lookup, examples, or saved prompt text.")
     else:
-        known_context.append("Customer name is not provided. You may ask for the name politely if needed.")
+        known_context.append("Customer name is not provided. Do not ask for it in the opening.")
     _base_prompt = "\n".join(known_context) + "\n\n" + _base_prompt
     _base_prompt = await _sanitize_legacy_prompt_behavior(_base_prompt)
     _base_prompt, _ = await _strip_stale_names_from_prompt(_base_prompt, customer_name)
@@ -602,12 +636,23 @@ async def entrypoint(ctx: agents.JobContext):
     else:
         system_prompt = _base_prompt
     system_prompt = system_prompt + "\n\n" + final_override
+    system_prompt, banned_identity_removed = await _sanitize_identity_confirmation(system_prompt)
+    final_voice_prompt_identity_safe = _identity_prompt_safe(system_prompt)
+    await _log("info", "identity_confirmation_disabled", "true")
+    await _log("info", "banned_identity_phrase_removed", str(banned_identity_removed).lower())
+    await _log("info", "final_voice_prompt_identity_safe", str(final_voice_prompt_identity_safe).lower())
+    if not final_voice_prompt_identity_safe:
+        await _log("error", "voice_call_blocked_identity_prompt_unsafe", "Final voice prompt still contains banned identity confirmation text")
+        ctx.shutdown()
+        return
     tool_ctx = AppointmentTools(ctx, phone_number=phone_number, lead_name=lead_name)
     tool_ctx.current_customer_name = customer_name
     tool_ctx.current_business_name = business_name
     tool_ctx.current_service_type = service_type
     tool_ctx.current_call_type = call_type
     active_tools = tool_ctx.build_tool_list(enabled_tools)
+    if call_type == "welcome_call":
+        active_tools = [tool for tool in active_tools if getattr(tool, "__name__", "") != "lookup_contact"]
     session = _build_session(tools=active_tools, system_prompt=system_prompt)
 
     await ctx.connect()

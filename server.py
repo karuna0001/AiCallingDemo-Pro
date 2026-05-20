@@ -575,7 +575,7 @@ async def api_health():
     greeting_mode_raw, greeting_mode_source = await setting_value_with_source("OUTBOUND_GREETING_MODE", "")
     fixed_greeting_text, fixed_greeting_text_source = await setting_value_with_source(
         "OUTBOUND_FIXED_GREETING",
-        "Hi, this is AI assistant. Am I speaking with you?",
+        "Hi, this is Priya calling from Ladder Hub. We help businesses automate calls, WhatsApp follow-up, and CRM tracking. Is this a good time to speak for a minute?",
     )
     fixed_enabled_value = fixed_enabled_raw.strip().lower()
     greeting_mode_value = greeting_mode_raw.strip().lower()
