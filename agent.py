@@ -95,7 +95,8 @@ def _first_text(*values, default: str = "") -> str:
 _TRUTHY = {"1", "true", "yes", "on", "enabled", "fixed"}
 _FALSEY = {"0", "false", "no", "off", "disabled"}
 _AI_GREETING_MODES = {"ai", "auto", "autonomous", "dynamic", "gemini", "model"}
-_DEFAULT_FIXED_GREETING = "Hi, this is Priya calling from Ladder Hub. We help businesses automate calls, WhatsApp follow-up, and CRM tracking. Is this a good time to speak for a minute?"
+_DEFAULT_FIXED_GREETING = "Hi, this is Priya from Ladder Hub. Is this a good time to speak for a minute?"
+_FIXED_GREETING_TEXT = "Hi, this is Priya from Ladder Hub. Is this a good time to speak for a minute?"
 _STALE_SAMPLE_NAMES = ("Prasanth", "Prashanth", "Ramesh", "Sample Lead", "Suresh", "Test Lead", "Unknown Lead")
 _IDENTITY_BAN_PATTERNS = (
     r"am\s+i\s+speaking",
@@ -350,6 +351,87 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
     return {"source": norm, "label": label, "mode": mode, "opening": opening}
 
 
+def _customer_response_intent(text: str) -> str:
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return "unclear"
+    busy_words = (
+        "busy", "later", "call back", "callback", "meeting", "driving", "not now",
+        "another time", "tomorrow", "evening", "morning", "after some time",
+    )
+    refusal_words = (
+        "not interested", "no interested", "don't want", "do not want", "stop calling",
+        "remove", "wrong number", "no need", "not required", "don't call",
+    )
+    positive_words = (
+        "yes", "yeah", "ok", "okay", "sure", "tell me", "go ahead", "speaking",
+        "continue", "haan", "ha", "sari", "fine",
+    )
+    if any(word in normalized for word in refusal_words):
+        return "refusal"
+    if normalized in {"no", "nope"}:
+        return "busy"
+    if any(word in normalized for word in busy_words):
+        return "busy"
+    if any(word in normalized for word in positive_words):
+        return "positive"
+    return "unclear"
+
+
+def _event_transcript_text(event) -> str:
+    for attr in ("transcript", "text", "message", "content"):
+        value = getattr(event, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    alternatives = getattr(event, "alternatives", None)
+    if alternatives:
+        try:
+            first = alternatives[0]
+            for attr in ("text", "transcript"):
+                value = getattr(first, attr, None)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _event_is_final(event) -> bool:
+    for attr in ("is_final", "final"):
+        value = getattr(event, attr, None)
+        if value is not None:
+            return bool(value)
+    return True
+
+
+def _watch_first_customer_response(session: AgentSession) -> tuple[asyncio.Event, dict]:
+    response_event = asyncio.Event()
+    holder = {"text": "", "event": ""}
+
+    def _capture(event_name: str):
+        def _handler(event) -> None:
+            if response_event.is_set() or not _event_is_final(event):
+                return
+            text = _event_transcript_text(event)
+            if not text:
+                return
+            holder["text"] = text
+            holder["event"] = event_name
+            response_event.set()
+        return _handler
+
+    for event_name in (
+        "user_input_transcribed",
+        "input_audio_transcription_completed",
+        "user_speech_committed",
+    ):
+        try:
+            session.on(event_name, _capture(event_name))
+        except Exception:
+            pass
+    return response_event, holder
+
+
 def _final_call_override(
     customer_name: str,
     business_name: str,
@@ -369,9 +451,10 @@ def _final_call_override(
         f"- Opening mode: {opening_context.get('mode') or 'generic'}",
         "These values override all previous prompt examples, CRM memory, contact memory, agent profiles, and old conversation history.",
         "Never use any other customer name.",
-        "After the fixed greeting, when the customer responds positively or gives permission to continue, your next response MUST be exactly this opening line:",
+        "The application will speak the fixed greeting and this source opening line through system audio before you continue:",
         f"\"{opening_context.get('opening') or ''}\"",
-        "Do not replace it with any other question. Do not ask whether the customer is looking for the service. Use the exact line above.",
+        "Do not repeat the greeting. Do not repeat the source opening. Do not replace it with any other first-business question.",
+        "After the system has spoken that opening line, continue from the customer's next response.",
         "HARD IDENTITY RULE: Never ask identity confirmation. Never ask if this is the correct person. Never request the customer's name. Start directly with enquiry/source/demo context.",
         "Do not say 'we received your enquiry' for database or generic record sources.",
         "Do not hardcode Facebook; only mention Facebook when the current source label is Facebook.",
@@ -654,11 +737,14 @@ async def entrypoint(ctx: agents.JobContext):
     await _log("info", "final_voice_context_call_type", call_type)
     await _log("info", "final_voice_prompt_contains_wrong_names", str(final_contains_wrong_names).lower())
     if fixed_greeting_config["enabled"]:
-        # Prevent Gemini from autonomously producing an opening greeting.
-        # The fixed greeting will be injected via session.say() after session.start().
+        # Prevent Gemini from producing the greeting or first business opening.
+        # Both are injected deterministically via session.say() after session.start().
         system_prompt = (
-            "IMPORTANT: Do NOT speak first. Do NOT generate any opening greeting. "
-            "Wait silently until the user speaks or you receive an explicit instruction to reply.\n\n"
+            "IMPORTANT: The fixed greeting and opening line are already handled by the system. "
+            "Do NOT speak first. Do NOT generate an opening greeting. "
+            "Do NOT respond to the customer's first reply after the fixed greeting. "
+            "Do NOT repeat the source opening. Continue only after the system opening line has been spoken "
+            "and the customer responds again.\n\n"
         ) + _base_prompt
     else:
         system_prompt = _base_prompt
@@ -669,10 +755,6 @@ async def entrypoint(ctx: agents.JobContext):
     opening_text = opening_context["opening"]
     opening_present = opening_text in system_prompt
     await _log("info", "final_voice_prompt_preview_safe", f"opening_text_present={str(opening_present).lower()}; opening_text={opening_text}")
-    if not opening_present:
-        await _log("error", "final_voice_prompt_missing_opening_text", opening_text)
-        ctx.shutdown()
-        return
     await _log("info", "identity_confirmation_disabled", "true")
     await _log("info", "banned_identity_phrase_removed", str(banned_identity_removed).lower())
     await _log("info", "final_voice_prompt_identity_safe", str(final_voice_prompt_identity_safe).lower())
@@ -771,9 +853,13 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as exc:
             await _log("warning", f"Recording start failed (non-fatal): {exc}")
 
-    fixed_greeting = fixed_greeting_config["greeting"]
+    fixed_greeting = _FIXED_GREETING_TEXT
     active_model = os.getenv("GEMINI_MODEL", "")
     recording_task = asyncio.create_task(_start_recording_after_greeting()) if phone_number else None
+    first_response_event, first_response_holder = _watch_first_customer_response(session)
+    await _log("info", "fixed_greeting_text", fixed_greeting)
+    await _log("info", "opening_text_built", opening_text)
+    await _log("info", "gemini_opening_disabled", "true")
 
     if fixed_greeting_config["enabled"]:
         try:
@@ -794,8 +880,55 @@ async def entrypoint(ctx: agents.JobContext):
                 )
             await _log("info", "fixed_greeting_completed_at", f"duration_ms={_ms_since(greeting_requested_at)}")
             await _log("info", "fixed_greeting_delay_ms", str(greeting_start_delay_ms))
-            await _log("info", "Fixed outbound greeting sent — Gemini realtime conversation continues")
+            await _log("info", "Fixed outbound greeting sent - waiting for customer response before system opening")
+            # The next customer reply is handled here so Gemini cannot invent the first business line.
             await _log("info", "ai_context_loaded_after_greeting", "not_applicable; prompt_context_loaded_before_session_start")
+            try:
+                wait_seconds = max(int(os.getenv("OPENING_RESPONSE_WAIT_SECONDS", "12")), 1)
+            except ValueError:
+                wait_seconds = 12
+            try:
+                await asyncio.wait_for(first_response_event.wait(), timeout=wait_seconds)
+            except asyncio.TimeoutError:
+                await _log("warning", "opening_text_wait_timeout", f"seconds={wait_seconds}; using_unclear_intent")
+
+            first_response = first_response_holder.get("text", "")
+            first_response_intent = _customer_response_intent(first_response)
+            await _log(
+                "info",
+                "opening_text_customer_response",
+                f"intent={first_response_intent}; event={first_response_holder.get('event') or 'timeout'}; text={first_response}",
+            )
+
+            if first_response_intent == "busy":
+                callback_text = "No problem. When is a good time to call back?"
+                callback_requested_at = time.perf_counter()
+                await _log("info", "opening_text_start_requested", "busy_callback_prompt")
+                await session.say(callback_text, allow_interruptions=True)
+                callback_duration_ms = _ms_since(callback_requested_at)
+                await _log("info", "opening_text_completed_at", f"mode=busy; duration_ms={callback_duration_ms}")
+                await _log("info", "opening_text_duration_ms", str(callback_duration_ms))
+                await _log("info", "opening_text_spoken_by_system", "true")
+            elif first_response_intent == "refusal":
+                refusal_text = "No worries at all. Thank you for your time."
+                refusal_requested_at = time.perf_counter()
+                await _log("info", "opening_text_start_requested", "refusal_close_prompt")
+                await session.say(refusal_text, allow_interruptions=True)
+                refusal_duration_ms = _ms_since(refusal_requested_at)
+                await _log("info", "opening_text_completed_at", f"mode=refusal; duration_ms={refusal_duration_ms}")
+                await _log("info", "opening_text_duration_ms", str(refusal_duration_ms))
+                await _log("info", "opening_text_spoken_by_system", "true")
+                await asyncio.sleep(1)
+                ctx.shutdown()
+                return
+            else:
+                opening_requested_at = time.perf_counter()
+                await _log("info", "opening_text_start_requested", opening_text)
+                await session.say(opening_text, allow_interruptions=True)
+                opening_duration_ms = _ms_since(opening_requested_at)
+                await _log("info", "opening_text_completed_at", f"duration_ms={opening_duration_ms}")
+                await _log("info", "opening_text_duration_ms", str(opening_duration_ms))
+                await _log("info", "opening_text_spoken_by_system", "true")
         except Exception as exc:
             await _log("warning", "fixed_greeting_failed_no_autonomous_fallback", str(exc))
     else:
