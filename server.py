@@ -2622,7 +2622,7 @@ async def api_call_selected(req: CrmCallSelectedRequest):
             if not contact:
                 failed += 1
                 continue
-            contacts.append({
+            call_contact = {
                 "phone": clean,
                 "lead_name": contact.get("lead_name") or "there",
                 "customer_name": contact.get("lead_name") or "there",
@@ -2633,7 +2633,19 @@ async def api_call_selected(req: CrmCallSelectedRequest):
                 "notes": contact.get("crm_notes") or "",
                 "source": contact.get("source") or "",
                 "call_type": _crm_status_to_call_type(contact.get("crm_status") or ""),
-            })
+            }
+            await log_error(
+                "server",
+                "crm_call_selected_payload",
+                (
+                    f"phone={clean}; source={call_contact.get('source') or 'missing'}; "
+                    f"service_type={call_contact.get('service_type') or 'missing'}; "
+                    f"lead_name={call_contact.get('lead_name') or 'missing'}; "
+                    f"call_type={call_contact.get('call_type') or 'welcome_call'}"
+                ),
+                "info",
+            )
+            contacts.append(call_contact)
         except Exception:
             failed += 1
     if not contacts:
@@ -3140,6 +3152,31 @@ async def _build_dispatch_metadata(contact: dict, prompt: Optional[str], profile
 async def _dispatch_one(lk, lk_api, contact: dict, room_name: str, prompt: Optional[str], profile: Optional[dict] = None) -> bool:
     try:
         metadata = await _build_dispatch_metadata(contact, prompt, profile)
+        await log_error(
+            "server",
+            "automation_call_payload",
+            (
+                f"phone={metadata.get('phone_number')}; "
+                f"source={metadata.get('source') or 'missing'}; "
+                f"service_type={metadata.get('service_type') or 'missing'}; "
+                f"call_type={metadata.get('call_type') or 'welcome_call'}"
+            ),
+            "info",
+        )
+        await log_error(
+            "server",
+            "outbound_metadata_prepared",
+            (
+                f"room={room_name}; phone={metadata.get('phone_number')}; "
+                f"customer_name={metadata.get('customer_name') or 'missing'}; "
+                f"business_name={metadata.get('business_name') or 'missing'}; "
+                f"company_name={metadata.get('company_name') or 'missing'}; "
+                f"service_type={metadata.get('service_type') or 'missing'}; "
+                f"source={metadata.get('source') or 'missing'}; "
+                f"call_type={metadata.get('call_type') or 'welcome_call'}"
+            ),
+            "info",
+        )
         room_kwargs = {"name": room_name, "empty_timeout": 300, "max_participants": 5}
         try:
             room_req = lk_api.CreateRoomRequest(**room_kwargs, metadata=json.dumps(metadata))

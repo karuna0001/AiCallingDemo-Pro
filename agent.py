@@ -265,6 +265,25 @@ async def _sanitize_identity_confirmation(prompt: str) -> tuple[str, bool]:
     return cleaned, removed
 
 
+async def _sanitize_competing_opening_questions(prompt: str) -> tuple[str, bool]:
+    patterns = (
+        r'[-\s"]*Are you still looking for\s+[^?\n]+\?"?',
+        r'[-•]?\s*"?Are you still looking for\s+\{?service_type\}?\?"?',
+        r'[-•]?\s*"?Are you looking for\s+[^?\n]+\?"?',
+        r'[-•]?\s*"?Are you looking for the same requirement as before, or something new\?"?',
+    )
+    cleaned = prompt
+    removed = False
+    for pattern in patterns:
+        cleaned_new = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+        if cleaned_new != cleaned:
+            removed = True
+            cleaned = cleaned_new
+    if removed:
+        await _log("warning", "competing_opening_question_removed", "true")
+    return cleaned, removed
+
+
 def _identity_prompt_safe(prompt: str) -> bool:
     return not any(re.search(pattern, prompt, flags=re.IGNORECASE) for pattern in _IDENTITY_BAN_PATTERNS)
 
@@ -292,6 +311,7 @@ def _normalize_source_value(source: str) -> str:
 def _voice_opening_context(source: str, business_name: str, service_type: str) -> dict:
     norm = _normalize_source_value(source)
     compact = norm.replace("_", "")
+    caller_business = "Ladder Hub"
     if norm in _SOURCE_LABELS:
         label = _SOURCE_LABELS[norm]
     elif compact in {"facebooklead", "facebookads", "fblead", "fbads", "metalead", "metaads"}:
@@ -311,7 +331,7 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
     if label == "database":
         mode = "cold_call"
         opening = (
-            f"I'm calling from {business_name}. We provide fully automated bulk AI voice calling, "
+            f"I'm calling from {caller_business}. We provide fully automated bulk AI voice calling, "
             "WhatsApp messaging, and CRM follow-up automation for businesses. "
             "Are you interested in a quick 10-minute Google Meet demo?"
         )
@@ -324,7 +344,7 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
     else:
         mode = "generic"
         opening = (
-            f"I'm calling from {business_name} regarding AI voice calling and WhatsApp CRM automation. "
+            f"I'm calling from {caller_business} regarding AI voice calling and WhatsApp CRM automation. "
             "Can I arrange a quick 10-minute Google Meet demo for you?"
         )
     return {"source": norm, "label": label, "mode": mode, "opening": opening}
@@ -349,8 +369,9 @@ def _final_call_override(
         f"- Opening mode: {opening_context.get('mode') or 'generic'}",
         "These values override all previous prompt examples, CRM memory, contact memory, agent profiles, and old conversation history.",
         "Never use any other customer name.",
-        "After the fixed greeting and after the customer responds, use this exact opening intent:",
+        "After the fixed greeting, when the customer responds positively or gives permission to continue, your next response MUST be exactly this opening line:",
         f"\"{opening_context.get('opening') or ''}\"",
+        "Do not replace it with any other question. Do not ask whether the customer is looking for the service. Use the exact line above.",
         "HARD IDENTITY RULE: Never ask identity confirmation. Never ask if this is the correct person. Never request the customer's name. Start directly with enquiry/source/demo context.",
         "Do not say 'we received your enquiry' for database or generic record sources.",
         "Do not hardcode Facebook; only mention Facebook when the current source label is Facebook.",
@@ -590,13 +611,14 @@ async def entrypoint(ctx: agents.JobContext):
         call_type=call_type,
     )
     _base_prompt = await _sanitize_legacy_prompt_behavior(_base_prompt)
+    _base_prompt, _ = await _sanitize_competing_opening_questions(_base_prompt)
     known_context = [
         "CURRENT SINGLE CALL METADATA OVERRIDE:",
         "These current call details override old CRM memory, old conversation memory, default prompt examples, and agent profile examples.",
         "CALL CONTEXT:",
-        f"- Customer name: {customer_name}" if customer_name else "- Customer name: unknown. Ask politely only if needed.",
-        f"- Business/company: {business_name}" if business_name else "- Business/company: unknown. Ask politely only if needed.",
-        f"- Service/interest: {service_type}" if service_type else "- Service/interest: unknown. Ask politely only if needed.",
+        f"- Customer name: {customer_name}" if customer_name else "- Customer name: unknown. Do not ask for it in the opening.",
+        f"- Business/company: {business_name}" if business_name else "- Business/company: unknown. Do not ask for it in the opening.",
+        f"- Service/interest: {service_type}" if service_type else "- Service/interest: unknown. Use the generic demo opening.",
         f"- Requirement/notes: {requirement}" if requirement else "- Requirement/notes: not provided.",
         f"- Source: {source}" if source else "- Source: not provided.",
         f"- Call type: {call_type}",
@@ -609,11 +631,16 @@ async def entrypoint(ctx: agents.JobContext):
         known_context.append("Customer name is not provided. Do not ask for it in the opening.")
     _base_prompt = "\n".join(known_context) + "\n\n" + _base_prompt
     _base_prompt = await _sanitize_legacy_prompt_behavior(_base_prompt)
+    _base_prompt, _ = await _sanitize_competing_opening_questions(_base_prompt)
     _base_prompt, _ = await _strip_stale_names_from_prompt(_base_prompt, customer_name)
     opening_context = _voice_opening_context(source, company_name or business_name or "Ladder Hub", service_type or "AI voice calling and WhatsApp CRM automation")
+    if not source or not service_type:
+        await _log("warning", "voice_opening_missing_data", f"source={source or 'missing'}; service_type={service_type or 'missing'}")
     await _log("info", "voice_opening_source", source or "unknown")
     await _log("info", "voice_opening_source_label", opening_context["label"])
+    await _log("info", "voice_opening_service_type", service_type or "missing")
     await _log("info", "voice_opening_mode", opening_context["mode"])
+    await _log("info", "voice_opening_text_built", opening_context["opening"])
     await _log("info", "voice_opening_context_built", opening_context["opening"])
     final_override = _final_call_override(customer_name, business_name, company_name, service_type, call_type, opening_context)
     _base_prompt = _base_prompt + "\n\n" + final_override
@@ -636,8 +663,16 @@ async def entrypoint(ctx: agents.JobContext):
     else:
         system_prompt = _base_prompt
     system_prompt = system_prompt + "\n\n" + final_override
+    system_prompt, _ = await _sanitize_competing_opening_questions(system_prompt)
     system_prompt, banned_identity_removed = await _sanitize_identity_confirmation(system_prompt)
     final_voice_prompt_identity_safe = _identity_prompt_safe(system_prompt)
+    opening_text = opening_context["opening"]
+    opening_present = opening_text in system_prompt
+    await _log("info", "final_voice_prompt_preview_safe", f"opening_text_present={str(opening_present).lower()}; opening_text={opening_text}")
+    if not opening_present:
+        await _log("error", "final_voice_prompt_missing_opening_text", opening_text)
+        ctx.shutdown()
+        return
     await _log("info", "identity_confirmation_disabled", "true")
     await _log("info", "banned_identity_phrase_removed", str(banned_identity_removed).lower())
     await _log("info", "final_voice_prompt_identity_safe", str(final_voice_prompt_identity_safe).lower())
