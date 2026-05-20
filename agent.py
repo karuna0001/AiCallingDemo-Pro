@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import ssl
+import subprocess
 import time
 import certifi
 
@@ -77,6 +78,25 @@ def _ms_since(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
 
 
+def _deployed_code_version() -> str:
+    env_version = os.getenv("DEPLOYED_CODE_VERSION") or os.getenv("RENDER_GIT_COMMIT") or os.getenv("SOURCE_VERSION")
+    if env_version:
+        return env_version[:12]
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(__file__) or ".",
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
 def _is_sip_busy_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return "486" in text or "busy here" in text or "busy" in text
@@ -96,7 +116,20 @@ _TRUTHY = {"1", "true", "yes", "on", "enabled", "fixed"}
 _FALSEY = {"0", "false", "no", "off", "disabled"}
 _AI_GREETING_MODES = {"ai", "auto", "autonomous", "dynamic", "gemini", "model"}
 _DEFAULT_FIXED_GREETING = "Hi, this is Priya from Ladder Hub. Is this a good time to speak for a minute?"
-_FIXED_GREETING_TEXT = "Hi, this is Priya from Ladder Hub. Is this a good time to speak for a minute?"
+_DEFAULT_GEMINI_TTS_VOICE = "Kore"
+_DEFAULT_TTS_LANGUAGE = "en-IN"
+_TTS_STYLE_INSTRUCTIONS = (
+    "Speak like a warm, confident Indian English telecaller from Chennai/Bengaluru. "
+    "Use a polite Indian customer-service tone, natural pace, clear pronunciation, and a slight smile. "
+    "Do not sound like a cold-call robot."
+)
+_SELECTED_TTS_CONFIG = {
+    "provider": "livekit.plugins.google",
+    "model": "unknown",
+    "voice": _DEFAULT_GEMINI_TTS_VOICE,
+    "language": _DEFAULT_TTS_LANGUAGE,
+    "style_applied": False,
+}
 _STALE_SAMPLE_NAMES = ("Prasanth", "Prashanth", "Ramesh", "Sample Lead", "Suresh", "Test Lead", "Unknown Lead")
 _IDENTITY_BAN_PATTERNS = (
     r"am\s+i\s+speaking",
@@ -331,24 +364,39 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
 
     if label == "database":
         mode = "cold_call"
-        opening = (
-            f"I'm calling from {caller_business}. We provide fully automated bulk AI voice calling, "
+        dynamic_greeting = (
+            f"Hi, this is Priya from {caller_business}. We provide fully automated bulk AI voice calling, "
             "WhatsApp messaging, and CRM follow-up automation for businesses. "
-            "Are you interested in a quick 10-minute Google Meet demo?"
+            "Is this a good time to speak for a minute?"
         )
+        opening = "Great. Are you interested in a quick 10-minute Google Meet demo?"
     elif label in {"Facebook", "Instagram", "our website", "Google", "WhatsApp"}:
         mode = "enquiry"
-        opening = (
+        dynamic_greeting = (
+            f"Hi, this is Priya from {caller_business}. "
             f"We received your enquiry from {label} regarding {service_type}. "
-            "Can I arrange a quick 10-minute Google Meet demo for you?"
+            "Is this a good time to speak for a minute?"
         )
+        opening = "Great. Can I arrange a quick 10-minute Google Meet demo for you?"
     else:
         mode = "generic"
-        opening = (
-            f"I'm calling from {caller_business} regarding AI voice calling and WhatsApp CRM automation. "
-            "Can I arrange a quick 10-minute Google Meet demo for you?"
+        dynamic_greeting = (
+            f"Hi, this is Priya from {caller_business}. "
+            "I'm calling regarding AI voice calling and WhatsApp CRM automation. "
+            "Is this a good time to speak for a minute?"
         )
-    return {"source": norm, "label": label, "mode": mode, "opening": opening}
+        opening = "Great. Can I arrange a quick 10-minute Google Meet demo for you?"
+    return {
+        "source": norm,
+        "label": label,
+        "mode": mode,
+        "dynamic_greeting": dynamic_greeting,
+        "opening": opening,
+        "legacy_source_opening": (
+            f"We received your enquiry from {label} regarding {service_type}. "
+            "Can I arrange a quick 10-minute Google Meet demo for you?"
+        ) if mode == "enquiry" else "",
+    }
 
 
 def _customer_response_intent(text: str) -> str:
@@ -451,9 +499,10 @@ def _final_call_override(
         f"- Opening mode: {opening_context.get('mode') or 'generic'}",
         "These values override all previous prompt examples, CRM memory, contact memory, agent profiles, and old conversation history.",
         "Never use any other customer name.",
-        "The application will speak the fixed greeting and this source opening line through system audio before you continue:",
+        "The application will speak the source-aware greeting and demo line through system audio before you continue:",
+        f"Source-aware greeting: \"{opening_context.get('dynamic_greeting') or ''}\"",
         f"\"{opening_context.get('opening') or ''}\"",
-        "Do not repeat the greeting. Do not repeat the source opening. Do not replace it with any other first-business question.",
+        "Do not repeat the greeting. Do not repeat the demo line. Do not replace it with any other first-business question.",
         "After the system has spoken that opening line, continue from the customer's next response.",
         "HARD IDENTITY RULE: Never verify who answered. Never request the customer's name. Start directly with enquiry/source/demo context.",
         "Do not say 'we received your enquiry' for database or generic record sources.",
@@ -524,7 +573,7 @@ except ImportError:
 
 def _build_realtime_model(system_prompt: str):
     model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
-    voice = os.getenv("GEMINI_TTS_VOICE", "Aoede")
+    voice = os.getenv("GEMINI_TTS_VOICE", _DEFAULT_GEMINI_TTS_VOICE)
     klass = _google_realtime or _google_beta_realtime
     if not klass:
         return None
@@ -555,9 +604,50 @@ def _build_realtime_model(system_prompt: str):
 
 
 def _build_tts_model():
+    global _SELECTED_TTS_CONFIG
     if not _google_tts:
+        _SELECTED_TTS_CONFIG = {
+            "provider": "livekit.plugins.google",
+            "model": "unavailable",
+            "voice": os.getenv("GEMINI_TTS_VOICE", _DEFAULT_GEMINI_TTS_VOICE),
+            "language": os.getenv("GEMINI_TTS_LANGUAGE", _DEFAULT_TTS_LANGUAGE),
+            "style_applied": False,
+        }
         return None
-    return _google_tts(voice_name=os.getenv("GEMINI_TTS_VOICE", "Aoede"))
+    voice_name = os.getenv("GEMINI_TTS_VOICE", _DEFAULT_GEMINI_TTS_VOICE)
+    language = os.getenv("GEMINI_TTS_LANGUAGE", _DEFAULT_TTS_LANGUAGE)
+    model = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+    attempts = (
+        {"model": model, "voice_name": voice_name, "language": language, "instructions": _TTS_STYLE_INSTRUCTIONS},
+        {"model": model, "voice_name": voice_name, "instructions": _TTS_STYLE_INSTRUCTIONS},
+        {"voice_name": voice_name, "language": language, "instructions": _TTS_STYLE_INSTRUCTIONS},
+        {"voice_name": voice_name, "instructions": _TTS_STYLE_INSTRUCTIONS},
+        {"voice_name": voice_name},
+    )
+    last_exc = None
+    for kwargs in attempts:
+        try:
+            tts = _google_tts(**kwargs)
+            _SELECTED_TTS_CONFIG = {
+                "provider": "livekit.plugins.google",
+                "model": kwargs.get("model", model),
+                "voice": kwargs.get("voice_name", voice_name),
+                "language": kwargs.get("language", language),
+                "style_applied": bool(kwargs.get("instructions")),
+            }
+            return tts
+        except TypeError as exc:
+            last_exc = exc
+    if last_exc:
+        logger.warning("Google TTS rejected Indian tone options, using provider defaults: %s", last_exc)
+    _SELECTED_TTS_CONFIG = {
+        "provider": "livekit.plugins.google",
+        "model": model,
+        "voice": voice_name,
+        "language": language,
+        "style_applied": False,
+    }
+    return _google_tts(voice_name=voice_name)
 
 
 def _build_session(tools: list, system_prompt: str) -> AgentSession:
@@ -598,6 +688,8 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
 
 async def entrypoint(ctx: agents.JobContext):
     call_started_at = time.perf_counter()
+    await _log("info", "deployed_code_version", _deployed_code_version())
+    await _log("info", "voice_flow_version", "v2_deterministic_indian")
     await _log("info", "outbound_call_started", f"room={getattr(ctx.room, 'name', '')}")
     metadata = {}
     raw_job_metadata = getattr(ctx.job, "metadata", "") or ""
@@ -723,6 +815,9 @@ async def entrypoint(ctx: agents.JobContext):
     await _log("info", "voice_opening_source_label", opening_context["label"])
     await _log("info", "voice_opening_service_type", service_type or "missing")
     await _log("info", "voice_opening_mode", opening_context["mode"])
+    await _log("info", "source_label", opening_context["label"])
+    await _log("info", "service_type", service_type or "missing")
+    await _log("info", "dynamic_greeting_text_built", opening_context["dynamic_greeting"])
     await _log("info", "voice_opening_text_built", opening_context["opening"])
     await _log("info", "voice_opening_context_built", opening_context["opening"])
     final_override = _final_call_override(customer_name, business_name, company_name, service_type, call_type, opening_context)
@@ -740,10 +835,10 @@ async def entrypoint(ctx: agents.JobContext):
         # Prevent Gemini from producing the greeting or first business opening.
         # Both are injected deterministically via session.say() after session.start().
         system_prompt = (
-            "IMPORTANT: The fixed greeting and opening line are already handled by the system. "
+            "IMPORTANT: The source-aware greeting and demo line are already handled by the system. "
             "Do NOT speak first. Do NOT generate an opening greeting. "
-            "Do NOT respond to the customer's first reply after the fixed greeting. "
-            "Do NOT repeat the source opening. Continue only after the system opening line has been spoken "
+            "Do NOT respond to the customer's first reply after the source-aware greeting. "
+            "Do NOT repeat the source reminder or demo line. Continue only after the system demo line has been spoken "
             "and the customer responds again.\n\n"
         ) + _base_prompt
     else:
@@ -853,17 +948,33 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as exc:
             await _log("warning", f"Recording start failed (non-fatal): {exc}")
 
-    fixed_greeting = _FIXED_GREETING_TEXT
+    dynamic_greeting_text = opening_context["dynamic_greeting"]
+    fixed_greeting = dynamic_greeting_text
     active_model = os.getenv("GEMINI_MODEL", "")
     recording_task = asyncio.create_task(_start_recording_after_greeting()) if phone_number else None
     first_response_event, first_response_holder = _watch_first_customer_response(session)
     await _log("info", "fixed_greeting_text", fixed_greeting)
+    await _log("info", "dynamic_greeting_text_built", dynamic_greeting_text)
     await _log("info", "opening_text_built", opening_text)
     await _log("info", "gemini_opening_disabled", "true")
     await _log("info", "generate_reply_identity_opening_removed", "true")
-    await _log("info", "system_opening_flow_active", str(fixed_greeting_config["enabled"]).lower())
+    deterministic_greeting_enabled = True
+    await _log("info", "system_opening_flow_active", str(deterministic_greeting_enabled).lower())
+    await _log("info", "deterministic_greeting_enabled", str(deterministic_greeting_enabled).lower())
+    tts_config = dict(_SELECTED_TTS_CONFIG)
+    tts_voice = tts_config.get("voice") or os.getenv("GEMINI_TTS_VOICE", _DEFAULT_GEMINI_TTS_VOICE)
+    tts_language = tts_config.get("language") or os.getenv("GEMINI_TTS_LANGUAGE", _DEFAULT_TTS_LANGUAGE)
+    indian_voice_enabled = bool(tts_config.get("style_applied")) or tts_language.lower().startswith("en-in")
+    await _log("info", "voice_provider_selected", tts_config.get("provider") or "livekit.plugins.google")
+    await _log("info", "tts_model_selected", tts_config.get("model") or "unknown")
+    await _log("info", "tts_voice_selected", tts_voice)
+    await _log("info", "tts_language_selected", tts_language)
+    await _log("info", "tts_style_instructions_applied", str(bool(tts_config.get("style_applied"))).lower())
+    await _log("info", "indian_voice_enabled", str(indian_voice_enabled).lower())
+    if not indian_voice_enabled:
+        await _log("warning", "indian_voice_config_missing", "Using Gemini TTS voice with Indian English style instructions fallback")
 
-    if fixed_greeting_config["enabled"]:
+    if deterministic_greeting_enabled:
         try:
             greeting_requested_at = time.perf_counter()
             greeting_start_delay_ms = _ms_since(call_started_at)
@@ -879,6 +990,7 @@ async def entrypoint(ctx: agents.JobContext):
             await session.say(fixed_greeting, allow_interruptions=True)
             await _log("info", "fixed_greeting_completed_at", f"duration_ms={_ms_since(greeting_requested_at)}")
             await _log("info", "fixed_greeting_delay_ms", str(greeting_start_delay_ms))
+            await _log("info", "dynamic_greeting_spoken_by_system", "true")
             await _log("info", "Fixed outbound greeting sent - waiting for customer response before system opening")
             # The next customer reply is handled here so Gemini cannot invent the first business line.
             await _log("info", "ai_context_loaded_after_greeting", "not_applicable; prompt_context_loaded_before_session_start")

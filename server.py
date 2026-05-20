@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import ssl
+import subprocess
 import time
 import uuid
 import certifi
@@ -92,6 +93,25 @@ from whatsapp import (
 load_dotenv(".env", override=False)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("server")
+
+
+def _deployed_code_version() -> str:
+    env_version = os.getenv("DEPLOYED_CODE_VERSION") or os.getenv("RENDER_GIT_COMMIT") or os.getenv("SOURCE_VERSION")
+    if env_version:
+        return env_version[:12]
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
 
 init_db()
 
@@ -216,6 +236,12 @@ def _run_due_appointment_reminders_sync():
 
 @app.on_event("startup")
 async def _startup():
+    version = _deployed_code_version()
+    logger.info("deployed_code_version=%s", version)
+    try:
+        await log_error("server", "deployed_code_version", version, "info")
+    except Exception:
+        pass
     if _scheduler:
         _scheduler.start()
         await _reschedule_all_campaigns()
@@ -268,7 +294,7 @@ class CallRequest(BaseModel):
 
 class AgentProfileRequest(BaseModel):
     name: str
-    voice: str = "Aoede"
+    voice: str = "Kore"
     model: str = "gemini-3.1-flash-live-preview"
     system_prompt: Optional[str] = None
     enabled_tools: str = "[]"
