@@ -658,7 +658,7 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
         if tts_model:
             realtime_kwargs["tts"] = tts_model
         else:
-            logger.warning("Google TTS unavailable; fixed greeting session.say() may not be able to speak")
+            logger.warning("Google TTS unavailable; deterministic system greeting session.say() may not be able to speak")
         try:
             return AgentSession(llm=realtime_model, **realtime_kwargs)
         except TypeError as exc:
@@ -715,9 +715,11 @@ async def entrypoint(ctx: agents.JobContext):
     lead_name = customer_name or "there"
     business_name = _first_text(metadata.get("business_name"), metadata.get("company_name"), default="our company")
     company_name = _first_text(metadata.get("company_name"), metadata.get("business_name"), default=business_name)
-    service_type = _first_text(metadata.get("service_type"), metadata.get("service"), default="our service")
+    metadata_service_type = _first_text(metadata.get("service_type"), metadata.get("service"), default="")
+    service_type = metadata_service_type or "our service"
     requirement = _first_text(metadata.get("requirement"), metadata.get("notes"), metadata.get("crm_notes"), default="")
     source = _first_text(metadata.get("source"), default="")
+    has_dynamic_greeting_metadata = bool(source and metadata_service_type)
     call_type = _first_text(metadata.get("call_type"), default="welcome_call")
     await _log(
         "info",
@@ -831,18 +833,15 @@ async def entrypoint(ctx: agents.JobContext):
     await _log("info", "final_voice_context_service_type", service_type)
     await _log("info", "final_voice_context_call_type", call_type)
     await _log("info", "final_voice_prompt_contains_wrong_names", str(final_contains_wrong_names).lower())
-    if fixed_greeting_config["enabled"]:
-        # Prevent Gemini from producing the greeting or first business opening.
-        # Both are injected deterministically via session.say() after session.start().
-        system_prompt = (
-            "IMPORTANT: The source-aware greeting and demo line are already handled by the system. "
-            "Do NOT speak first. Do NOT generate an opening greeting. "
-            "Do NOT respond to the customer's first reply after the source-aware greeting. "
-            "Do NOT repeat the source reminder or demo line. Continue only after the system demo line has been spoken "
-            "and the customer responds again.\n\n"
-        ) + _base_prompt
-    else:
-        system_prompt = _base_prompt
+    # Prevent Gemini from producing the greeting or first business opening.
+    # Both are injected deterministically via session.say() after session.start().
+    system_prompt = (
+        "IMPORTANT: The source-aware greeting and demo line are already handled by the system. "
+        "Do NOT speak first. Do NOT generate an opening greeting. "
+        "Do NOT respond to the customer's first reply after the source-aware greeting. "
+        "Do NOT repeat the source reminder or demo line. Continue only after the system demo line has been spoken "
+        "and the customer responds again.\n\n"
+    ) + _base_prompt
     system_prompt = system_prompt + "\n\n" + final_override
     system_prompt, _ = await _sanitize_competing_opening_questions(system_prompt)
     system_prompt, banned_identity_removed = await _sanitize_identity_confirmation(system_prompt)
@@ -949,12 +948,15 @@ async def entrypoint(ctx: agents.JobContext):
             await _log("warning", f"Recording start failed (non-fatal): {exc}")
 
     dynamic_greeting_text = opening_context["dynamic_greeting"]
-    fixed_greeting = dynamic_greeting_text
+    fallback_fixed_greeting = fixed_greeting_config.get("greeting") or _DEFAULT_FIXED_GREETING
+    system_greeting_text = dynamic_greeting_text if has_dynamic_greeting_metadata else fallback_fixed_greeting
     active_model = os.getenv("GEMINI_MODEL", "")
     recording_task = asyncio.create_task(_start_recording_after_greeting()) if phone_number else None
     first_response_event, first_response_holder = _watch_first_customer_response(session)
-    await _log("info", "fixed_greeting_text", fixed_greeting)
     await _log("info", "dynamic_greeting_text_built", dynamic_greeting_text)
+    await _log("info", "dynamic_greeting_selected", str(has_dynamic_greeting_metadata).lower())
+    await _log("info", "outbound_fixed_greeting_used", str(not has_dynamic_greeting_metadata).lower())
+    await _log("info", "system_greeting_text", system_greeting_text)
     await _log("info", "opening_text_built", opening_text)
     await _log("info", "gemini_opening_disabled", "true")
     await _log("info", "generate_reply_identity_opening_removed", "true")
@@ -978,20 +980,21 @@ async def entrypoint(ctx: agents.JobContext):
         try:
             greeting_requested_at = time.perf_counter()
             greeting_start_delay_ms = _ms_since(call_started_at)
-            _log_bg("info", "Fixed outbound greeting mode enabled — speaking greeting immediately")
+            await _log("info", "dynamic_greeting_say_text", system_greeting_text)
+            _log_bg("info", "Dynamic source greeting mode enabled - speaking greeting immediately")
             _log_bg(
                 "info",
-                "fixed_greeting_start_requested",
+                "dynamic_greeting_start_requested",
                 f"delay_ms={greeting_start_delay_ms}; since_session_ms={_ms_since(session_started_at)}",
             )
-            _log_bg("info", "fixed_greeting_started_at", f"delay_ms={greeting_start_delay_ms}")
+            _log_bg("info", "dynamic_greeting_started_at", f"delay_ms={greeting_start_delay_ms}")
             if not hasattr(session, "say"):
                 raise RuntimeError("AgentSession.say() unavailable for deterministic system greeting")
-            await session.say(fixed_greeting, allow_interruptions=True)
-            await _log("info", "fixed_greeting_completed_at", f"duration_ms={_ms_since(greeting_requested_at)}")
-            await _log("info", "fixed_greeting_delay_ms", str(greeting_start_delay_ms))
+            await session.say(system_greeting_text, allow_interruptions=True)
+            await _log("info", "dynamic_greeting_completed_at", f"duration_ms={_ms_since(greeting_requested_at)}")
+            await _log("info", "dynamic_greeting_delay_ms", str(greeting_start_delay_ms))
             await _log("info", "dynamic_greeting_spoken_by_system", "true")
-            await _log("info", "Fixed outbound greeting sent - waiting for customer response before system opening")
+            await _log("info", "Dynamic source greeting sent - waiting for customer response before system opening")
             # The next customer reply is handled here so Gemini cannot invent the first business line.
             await _log("info", "ai_context_loaded_after_greeting", "not_applicable; prompt_context_loaded_before_session_start")
             try:
