@@ -602,6 +602,32 @@ async def api_health():
         or await get_setting("AI_PROMPT_whatsapp_chat_prompt", "")
         or get_default_prompt("whatsapp_chat")
     )
+    active_prompt_types = []
+    for pt, _label, _default in PROMPT_TYPES:
+        saved = await get_setting(_AI_PROMPT_KEY.format(pt), "")
+        alias_saved = ""
+        for alias, canonical in _PROMPT_TYPE_ALIASES.items():
+            if canonical == pt:
+                alias_saved = alias_saved or await get_setting(_AI_PROMPT_KEY.format(alias), "")
+        if saved or alias_saved:
+            active_prompt_types.append(pt)
+    legacy_prompt_saved = await get_setting("system_prompt", "") or prompt_saved
+    default_agent_profile_prompt = ""
+    try:
+        for profile in await get_all_agent_profiles():
+            if profile.get("is_default") and (profile.get("system_prompt") or "").strip():
+                default_agent_profile_prompt = profile.get("system_prompt") or ""
+                break
+    except Exception:
+        default_agent_profile_prompt = ""
+    if default_agent_profile_prompt:
+        prompt_mode = "agent_profile"
+    elif active_prompt_types:
+        prompt_mode = "call_type"
+    elif legacy_prompt_saved:
+        prompt_mode = "legacy"
+    else:
+        prompt_mode = "default"
     supabase_configured, supabase_error = await supabase_status(supabase_url, supabase_key)
     response = {
         "status": "ok",
@@ -611,8 +637,10 @@ async def api_health():
         "trunk_configured": bool(trunk_id),
         "gemini_model_configured": bool(gemini_model),
         "gemini_tts_voice_configured": bool(gemini_voice),
-        "prompt_configured": bool(prompt_saved or PROMPT_TYPES),
-        "prompt_mode": "custom" if prompt_saved else "default",
+        "prompt_configured": bool(default_agent_profile_prompt or active_prompt_types or legacy_prompt_saved),
+        "prompt_mode": prompt_mode,
+        "active_prompt_types": active_prompt_types,
+        "default_prompt_used": prompt_mode == "default",
         "whatsapp_ai_provider": "gemini",
         "whatsapp_gemini_model": whatsapp_gemini_model,
         "whatsapp_gemini_model_configured": bool(whatsapp_gemini_model),
@@ -683,26 +711,54 @@ async def api_dispatch_call(req: CallRequest):
         "info",
     )
 
+    await log_error("server", "prompt_resolution_started", f"phone={phone}; call_type={call_type}", "info")
+    await log_error("server", "prompt_type_requested", call_type, "info")
     effective_prompt = req.system_prompt
+    prompt_meta = {
+        "prompt_source_selected": "request.system_prompt" if effective_prompt else "",
+        "prompt_mode_selected": "request" if effective_prompt else "",
+        "prompt_default_used": False,
+    }
     effective_voice = effective_model = effective_tools = None
     if req.agent_profile_id:
         profile = await get_agent_profile(req.agent_profile_id)
         if profile:
             if not effective_prompt and profile.get("system_prompt"):
                 effective_prompt = profile["system_prompt"]
+                prompt_meta = {
+                    "prompt_source_selected": "agent_profile",
+                    "prompt_mode_selected": "agent_profile",
+                    "prompt_default_used": False,
+                }
             effective_voice = profile.get("voice")
             effective_model = profile.get("model")
             effective_tools = profile.get("enabled_tools")
     if not effective_prompt:
-        # Try legacy global prompt first, then resolve by call_type
-        effective_prompt = await get_setting("system_prompt", "") or None
-    if not effective_prompt:
-        effective_prompt = await resolve_ai_prompt(
+        effective_prompt, prompt_meta = await resolve_ai_prompt_with_meta(
             call_type=call_type,
             lead_name=lead_name,
             business_name=business_name,
             service_type=service_type,
         )
+    if prompt_meta.get("prompt_default_used"):
+        legacy_prompt = await get_setting("system_prompt", "")
+        if legacy_prompt:
+            effective_prompt = legacy_prompt
+            prompt_meta = {
+                "prompt_source_selected": "system_prompt",
+                "prompt_mode_selected": "legacy",
+                "prompt_default_used": False,
+            }
+    if not effective_prompt:
+        effective_prompt, prompt_meta = await resolve_ai_prompt_with_meta(
+            call_type=call_type,
+            lead_name=lead_name,
+            business_name=business_name,
+            service_type=service_type,
+        )
+    await log_error("server", "prompt_source_selected", str(prompt_meta.get("prompt_source_selected", "")), "info")
+    await log_error("server", "prompt_mode_selected", str(prompt_meta.get("prompt_mode_selected", "")), "info")
+    await log_error("server", "prompt_default_used", str(prompt_meta.get("prompt_default_used", False)).lower(), "info")
 
     room_name = f"call-{phone.replace('+', '')}-{random.randint(1000, 9999)}"
     metadata = {
@@ -718,6 +774,9 @@ async def api_dispatch_call(req: CallRequest):
         "source": source,
         "call_type": call_type,
         "system_prompt": effective_prompt,
+        "prompt_source_selected": prompt_meta.get("prompt_source_selected", ""),
+        "prompt_mode_selected": prompt_meta.get("prompt_mode_selected", ""),
+        "prompt_default_used": str(prompt_meta.get("prompt_default_used", False)).lower(),
     }
     if effective_voice:
         metadata["voice_override"] = effective_voice
@@ -1149,6 +1208,70 @@ async def api_reset_prompt():
 _AI_PROMPT_KEY = "AI_PROMPT_{}"
 _AI_PROMPT_DEFAULT_TYPE_KEY = "AI_PROMPT_DEFAULT_TYPE"
 _VALID_PROMPT_TYPES = {pt for pt, _, _ in PROMPT_TYPES}
+_PROMPT_TYPE_ALIASES = {
+    "follow_up": "followup_call",
+    "followup": "followup_call",
+    "payment_follow_up": "payment_followup",
+    "missed_call": "missed_call_retry",
+}
+
+
+def _resolve_prompt_type(call_type: str, fallback: str = "welcome_call") -> str:
+    requested = (call_type or fallback or "welcome_call").strip()
+    resolved = _PROMPT_TYPE_ALIASES.get(requested, requested)
+    return resolved if resolved in _VALID_PROMPT_TYPES else fallback
+
+
+def _prompt_key_candidates(call_type: str, resolved_type: str) -> list[str]:
+    candidates = []
+    alias_values = [alias for alias, canonical in _PROMPT_TYPE_ALIASES.items() if canonical == resolved_type]
+    for pt in (call_type, resolved_type):
+        pt = (pt or "").strip()
+        if pt:
+            key = _AI_PROMPT_KEY.format(pt)
+            if key not in candidates:
+                candidates.append(key)
+    for alias in alias_values:
+        key = _AI_PROMPT_KEY.format(alias)
+        if key not in candidates:
+            candidates.append(key)
+    return candidates
+
+
+async def _saved_call_type_prompt(call_type: str, fallback: str = "welcome_call") -> tuple[str, str, str]:
+    resolved_type = _resolve_prompt_type(call_type, fallback)
+    for key in _prompt_key_candidates(call_type, resolved_type):
+        saved = await get_setting(key, "")
+        if saved:
+            return saved, key, resolved_type
+    return "", "", resolved_type
+
+
+async def resolve_ai_prompt_with_meta(
+    call_type: str = "welcome_call",
+    fallback: str = "welcome_call",
+    lead_name: str = "there",
+    business_name: str = "our company",
+    service_type: str = "our service",
+) -> tuple[str, dict]:
+    saved, key, resolved_type = await _saved_call_type_prompt(call_type, fallback)
+    kb = await get_knowledge_base()
+    prompt = build_prompt_for_type(
+        prompt_type=resolved_type,
+        lead_name=lead_name,
+        business_name=business_name,
+        service_type=service_type,
+        saved_text=saved or None,
+        kb=kb,
+    )
+    meta = {
+        "prompt_type_requested": call_type or "welcome_call",
+        "prompt_type_resolved": resolved_type,
+        "prompt_source_selected": key or f"built_in:{resolved_type}",
+        "prompt_mode_selected": "call_type" if saved else "default",
+        "prompt_default_used": not bool(saved),
+    }
+    return prompt, meta
 
 
 async def resolve_ai_prompt(
@@ -1164,17 +1287,14 @@ async def resolve_ai_prompt(
     KB context is prepended when knowledge base has content.
     Returns an interpolated prompt string ready to pass to Gemini.
     """
-    resolved_type = call_type if call_type in _VALID_PROMPT_TYPES else fallback
-    saved = await get_setting(_AI_PROMPT_KEY.format(resolved_type), "")
-    kb = await get_knowledge_base()
-    return build_prompt_for_type(
-        prompt_type=resolved_type,
+    prompt, _meta = await resolve_ai_prompt_with_meta(
+        call_type=call_type,
+        fallback=fallback,
         lead_name=lead_name,
         business_name=business_name,
         service_type=service_type,
-        saved_text=saved or None,
-        kb=kb,
     )
+    return prompt
 
 
 def _crm_status_to_call_type(crm_status: str) -> str:
@@ -1215,15 +1335,17 @@ async def api_list_ai_prompts():
 
 @app.get("/api/ai-prompts/resolve")
 async def api_resolve_ai_prompt(call_type: str = "welcome_call"):
-    if call_type not in _VALID_PROMPT_TYPES:
+    resolved_type = _resolve_prompt_type(call_type)
+    if resolved_type not in _VALID_PROMPT_TYPES:
         raise HTTPException(400, f"Unknown call type: {call_type}. Valid: {sorted(_VALID_PROMPT_TYPES)}")
-    saved = await get_setting(_AI_PROMPT_KEY.format(call_type), "")
-    prompt = saved if saved else get_default_prompt(call_type)
+    saved, key, resolved_type = await _saved_call_type_prompt(call_type)
+    prompt = saved if saved else get_default_prompt(resolved_type)
     return {
-        "type": call_type,
-        "label": get_prompt_label(call_type),
+        "type": resolved_type,
+        "label": get_prompt_label(resolved_type),
         "prompt": prompt,
         "is_saved": bool(saved),
+        "source_key": key or f"built_in:{resolved_type}",
     }
 
 
@@ -2957,17 +3079,36 @@ async def _build_dispatch_metadata(contact: dict, prompt: Optional[str], profile
     source = (contact.get("source") or "").strip()
     call_type = (contact.get("call_type") or "welcome_call").strip()
 
-    # Prompt priority: explicit > agent profile > legacy global > call-type resolved
-    saved_prompt = prompt or (await get_setting("system_prompt", "")) or None
+    # Prompt priority: explicit/profile > saved call-type prompt > legacy global > built-in default.
+    saved_prompt = prompt or None
+    prompt_meta = {
+        "prompt_source_selected": "campaign.system_prompt" if saved_prompt else "",
+        "prompt_mode_selected": "request" if saved_prompt else "",
+        "prompt_default_used": False,
+    }
     if profile and not saved_prompt and profile.get("system_prompt"):
         saved_prompt = profile["system_prompt"]
+        prompt_meta = {
+            "prompt_source_selected": "agent_profile",
+            "prompt_mode_selected": "agent_profile",
+            "prompt_default_used": False,
+        }
     if not saved_prompt:
-        saved_prompt = await resolve_ai_prompt(
+        saved_prompt, prompt_meta = await resolve_ai_prompt_with_meta(
             call_type=call_type,
             lead_name=lead_name,
             business_name=business_name,
             service_type=service_type,
         )
+    if prompt_meta.get("prompt_default_used"):
+        legacy_prompt = await get_setting("system_prompt", "")
+        if legacy_prompt:
+            saved_prompt = legacy_prompt
+            prompt_meta = {
+                "prompt_source_selected": "system_prompt",
+                "prompt_mode_selected": "legacy",
+                "prompt_default_used": False,
+            }
 
     metadata = {
         "phone_number": contact["phone"],
@@ -2982,6 +3123,9 @@ async def _build_dispatch_metadata(contact: dict, prompt: Optional[str], profile
         "source": source,
         "call_type": call_type,
         "system_prompt": saved_prompt,
+        "prompt_source_selected": prompt_meta.get("prompt_source_selected", ""),
+        "prompt_mode_selected": prompt_meta.get("prompt_mode_selected", ""),
+        "prompt_default_used": str(prompt_meta.get("prompt_default_used", False)).lower(),
     }
     if profile:
         if profile.get("voice"):

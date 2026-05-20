@@ -212,6 +212,28 @@ def _prompt_contains_wrong_names(prompt: str, customer_name: str) -> bool:
     return False
 
 
+async def _sanitize_legacy_prompt_behavior(prompt: str) -> str:
+    patterns = (
+        r'Open with:\s*"Hi,\s*am I speaking with\s*\{lead_name\}\?"',
+        r'"Hi,\s*am I speaking with\s*\{lead_name\}\?"',
+        r"Hi,\s*am I speaking with\s*\{lead_name\}\?",
+        r"Am I speaking with\s*\{lead_name\}\??",
+        r"Use the lookup_contact tool at the start of every call to retrieve prior history\.",
+        r"lookup_contact\s+at call start",
+        r"lookup_contact\s*→\s*call at call start ONLY[^\n]*",
+    )
+    cleaned = prompt
+    changed = False
+    for pattern in patterns:
+        cleaned_new = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+        if cleaned_new != cleaned:
+            changed = True
+            cleaned = cleaned_new
+    if changed:
+        await _log("warning", "legacy_prompt_behavior_removed", "removed identity opening or forced lookup_contact instruction")
+    return cleaned
+
+
 async def _strip_stale_names_from_prompt(prompt: str, customer_name: str) -> tuple[str, bool]:
     replacement = customer_name.strip() if customer_name else "the customer"
     changed = False
@@ -300,7 +322,7 @@ def _final_call_override(
     if customer_name:
         lines.extend([
             f"Customer name is {customer_name}. Do not ask for the customer name again. Do not use any other name.",
-            f"Do not say 'Am I speaking to...' or 'Am I speaking with...' unless you use exactly '{customer_name}'.",
+            f"Do not use identity-confirmation wording unless you use exactly '{customer_name}'.",
             "Do not say 'May I know your name?'",
         ])
     else:
@@ -512,6 +534,15 @@ async def entrypoint(ctx: agents.JobContext):
     if not fixed_greeting_config["enabled"]:
         await _log("info", "fixed_greeting_disabled", fixed_greeting_config["reason"])
 
+    prompt_source_selected = _first_text(metadata.get("prompt_source_selected"), default="metadata.system_prompt" if metadata.get("system_prompt") else "built_in")
+    prompt_mode_selected = _first_text(metadata.get("prompt_mode_selected"), default="unknown")
+    prompt_default_used = _first_text(metadata.get("prompt_default_used"), default="false").lower() in ("1", "true", "yes", "on")
+    await _log("info", "prompt_resolution_started", f"call_type={call_type}")
+    await _log("info", "prompt_type_requested", call_type)
+    await _log("info", "prompt_source_selected", prompt_source_selected)
+    await _log("info", "prompt_mode_selected", prompt_mode_selected)
+    await _log("info", "prompt_default_used", str(prompt_default_used).lower())
+
     _base_prompt = build_prompt(
         lead_name,
         business_name,
@@ -523,6 +554,7 @@ async def entrypoint(ctx: agents.JobContext):
         source=source,
         call_type=call_type,
     )
+    _base_prompt = await _sanitize_legacy_prompt_behavior(_base_prompt)
     known_context = [
         "CURRENT SINGLE CALL METADATA OVERRIDE:",
         "These current call details override old CRM memory, old conversation memory, default prompt examples, and agent profile examples.",
@@ -537,11 +569,12 @@ async def entrypoint(ctx: agents.JobContext):
     if customer_name:
         known_context.append(f"Customer name is {customer_name}. Do not ask for the customer name again. Do not use any other name.")
         known_context.append(f"If you need to confirm identity, only use the exact name '{customer_name}', or avoid saying a name.")
-        known_context.append("Do not ask 'Am I speaking to...' or 'Am I speaking with...' using any name other than the exact customer name above.")
+        known_context.append("Do not use identity-confirmation wording with any name other than the exact customer name above.")
         known_context.append("Ignore any conflicting customer name from tools, memory, CRM lookup, examples, or saved prompt text.")
     else:
         known_context.append("Customer name is not provided. You may ask for the name politely if needed.")
     _base_prompt = "\n".join(known_context) + "\n\n" + _base_prompt
+    _base_prompt = await _sanitize_legacy_prompt_behavior(_base_prompt)
     _base_prompt, _ = await _strip_stale_names_from_prompt(_base_prompt, customer_name)
     opening_context = _voice_opening_context(source, company_name or business_name or "Ladder Hub", service_type or "AI voice calling and WhatsApp CRM automation")
     await _log("info", "voice_opening_source", source or "unknown")
