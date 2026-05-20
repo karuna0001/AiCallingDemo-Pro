@@ -2321,7 +2321,7 @@ async def generate_whatsapp_ai_reply(
             if known_name:
                 reply = f"Hi {known_name}, thanks for contacting us. How can I assist you?"
             else:
-                reply = "Hi, thanks for contacting S Cube Digital Marketing. May I know your name and how can I assist you?"
+                reply = "Hi, thanks for contacting S Cube Digital Marketing. How can I assist you today?"
             return {
                 "reply": reply,
                 "reason": "",

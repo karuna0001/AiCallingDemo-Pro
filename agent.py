@@ -455,7 +455,7 @@ def _final_call_override(
         f"\"{opening_context.get('opening') or ''}\"",
         "Do not repeat the greeting. Do not repeat the source opening. Do not replace it with any other first-business question.",
         "After the system has spoken that opening line, continue from the customer's next response.",
-        "HARD IDENTITY RULE: Never ask identity confirmation. Never ask if this is the correct person. Never request the customer's name. Start directly with enquiry/source/demo context.",
+        "HARD IDENTITY RULE: Never verify who answered. Never request the customer's name. Start directly with enquiry/source/demo context.",
         "Do not say 'we received your enquiry' for database or generic record sources.",
         "Do not hardcode Facebook; only mention Facebook when the current source label is Facebook.",
     ]
@@ -860,6 +860,8 @@ async def entrypoint(ctx: agents.JobContext):
     await _log("info", "fixed_greeting_text", fixed_greeting)
     await _log("info", "opening_text_built", opening_text)
     await _log("info", "gemini_opening_disabled", "true")
+    await _log("info", "generate_reply_identity_opening_removed", "true")
+    await _log("info", "system_opening_flow_active", str(fixed_greeting_config["enabled"]).lower())
 
     if fixed_greeting_config["enabled"]:
         try:
@@ -872,12 +874,9 @@ async def entrypoint(ctx: agents.JobContext):
                 f"delay_ms={greeting_start_delay_ms}; since_session_ms={_ms_since(session_started_at)}",
             )
             _log_bg("info", "fixed_greeting_started_at", f"delay_ms={greeting_start_delay_ms}")
-            if hasattr(session, "say"):
-                await session.say(fixed_greeting, allow_interruptions=True)
-            else:
-                await session.generate_reply(
-                    instructions=f"Say ONLY this exact text verbatim, word for word, nothing added: {fixed_greeting}"
-                )
+            if not hasattr(session, "say"):
+                raise RuntimeError("AgentSession.say() unavailable for deterministic system greeting")
+            await session.say(fixed_greeting, allow_interruptions=True)
             await _log("info", "fixed_greeting_completed_at", f"duration_ms={_ms_since(greeting_requested_at)}")
             await _log("info", "fixed_greeting_delay_ms", str(greeting_start_delay_ms))
             await _log("info", "Fixed outbound greeting sent - waiting for customer response before system opening")
@@ -933,18 +932,7 @@ async def entrypoint(ctx: agents.JobContext):
             await _log("warning", "fixed_greeting_failed_no_autonomous_fallback", str(exc))
     else:
         await _log("info", "fixed_greeting_disabled", fixed_greeting_config["reason"])
-        await _log("info", "autonomous_greeting_selected", f"reason={fixed_greeting_config['reason']}")
-        if "3.1" in active_model or "2.5" in active_model:
-            await _log(
-                "info",
-                "Gemini native-audio: model will greet autonomously from system prompt",
-                f"fixed_greeting_disabled_reason={fixed_greeting_config['reason']}",
-            )
-        else:
-            try:
-                await session.generate_reply(instructions=f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}.")
-            except Exception as exc:
-                await _log("warning", f"generate_reply failed: {exc}")
+        await _log("warning", "system_opening_flow_inactive", f"reason={fixed_greeting_config['reason']}")
 
     if phone_number:
         sip_identity = f"sip_{phone_number}"

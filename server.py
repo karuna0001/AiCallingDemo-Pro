@@ -711,51 +711,20 @@ async def api_dispatch_call(req: CallRequest):
         "info",
     )
 
-    await log_error("server", "prompt_resolution_started", f"phone={phone}; call_type={call_type}", "info")
-    await log_error("server", "prompt_type_requested", call_type, "info")
-    effective_prompt = req.system_prompt
-    prompt_meta = {
-        "prompt_source_selected": "request.system_prompt" if effective_prompt else "",
-        "prompt_mode_selected": "request" if effective_prompt else "",
-        "prompt_default_used": False,
-    }
+    await log_error("server", "prompt_resolution_started", f"phone={phone}; call_type=voice_call", "info")
+    await log_error("server", "prompt_type_requested", "voice_call", "info")
     effective_voice = effective_model = effective_tools = None
     if req.agent_profile_id:
         profile = await get_agent_profile(req.agent_profile_id)
         if profile:
-            if not effective_prompt and profile.get("system_prompt"):
-                effective_prompt = profile["system_prompt"]
-                prompt_meta = {
-                    "prompt_source_selected": "agent_profile",
-                    "prompt_mode_selected": "agent_profile",
-                    "prompt_default_used": False,
-                }
             effective_voice = profile.get("voice")
             effective_model = profile.get("model")
             effective_tools = profile.get("enabled_tools")
-    if not effective_prompt:
-        effective_prompt, prompt_meta = await resolve_ai_prompt_with_meta(
-            call_type=call_type,
-            lead_name=lead_name,
-            business_name=business_name,
-            service_type=service_type,
-        )
-    if prompt_meta.get("prompt_default_used"):
-        legacy_prompt = await get_setting("system_prompt", "")
-        if legacy_prompt:
-            effective_prompt = legacy_prompt
-            prompt_meta = {
-                "prompt_source_selected": "system_prompt",
-                "prompt_mode_selected": "legacy",
-                "prompt_default_used": False,
-            }
-    if not effective_prompt:
-        effective_prompt, prompt_meta = await resolve_ai_prompt_with_meta(
-            call_type=call_type,
-            lead_name=lead_name,
-            business_name=business_name,
-            service_type=service_type,
-        )
+    effective_prompt, prompt_meta = await resolve_voice_call_prompt_with_meta(
+        lead_name=lead_name,
+        business_name=business_name,
+        service_type=service_type,
+    )
     await log_error("server", "prompt_source_selected", str(prompt_meta.get("prompt_source_selected", "")), "info")
     await log_error("server", "prompt_mode_selected", str(prompt_meta.get("prompt_mode_selected", "")), "info")
     await log_error("server", "prompt_default_used", str(prompt_meta.get("prompt_default_used", False)).lower(), "info")
@@ -1272,6 +1241,30 @@ async def resolve_ai_prompt_with_meta(
         "prompt_default_used": not bool(saved),
     }
     return prompt, meta
+
+
+async def resolve_voice_call_prompt_with_meta(
+    lead_name: str = "there",
+    business_name: str = "our company",
+    service_type: str = "our service",
+) -> tuple[str, dict]:
+    saved = await get_setting("AI_PROMPT_voice_call", "")
+    kb = await get_knowledge_base()
+    prompt = build_prompt_for_type(
+        prompt_type="voice_call",
+        lead_name=lead_name,
+        business_name=business_name,
+        service_type=service_type,
+        saved_text=saved or None,
+        kb=kb,
+    )
+    return prompt, {
+        "prompt_type_requested": "voice_call",
+        "prompt_type_resolved": "voice_call",
+        "prompt_source_selected": "AI_PROMPT_voice_call" if saved else "built_in:voice_call",
+        "prompt_mode_selected": "call_type" if saved else "default",
+        "prompt_default_used": not bool(saved),
+    }
 
 
 async def resolve_ai_prompt(
@@ -3091,36 +3084,13 @@ async def _build_dispatch_metadata(contact: dict, prompt: Optional[str], profile
     source = (contact.get("source") or "").strip()
     call_type = (contact.get("call_type") or "welcome_call").strip()
 
-    # Prompt priority: explicit/profile > saved call-type prompt > legacy global > built-in default.
-    saved_prompt = prompt or None
-    prompt_meta = {
-        "prompt_source_selected": "campaign.system_prompt" if saved_prompt else "",
-        "prompt_mode_selected": "request" if saved_prompt else "",
-        "prompt_default_used": False,
-    }
-    if profile and not saved_prompt and profile.get("system_prompt"):
-        saved_prompt = profile["system_prompt"]
-        prompt_meta = {
-            "prompt_source_selected": "agent_profile",
-            "prompt_mode_selected": "agent_profile",
-            "prompt_default_used": False,
-        }
-    if not saved_prompt:
-        saved_prompt, prompt_meta = await resolve_ai_prompt_with_meta(
-            call_type=call_type,
-            lead_name=lead_name,
-            business_name=business_name,
-            service_type=service_type,
-        )
-    if prompt_meta.get("prompt_default_used"):
-        legacy_prompt = await get_setting("system_prompt", "")
-        if legacy_prompt:
-            saved_prompt = legacy_prompt
-            prompt_meta = {
-                "prompt_source_selected": "system_prompt",
-                "prompt_mode_selected": "legacy",
-                "prompt_default_used": False,
-            }
+    # Voice calls use only the dedicated safe voice prompt. Request/campaign,
+    # agent-profile, legacy, and old call-type prompt text must not drive openings.
+    saved_prompt, prompt_meta = await resolve_voice_call_prompt_with_meta(
+        lead_name=lead_name,
+        business_name=business_name,
+        service_type=service_type,
+    )
 
     metadata = {
         "phone_number": contact["phone"],
