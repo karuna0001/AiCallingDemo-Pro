@@ -42,6 +42,7 @@ class AppointmentTools(llm.ToolContext):
         self.recording_object_key: Optional[str] = None
         self.recording_size_bytes: int = 0
         self.call_logged: bool = False
+        self.notes: Optional[str] = None
         super().__init__(tools=[])
 
     def build_tool_list(self, enabled: list) -> list:
@@ -88,6 +89,7 @@ class AppointmentTools(llm.ToolContext):
                 reason,
                 duration,
                 self.recording_url,
+                notes=self.notes,
                 recording_object_key=self.recording_object_key,
                 recording_size_bytes=self.recording_size_bytes,
             )

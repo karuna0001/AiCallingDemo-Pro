@@ -303,9 +303,11 @@ async def _setting_with_source(key: str, default: str = "") -> tuple[str, str]:
 
 
 async def _fixed_greeting_config(phone_number: str | None) -> dict:
+    agent_name = os.getenv("VOICE_AGENT_NAME", "Snikitha").strip() or "Snikitha"
+    default_fixed_greeting = f"Hi, this is {agent_name} from Ladder Hub. Is this a good time to speak for a minute?"
     enabled_raw, enabled_source = await _setting_with_source("OUTBOUND_FIXED_GREETING_ENABLED", "")
     mode_raw, mode_source = await _setting_with_source("OUTBOUND_GREETING_MODE", "")
-    greeting_text, greeting_source = await _setting_with_source("OUTBOUND_FIXED_GREETING", _DEFAULT_FIXED_GREETING)
+    greeting_text, greeting_source = await _setting_with_source("OUTBOUND_FIXED_GREETING", default_fixed_greeting)
 
     enabled_value = enabled_raw.strip().lower()
     mode_value = mode_raw.strip().lower()
@@ -463,7 +465,8 @@ def _normalize_source_value(source: str) -> str:
 def _voice_opening_context(source: str, business_name: str, service_type: str) -> dict:
     norm = _normalize_source_value(source)
     compact = norm.replace("_", "")
-    caller_business = "Ladder Hub"
+    caller_business = business_name or "Ladder Hub"
+    agent_name = (os.getenv("VOICE_AGENT_NAME") or "Snikitha").strip() or "Snikitha"
     if norm in _SOURCE_LABELS:
         label = _SOURCE_LABELS[norm]
     elif compact in {"facebooklead", "facebookads", "fblead", "fbads", "metalead", "metaads"}:
@@ -483,7 +486,7 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
     if label == "database":
         mode = "cold_call"
         dynamic_greeting = (
-            f"Hi, this is Priya from {caller_business}. We provide fully automated bulk AI voice calling, "
+            f"Hi, this is {agent_name} from {caller_business}. We provide fully automated bulk AI voice calling, "
             "WhatsApp messaging, and CRM follow-up automation for businesses. "
             "Is this a good time to speak for a minute?"
         )
@@ -491,7 +494,7 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
     elif label in {"Facebook", "Instagram", "our website", "Google", "WhatsApp"}:
         mode = "enquiry"
         dynamic_greeting = (
-            f"Hi, this is Priya from {caller_business}. "
+            f"Hi, this is {agent_name} from {caller_business}. "
             f"We received your enquiry from {label} regarding {service_type}. "
             "Is this a good time to speak for a minute?"
         )
@@ -499,7 +502,7 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
     else:
         mode = "generic"
         dynamic_greeting = (
-            f"Hi, this is Priya from {caller_business}. "
+            f"Hi, this is {agent_name} from {caller_business}. "
             "I'm calling regarding AI voice calling and WhatsApp CRM automation. "
             "Is this a good time to speak for a minute?"
         )
@@ -836,384 +839,447 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
 
 async def entrypoint(ctx: agents.JobContext):
     call_started_at = time.perf_counter()
-    await _log("info", f"outbound_agent_name={_outbound_agent_name()}", _outbound_agent_name())
-    await _log_agent_runtime_fingerprint()
-    await _log("info", "deployed_code_version", _deployed_code_version())
-    await _log("info", "voice_flow_version", VOICE_FLOW_RUNTIME)
-    await _log("info", "outbound_call_started", f"room={getattr(ctx.room, 'name', '')}")
-    metadata = {}
-    raw_job_metadata = getattr(ctx.job, "metadata", "") or ""
-    raw_room_metadata = getattr(ctx.room, "metadata", "") or ""
-    await _log("info", "agent_raw_job_metadata", raw_job_metadata or "{}")
-    await _log("info", "agent_raw_room_metadata", raw_room_metadata or "{}")
-    try:
-        if raw_job_metadata:
-            metadata.update(json.loads(raw_job_metadata))
-    except Exception:
-        pass
-    try:
-        if raw_room_metadata:
-            metadata.update(json.loads(raw_room_metadata))
-    except Exception:
-        pass
+    phone_number = ""
+    customer_name = ""
+    lead_name = "there"
+    business_name = "our company"
+    company_name = "our company"
+    service_type = "our service"
+    source = ""
+    call_type = "voice_call"
+    recording_task = None
+    session = None
 
-    phone_number = _first_text(metadata.get("phone_number"), metadata.get("phone"), default="")
-    customer_name = _first_text(metadata.get("customer_name"), metadata.get("name"), default="")
-    lead_name_from_metadata = _first_text(metadata.get("lead_name"), default="")
-    if not customer_name and lead_name_from_metadata.lower() not in ("", "there", "customer", "lead"):
-        customer_name = lead_name_from_metadata
-    lead_name = customer_name or "there"
-    business_name = _first_text(metadata.get("business_name"), metadata.get("company_name"), default="our company")
-    company_name = _first_text(metadata.get("company_name"), metadata.get("business_name"), default=business_name)
-    metadata_service_type = _first_text(metadata.get("service_type"), metadata.get("service"), default="")
-    service_type = metadata_service_type or "our service"
-    requirement = _first_text(metadata.get("requirement"), metadata.get("notes"), metadata.get("crm_notes"), default="")
-    source = _first_text(metadata.get("source"), default="")
-    has_dynamic_greeting_metadata = bool(source and metadata_service_type)
-    call_type = _first_text(metadata.get("call_type"), default="welcome_call")
-    await _log(
-        "info",
-        "agent_metadata_loaded",
-        (
-            f"customer_name={customer_name or 'missing'}; "
-            f"business_name={business_name}; "
-            f"service_type={service_type}; "
-            f"call_type={call_type}; "
-            f"phone_present={str(bool(phone_number)).lower()}; "
-            f"keys={','.join(sorted(metadata.keys()))}"
-        ),
-    )
-    await _log("info", "agent_context_customer_name", customer_name or "missing")
-    await _log("info", "agent_context_business_name", business_name)
-    await _log("info", "agent_context_service_type", service_type)
-    await _log("info", "agent_context_source", source or "missing")
-    await _log("info", "agent_context_call_type", call_type)
-
-    if metadata.get("voice_override"):
-        os.environ["GEMINI_TTS_VOICE"] = metadata["voice_override"]
-    if metadata.get("model_override"):
-        os.environ["GEMINI_MODEL"] = metadata["model_override"]
-
-    enabled_tools = await get_enabled_tools()
-    if metadata.get("tools_override"):
-        try:
-            enabled_tools = json.loads(metadata["tools_override"])
-        except Exception:
-            pass
-
-    fixed_greeting_config = await _fixed_greeting_config(phone_number)
-    await _log(
-        "info",
-        "fixed_greeting_config",
-        (
-            f"enabled={str(fixed_greeting_config['enabled']).lower()}; "
-            f"greeting_text_present={str(fixed_greeting_config['greeting_text_present']).lower()}; "
-            f"source={fixed_greeting_config['source']}; "
-            f"greeting_source={fixed_greeting_config['greeting_source']}; "
-            f"mode={fixed_greeting_config['mode']}; "
-            f"phone_number_present={str(fixed_greeting_config['phone_number_present']).lower()}; "
-            f"reason={fixed_greeting_config['reason']}"
-        ),
-    )
-    if not fixed_greeting_config["enabled"]:
-        await _log("info", "fixed_greeting_disabled", fixed_greeting_config["reason"])
-
-    prompt_source_selected = _first_text(metadata.get("prompt_source_selected"), default="metadata.system_prompt" if metadata.get("system_prompt") else "built_in")
-    prompt_mode_selected = _first_text(metadata.get("prompt_mode_selected"), default="unknown")
-    prompt_default_used = _first_text(metadata.get("prompt_default_used"), default="false").lower() in ("1", "true", "yes", "on")
-    await _log("info", "prompt_resolution_started", f"call_type={call_type}")
-    await _log("info", "prompt_type_requested", "voice_call")
-    await _log("info", "prompt_source_selected", prompt_source_selected)
-    await _log("info", "prompt_mode_selected", prompt_mode_selected)
-    await _log("info", "prompt_default_used", str(prompt_default_used).lower())
-    await _log("info", "voice_prompt_simple_mode", "true")
-    await _log("info", "old_prompt_types_hidden", "true")
-    await _log("info", "old_prompt_types_ignored", "true")
-    await _log("info", "agent_profile_prompt_ignored_for_voice", "true")
-    await _log("info", "legacy_prompt_ignored_for_voice", "true")
-
-    _base_prompt = build_prompt(
-        lead_name,
-        business_name,
-        service_type,
-        metadata.get("system_prompt"),
-        customer_name=customer_name,
-        company_name=company_name,
-        requirement=requirement,
-        source=source,
-        call_type=call_type,
-    )
-    _base_prompt = await _sanitize_legacy_prompt_behavior(_base_prompt)
-    _base_prompt, _ = await _sanitize_competing_opening_questions(_base_prompt)
-    known_context = [
-        "CURRENT SINGLE CALL METADATA OVERRIDE:",
-        "These current call details override old CRM memory, old conversation memory, default prompt examples, and agent profile examples.",
-        "CALL CONTEXT:",
-        f"- Customer name: {customer_name}" if customer_name else "- Customer name: unknown. Do not ask for it in the opening.",
-        f"- Business/company: {business_name}" if business_name else "- Business/company: unknown. Do not ask for it in the opening.",
-        f"- Service/interest: {service_type}" if service_type else "- Service/interest: unknown. Use the generic demo opening.",
-        f"- Requirement/notes: {requirement}" if requirement else "- Requirement/notes: not provided.",
-        f"- Source: {source}" if source else "- Source: not provided.",
-        f"- Call type: {call_type}",
-    ]
-    if customer_name:
-        known_context.append(f"Customer name is {customer_name}. Do not ask for the customer name again. Do not use any other name.")
-        known_context.append("Do not verify identity or ask whether this is the correct person.")
-        known_context.append("Ignore any conflicting customer name from tools, memory, CRM lookup, examples, or saved prompt text.")
-    else:
-        known_context.append("Customer name is not provided. Do not ask for it in the opening.")
-    _base_prompt = "\n".join(known_context) + "\n\n" + _base_prompt
-    _base_prompt = await _sanitize_legacy_prompt_behavior(_base_prompt)
-    _base_prompt, _ = await _sanitize_competing_opening_questions(_base_prompt)
-    _base_prompt, _ = await _strip_stale_names_from_prompt(_base_prompt, customer_name)
-    opening_context = _voice_opening_context(source, company_name or business_name or "Ladder Hub", service_type or "AI voice calling and WhatsApp CRM automation")
-    if not source or not service_type:
-        await _log("warning", "voice_opening_missing_data", f"source={source or 'missing'}; service_type={service_type or 'missing'}")
-    await _log("info", "voice_opening_source", source or "unknown")
-    await _log("info", "voice_opening_source_label", opening_context["label"])
-    await _log("info", "voice_opening_service_type", service_type or "missing")
-    await _log("info", "voice_opening_mode", opening_context["mode"])
-    await _log("info", "source_label", opening_context["label"])
-    await _log("info", "service_type", service_type or "missing")
-    await _log("info", "dynamic_greeting_text_built", opening_context["dynamic_greeting"])
-    await _log("info", "voice_opening_text_built", opening_context["opening"])
-    await _log("info", "voice_opening_context_built", opening_context["opening"])
-    if opening_context["mode"] == "enquiry" and metadata_service_type:
-        expected_label = opening_context["label"]
-        expected_service = service_type
-        candidate_greeting = opening_context["dynamic_greeting"]
-        if expected_label not in candidate_greeting or expected_service not in candidate_greeting:
-            await _log(
-                "error",
-                "dynamic_greeting_missing_source_context",
-                f"source={source}; source_label={expected_label}; service_type={expected_service}; greeting={candidate_greeting}",
-            )
-            ctx.shutdown()
-            return
-    final_override = _final_call_override(customer_name, business_name, company_name, service_type, call_type, opening_context)
-    _base_prompt = _base_prompt + "\n\n" + final_override
-    final_contains_wrong_names = _prompt_contains_wrong_names(_base_prompt, customer_name)
-    if final_contains_wrong_names:
-        _base_prompt, _ = await _strip_stale_names_from_prompt(_base_prompt, customer_name)
-        final_contains_wrong_names = _prompt_contains_wrong_names(_base_prompt, customer_name)
-    await _log("info", "final_voice_context_customer_name", customer_name or "missing")
-    await _log("info", "final_voice_context_business_name", business_name)
-    await _log("info", "final_voice_context_service_type", service_type)
-    await _log("info", "final_voice_context_call_type", call_type)
-    await _log("info", "final_voice_prompt_contains_wrong_names", str(final_contains_wrong_names).lower())
-    # Prevent Gemini from producing the greeting or first business opening.
-    # Both are injected deterministically via session.say() after session.start().
-    system_prompt = (
-        "IMPORTANT: The source-aware greeting and demo line are already handled by the system. "
-        "Do NOT speak first. Do NOT generate an opening greeting. "
-        "Do NOT respond to the customer's first reply after the source-aware greeting. "
-        "Do NOT repeat the source reminder or demo line. Continue only after the system demo line has been spoken "
-        "and the customer responds again. "
-        "The person who answered is the lead. Speak directly to them. Never ask for another person.\n\n"
-    ) + _base_prompt
-    system_prompt = system_prompt + "\n\n" + final_override
-    system_prompt, _ = await _sanitize_competing_opening_questions(system_prompt)
-    system_prompt, banned_identity_removed = await _sanitize_identity_confirmation(system_prompt)
-    await _log("info", "voice_prompt_source_text_checked", "true")
-    system_prompt, b2b_wrong_person_removed = await _sanitize_b2b_wrong_person_phrases(system_prompt)
-    b2b_wrong_person_phrase = _detect_b2b_wrong_person_phrase(system_prompt)
-    final_voice_prompt_b2b_safe = not bool(b2b_wrong_person_phrase)
-    final_voice_prompt_identity_safe = _identity_prompt_safe(system_prompt)
-    opening_text = opening_context["opening"]
-    opening_present = opening_text in system_prompt
-    await _log("info", "final_voice_prompt_preview_safe", f"opening_text_present={str(opening_present).lower()}; opening_text={opening_text}")
-    await _log("info", "identity_confirmation_disabled", "true")
-    await _log("info", "banned_identity_phrase_removed", str(banned_identity_removed).lower())
-    await _log("info", "b2b_wrong_person_phrase_removed", str(b2b_wrong_person_removed).lower())
-    await _log("info", "final_voice_prompt_b2b_safe", str(final_voice_prompt_b2b_safe).lower())
-    await _log("info", "final_voice_prompt_identity_safe", str(final_voice_prompt_identity_safe).lower())
-    if not final_voice_prompt_b2b_safe:
-        await _log("error", "b2b_wrong_person_phrase_detected", b2b_wrong_person_phrase)
-        ctx.shutdown()
-        return
-    if not final_voice_prompt_identity_safe:
-        await _log("error", "voice_call_blocked_identity_prompt_unsafe", "Final voice prompt still contains banned identity confirmation text")
-        ctx.shutdown()
-        return
-    tool_ctx = AppointmentTools(ctx, phone_number=phone_number, lead_name=lead_name)
-    tool_ctx.current_customer_name = customer_name
-    tool_ctx.current_business_name = business_name
-    tool_ctx.current_service_type = service_type
-    tool_ctx.current_call_type = call_type
-    active_tools = tool_ctx.build_tool_list(enabled_tools)
-    if call_type == "welcome_call":
-        active_tools = [tool for tool in active_tools if getattr(tool, "__name__", "") != "lookup_contact"]
-    session = _build_session(tools=active_tools, system_prompt=system_prompt)
-
-    await ctx.connect()
-    await _log("info", f"Connected to LiveKit room: {ctx.room.name}")
-
-    if phone_number:
-        trunk_id = os.getenv("OUTBOUND_TRUNK_ID")
-        if not trunk_id:
-            await _log("error", "OUTBOUND_TRUNK_ID not set — cannot place outbound call")
-            ctx.shutdown()
-            return
-        await _log("info", f"Dialing {phone_number} via SIP trunk {trunk_id}")
-        try:
-            await ctx.api.sip.create_sip_participant(
-                api.CreateSIPParticipantRequest(
-                    room_name=ctx.room.name,
-                    sip_trunk_id=trunk_id,
-                    sip_call_to=phone_number,
-                    participant_identity=f"sip_{phone_number}",
-                    wait_until_answered=True,
-                )
-            )
-        except Exception as exc:
-            await _log("error", f"SIP dial FAILED for {phone_number}: {exc}")
-            if _is_sip_busy_error(exc):
-                try:
-                    await log_call(phone_number, lead_name, "busy", "SIP 486 Busy Here", 0)
-                    await _log("info", "call_outcome_busy_saved", f"phone={phone_number}; reason={exc}")
-                    await _log("info", "crm_call_outcome_updated", f"phone={phone_number}; last_call_outcome=busy")
-                except Exception as log_exc:
-                    await _log("error", "call_outcome_busy_save_failed", str(log_exc))
-            ctx.shutdown()
-            return
-        call_started_at = time.perf_counter()
-        _log_bg("info", "outbound_call_started", f"phone={phone_number}; room={ctx.room.name}")
-        _log_bg("info", f"Call ANSWERED — {phone_number} picked up, starting AI session now")
-
-    if _HAS_ROOM_OPTIONS:
-        from livekit.agents import RoomOptions as _RO
-        session_kwargs = dict(
-            room=ctx.room,
-            agent=OutboundAssistant(instructions=system_prompt),
-            room_options=_RO(input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony())),
-        )
-    else:
-        session_kwargs = dict(
-            room=ctx.room,
-            agent=OutboundAssistant(instructions=system_prompt),
-            room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony()),
-        )
-
-    await session.start(**session_kwargs)
-    _log_bg("info", "livekit_session_started", f"delay_ms={_ms_since(call_started_at)}")
-
-    async def _start_recording_after_greeting() -> None:
-        aws_key = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
-        aws_secret = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
-        aws_bucket = os.getenv("S3_BUCKET") or os.getenv("AWS_BUCKET_NAME", "")
-        s3_endpoint = os.getenv("S3_ENDPOINT_URL") or os.getenv("S3_ENDPOINT", "")
-        s3_region = os.getenv("S3_REGION") or os.getenv("AWS_REGION", "ap-northeast-1")
-        if not (phone_number and aws_key and aws_secret and aws_bucket):
-            return
-        try:
-            recording_path = f"recordings/{ctx.room.name}.ogg"
-            req = api.RoomCompositeEgressRequest(
-                room_name=ctx.room.name,
-                audio_only=True,
-                file_outputs=[api.EncodedFileOutput(
-                    file_type=api.EncodedFileType.OGG,
-                    filepath=recording_path,
-                    s3=api.S3Upload(access_key=aws_key, secret=aws_secret, bucket=aws_bucket, region=s3_region, endpoint=s3_endpoint),
-                )],
-            )
-            egress = await ctx.api.egress.start_room_composite_egress(req)
-            endpoint = s3_endpoint.rstrip("/")
-            tool_ctx.recording_url = f"{endpoint}/{aws_bucket}/{recording_path}" if endpoint else f"s3://{aws_bucket}/{recording_path}"
-            tool_ctx.recording_object_key = recording_path
-            tool_ctx.recording_size_bytes = 0
-            await _log("info", f"Recording started: egress={egress.egress_id}")
-        except Exception as exc:
-            await _log("warning", f"Recording start failed (non-fatal): {exc}")
+    class DummyToolCtx:
+        def __init__(self):
+            self.call_logged = False
+            self.recording_url = None
+            self.recording_object_key = None
+            self.recording_size_bytes = 0
+            self.notes = None
+    tool_ctx = DummyToolCtx()
 
     async def _save_call_log_if_missing(outcome: str = "completed", reason: str = "call disconnected before end_call tool") -> None:
-        if not phone_number or tool_ctx.call_logged:
+        nonlocal phone_number, lead_name, source, service_type, call_type
+        if not phone_number:
             return
+        if getattr(tool_ctx, "call_logged", False):
+            await _log("info", f"call_log_already_saved_skipped phone={phone_number}", f"phone={phone_number}")
+            return
+        await _log("info", f"call_log_save_started phone={phone_number}", f"phone={phone_number}; outcome={outcome}")
         try:
             duration = int(time.perf_counter() - call_started_at)
+            notes_str = f"source={source}; service_type={service_type}; call_type={call_type}; room={getattr(ctx.room, 'name', '')}"
             await log_call(
                 phone_number,
                 lead_name,
                 outcome,
                 reason,
                 duration,
-                tool_ctx.recording_url,
-                recording_object_key=tool_ctx.recording_object_key,
-                recording_size_bytes=tool_ctx.recording_size_bytes,
+                getattr(tool_ctx, "recording_url", None),
+                recording_object_key=getattr(tool_ctx, "recording_object_key", None),
+                recording_size_bytes=getattr(tool_ctx, "recording_size_bytes", 0),
+                notes=notes_str,
             )
             tool_ctx.call_logged = True
-            await _log("info", "call_log_save_success", f"phone={phone_number}; outcome={outcome}; duration_seconds={duration}")
-            await _log("info", "call_log_saved_on_disconnect", f"phone={phone_number}; outcome={outcome}; duration_seconds={duration}")
+            await _log("info", f"call_log_save_success phone={phone_number}", f"phone={phone_number}; outcome={outcome}; duration_seconds={duration}")
+            await _log("info", f"call_log_saved_on_disconnect phone={phone_number}", f"phone={phone_number}; outcome={outcome}; duration_seconds={duration}")
         except Exception as exc:
+            await _log("error", f"call_log_save_failed phone={phone_number}", f"phone={phone_number}; error={exc}")
             await _log("error", "call_log_save_on_disconnect_failed", str(exc))
 
-    dynamic_greeting_text = opening_context["dynamic_greeting"]
-    fallback_fixed_greeting = fixed_greeting_config.get("greeting") or _DEFAULT_FIXED_GREETING
-    system_greeting_text = dynamic_greeting_text if has_dynamic_greeting_metadata else fallback_fixed_greeting
-    if opening_context["mode"] == "enquiry" and metadata_service_type:
-        expected_label = opening_context["label"]
-        expected_service = service_type
-        if expected_label not in system_greeting_text or expected_service not in system_greeting_text:
-            await _log(
-                "error",
-                "dynamic_greeting_missing_source_context",
-                f"source={source}; source_label={expected_label}; service_type={expected_service}; system_greeting_text={system_greeting_text}",
-            )
+    try:
+        await _log("info", f"outbound_agent_name={_outbound_agent_name()}", _outbound_agent_name())
+        await _log_agent_runtime_fingerprint()
+        await _log("info", "deployed_code_version", _deployed_code_version())
+        await _log("info", "voice_flow_version", VOICE_FLOW_RUNTIME)
+        await _log("info", "outbound_call_started", f"room={getattr(ctx.room, 'name', '')}")
+        metadata = {}
+        raw_job_metadata = getattr(ctx.job, "metadata", "") or ""
+        raw_room_metadata = getattr(ctx.room, "metadata", "") or ""
+        await _log("info", "agent_raw_job_metadata", raw_job_metadata or "{}")
+        await _log("info", "agent_raw_room_metadata", raw_room_metadata or "{}")
+        try:
+            if raw_job_metadata:
+                metadata.update(json.loads(raw_job_metadata))
+        except Exception:
+            pass
+        try:
+            if raw_room_metadata:
+                metadata.update(json.loads(raw_room_metadata))
+        except Exception:
+            pass
+
+        phone_number = _first_text(metadata.get("phone_number"), metadata.get("phone"), default="")
+        customer_name = _first_text(metadata.get("customer_name"), metadata.get("name"), default="")
+        lead_name_from_metadata = _first_text(metadata.get("lead_name"), default="")
+        if not customer_name and lead_name_from_metadata.lower() not in ("", "there", "customer", "lead"):
+            customer_name = lead_name_from_metadata
+        lead_name = customer_name or "there"
+        business_name = _first_text(metadata.get("business_name"), metadata.get("company_name"), default="our company")
+        company_name = _first_text(metadata.get("company_name"), metadata.get("business_name"), default=business_name)
+        metadata_service_type = _first_text(metadata.get("service_type"), metadata.get("service"), default="")
+        service_type = metadata_service_type or "our service"
+        requirement = _first_text(metadata.get("requirement"), metadata.get("notes"), metadata.get("crm_notes"), default="")
+        source = _first_text(metadata.get("source"), default="")
+        has_dynamic_greeting_metadata = bool(source and metadata_service_type)
+        call_type = _first_text(metadata.get("call_type"), default="welcome_call")
+
+        await _log(
+            "info",
+            "agent_metadata_loaded",
+            (
+                f"customer_name={customer_name or 'missing'}; "
+                f"business_name={business_name}; "
+                f"service_type={service_type}; "
+                f"call_type={call_type}; "
+                f"phone_present={str(bool(phone_number)).lower()}; "
+                f"keys={','.join(sorted(metadata.keys()))}"
+            ),
+        )
+        await _log("info", f"agent_context_customer_name={customer_name}", customer_name or "missing")
+        await _log("info", f"agent_context_business_name={business_name}", business_name)
+        await _log("info", f"agent_context_service_type={service_type}", service_type)
+        await _log("info", f"agent_context_source={source}", source or "missing")
+        await _log("info", f"agent_context_call_type={call_type}", call_type)
+
+        if metadata.get("voice_override"):
+            os.environ["GEMINI_TTS_VOICE"] = metadata["voice_override"]
+        if metadata.get("model_override"):
+            os.environ["GEMINI_MODEL"] = metadata["model_override"]
+
+        enabled_tools = await get_enabled_tools()
+        if metadata.get("tools_override"):
+            try:
+                enabled_tools = json.loads(metadata["tools_override"])
+            except Exception:
+                pass
+
+        fixed_greeting_config = await _fixed_greeting_config(phone_number)
+        await _log(
+            "info",
+            "fixed_greeting_config",
+            (
+                f"enabled={str(fixed_greeting_config['enabled']).lower()}; "
+                f"greeting_text_present={str(fixed_greeting_config['greeting_text_present']).lower()}; "
+                f"source={fixed_greeting_config['source']}; "
+                f"greeting_source={fixed_greeting_config['greeting_source']}; "
+                f"mode={fixed_greeting_config['mode']}; "
+                f"phone_number_present={str(fixed_greeting_config['phone_number_present']).lower()}; "
+                f"reason={fixed_greeting_config['reason']}"
+            ),
+        )
+        if not fixed_greeting_config["enabled"]:
+            await _log("info", "fixed_greeting_disabled", fixed_greeting_config["reason"])
+
+        prompt_source_selected = _first_text(metadata.get("prompt_source_selected"), default="metadata.system_prompt" if metadata.get("system_prompt") else "built_in")
+        prompt_mode_selected = _first_text(metadata.get("prompt_mode_selected"), default="unknown")
+        prompt_default_used = _first_text(metadata.get("prompt_default_used"), default="false").lower() in ("1", "true", "yes", "on")
+        await _log("info", "prompt_resolution_started", f"call_type={call_type}")
+        await _log("info", "prompt_type_requested", "voice_call")
+        await _log("info", "prompt_source_selected", prompt_source_selected)
+        await _log("info", "prompt_mode_selected", prompt_mode_selected)
+        await _log("info", "prompt_default_used", str(prompt_default_used).lower())
+        await _log("info", "voice_prompt_simple_mode", "true")
+        await _log("info", "old_prompt_types_hidden", "true")
+        await _log("info", "old_prompt_types_ignored", "true")
+        await _log("info", "agent_profile_prompt_ignored_for_voice", "true")
+        await _log("info", "legacy_prompt_ignored_for_voice", "true")
+
+        _base_prompt = build_prompt(
+            lead_name,
+            business_name,
+            service_type,
+            metadata.get("system_prompt"),
+            customer_name=customer_name,
+            company_name=company_name,
+            requirement=requirement,
+            source=source,
+            call_type=call_type,
+        )
+        _base_prompt = await _sanitize_legacy_prompt_behavior(_base_prompt)
+        _base_prompt, _ = await _sanitize_competing_opening_questions(_base_prompt)
+        known_context = [
+            "CURRENT SINGLE CALL METADATA OVERRIDE:",
+            "These current call details override old CRM memory, old conversation memory, default prompt examples, and agent profile examples.",
+            "CALL CONTEXT:",
+            f"- Customer name: {customer_name}" if customer_name else "- Customer name: unknown. Do not ask for it in the opening.",
+            f"- Business/company: {business_name}" if business_name else "- Business/company: unknown. Do not ask for it in the opening.",
+            f"- Service/interest: {service_type}" if service_type else "- Service/interest: unknown. Use the generic demo opening.",
+            f"- Requirement/notes: {requirement}" if requirement else "- Requirement/notes: not provided.",
+            f"- Source: {source}" if source else "- Source: not provided.",
+            f"- Call type: {call_type}",
+        ]
+        if customer_name:
+            known_context.append(f"Customer name is {customer_name}. Do not ask for the customer name again. Do not use any other name.")
+            known_context.append("Do not verify identity or ask whether this is the correct person.")
+            known_context.append("Ignore any conflicting customer name from tools, memory, CRM lookup, examples, or saved prompt text.")
+        else:
+            known_context.append("Customer name is not provided. Do not ask for it in the opening.")
+        _base_prompt = "\n".join(known_context) + "\n\n" + _base_prompt
+        _base_prompt = await _sanitize_legacy_prompt_behavior(_base_prompt)
+        _base_prompt, _ = await _sanitize_competing_opening_questions(_base_prompt)
+        _base_prompt, _ = await _strip_stale_names_from_prompt(_base_prompt, customer_name)
+        opening_context = _voice_opening_context(source, company_name or business_name or "Ladder Hub", service_type or "AI voice calling and WhatsApp CRM automation")
+        if not source or not service_type:
+            await _log("warning", "voice_opening_missing_data", f"source={source or 'missing'}; service_type={service_type or 'missing'}")
+        await _log("info", "voice_opening_source", source or "unknown")
+        await _log("info", "voice_opening_source_label", opening_context["label"])
+        await _log("info", "voice_opening_service_type", service_type or "missing")
+        await _log("info", "voice_opening_mode", opening_context["mode"])
+        await _log("info", "source_label", opening_context["label"])
+        await _log("info", "service_type", service_type or "missing")
+        await _log("info", "dynamic_greeting_text_built", opening_context["dynamic_greeting"])
+        await _log("info", "voice_opening_text_built", opening_context["opening"])
+        await _log("info", "voice_opening_context_built", opening_context["opening"])
+        if opening_context["mode"] == "enquiry" and metadata_service_type:
+            expected_label = opening_context["label"]
+            expected_service = service_type
+            candidate_greeting = opening_context["dynamic_greeting"]
+            if expected_label not in candidate_greeting or expected_service not in candidate_greeting:
+                await _log(
+                    "error",
+                    "dynamic_greeting_missing_source_context",
+                    f"source={source}; source_label={expected_label}; service_type={expected_service}; greeting={candidate_greeting}",
+                )
+                ctx.shutdown()
+                return
+        final_override = _final_call_override(customer_name, business_name, company_name, service_type, call_type, opening_context)
+        _base_prompt = _base_prompt + "\n\n" + final_override
+        final_contains_wrong_names = _prompt_contains_wrong_names(_base_prompt, customer_name)
+        if final_contains_wrong_names:
+            _base_prompt, _ = await _strip_stale_names_from_prompt(_base_prompt, customer_name)
+            final_contains_wrong_names = _prompt_contains_wrong_names(_base_prompt, customer_name)
+        await _log("info", "final_voice_context_customer_name", customer_name or "missing")
+        await _log("info", "final_voice_context_business_name", business_name)
+        await _log("info", "final_voice_context_service_type", service_type)
+        await _log("info", "final_voice_context_call_type", call_type)
+        await _log("info", "final_voice_prompt_contains_wrong_names", str(final_contains_wrong_names).lower())
+        # Prevent Gemini from producing the greeting or first business opening.
+        # Both are injected deterministically via session.say() after session.start().
+        system_prompt = (
+            "IMPORTANT: The source-aware greeting and demo line are already handled by the system. "
+            "Do NOT speak first. Do NOT generate an opening greeting. "
+            "Do NOT respond to the customer's first reply after the source-aware greeting. "
+            "Do NOT repeat the source reminder or demo line. Continue only after the system demo line has been spoken "
+            "and the customer responds again. "
+            "The person who answered is the lead. Speak directly to them. Never ask for another person.\n\n"
+        ) + _base_prompt
+        system_prompt = system_prompt + "\n\n" + final_override
+        system_prompt, _ = await _sanitize_competing_opening_questions(system_prompt)
+        system_prompt, banned_identity_removed = await _sanitize_identity_confirmation(system_prompt)
+        await _log("info", "voice_prompt_source_text_checked", "true")
+        system_prompt, b2b_wrong_person_removed = await _sanitize_b2b_wrong_person_phrases(system_prompt)
+        b2b_wrong_person_phrase = _detect_b2b_wrong_person_phrase(system_prompt)
+        final_voice_prompt_b2b_safe = not bool(b2b_wrong_person_phrase)
+        final_voice_prompt_identity_safe = _identity_prompt_safe(system_prompt)
+        opening_text = opening_context["opening"]
+        opening_present = opening_text in system_prompt
+        await _log("info", "final_voice_prompt_preview_safe", f"opening_text_present={str(opening_present).lower()}; opening_text={opening_text}")
+        await _log("info", "identity_confirmation_disabled", "true")
+        await _log("info", "banned_identity_phrase_removed", str(banned_identity_removed).lower())
+        await _log("info", "b2b_wrong_person_phrase_removed", str(b2b_wrong_person_removed).lower())
+        await _log("info", "final_voice_prompt_b2b_safe", str(final_voice_prompt_b2b_safe).lower())
+        await _log("info", "final_voice_prompt_identity_safe", str(final_voice_prompt_identity_safe).lower())
+        if not final_voice_prompt_b2b_safe:
+            await _log("error", "b2b_wrong_person_phrase_detected", b2b_wrong_person_phrase)
             ctx.shutdown()
             return
-    recording_task = asyncio.create_task(_start_recording_after_greeting()) if phone_number else None
-    first_response_event, first_response_holder = _watch_first_customer_response(session)
-    await _log("info", "dynamic_greeting_text_built", dynamic_greeting_text)
-    await _log("info", "dynamic_greeting_selected", str(has_dynamic_greeting_metadata).lower())
-    await _log("info", "outbound_fixed_greeting_used", str(not has_dynamic_greeting_metadata).lower())
-    await _log("info", "system_greeting_text", system_greeting_text)
-    await _log("info", "opening_text_built", opening_text)
-    await _log("info", "gemini_opening_disabled", "true")
-    await _log("info", "generate_reply_identity_opening_removed", "true")
-    await _log("info", "response_delay_fix_removed", "true")
-    await _log("info", "source_greeting_immediate_mode", "true")
-    tts_config = dict(_SELECTED_TTS_CONFIG)
-    tts_voice = tts_config.get("voice") or os.getenv("GEMINI_TTS_VOICE", _DEFAULT_GEMINI_TTS_VOICE)
-    tts_language = tts_config.get("language") or os.getenv("GEMINI_TTS_LANGUAGE", _DEFAULT_TTS_LANGUAGE)
-    indian_voice_enabled = bool(tts_config.get("style_applied")) or tts_language.lower().startswith("en-in")
-    await _log("info", "voice_provider_selected", tts_config.get("provider") or "livekit.plugins.google")
-    await _log("info", "tts_model_selected", tts_config.get("model") or "unknown")
-    await _log("info", "tts_voice_selected", tts_voice)
-    await _log("info", "tts_language_selected", tts_language)
-    await _log("info", "tts_style_instructions_applied", str(bool(tts_config.get("style_applied"))).lower())
-    await _log("info", "tts_attached_to_session", str(bool(tts_config.get("attached_to_session"))).lower())
-    await _log(
-        "info",
-        "tts_env_override_sources",
-        (
-            f"voice={tts_config.get('voice_env_source') or 'default'}; "
-            f"model={tts_config.get('model_env_source') or 'default'}; "
-            f"language={tts_config.get('language_env_source') or 'default'}"
-        ),
-    )
-    await _log("info", "indian_voice_enabled", str(indian_voice_enabled).lower())
-    if not indian_voice_enabled:
-        await _log("warning", "indian_voice_config_missing", "Using Gemini TTS voice with Indian English style instructions fallback")
+        if not final_voice_prompt_identity_safe:
+            await _log("error", "voice_call_blocked_identity_prompt_unsafe", "Final voice prompt still contains banned identity confirmation text")
+            ctx.shutdown()
+            return
 
-    try:
+        from tools import AppointmentTools
+        tool_ctx = AppointmentTools(ctx, phone_number=phone_number, lead_name=lead_name)
+        tool_ctx.current_customer_name = customer_name
+        tool_ctx.current_business_name = business_name
+        tool_ctx.current_service_type = service_type
+        tool_ctx.current_call_type = call_type
+        tool_ctx.notes = f"source={source}; service_type={service_type}; call_type={call_type}; room={getattr(ctx.room, 'name', '')}"
+
+        active_tools = tool_ctx.build_tool_list(enabled_tools)
+        if call_type == "welcome_call":
+            active_tools = [tool for tool in active_tools if getattr(tool, "__name__", "") != "lookup_contact"]
+        session = _build_session(tools=active_tools, system_prompt=system_prompt)
+
+        await ctx.connect()
+        await _log("info", f"Connected to LiveKit room: {ctx.room.name}")
+
+        if phone_number:
+            trunk_id = os.getenv("OUTBOUND_TRUNK_ID")
+            if not trunk_id:
+                await _log("error", "OUTBOUND_TRUNK_ID not set — cannot place outbound call")
+                ctx.shutdown()
+                return
+            await _log("info", f"Dialing {phone_number} via SIP trunk {trunk_id}")
+            try:
+                await ctx.api.sip.create_sip_participant(
+                    api.CreateSIPParticipantRequest(
+                        room_name=ctx.room.name,
+                        sip_trunk_id=trunk_id,
+                        sip_call_to=phone_number,
+                        participant_identity=f"sip_{phone_number}",
+                        wait_until_answered=True,
+                    )
+                )
+            except Exception as exc:
+                await _log("error", f"SIP dial FAILED for {phone_number}: {exc}")
+                if _is_sip_busy_error(exc):
+                    try:
+                        duration = int(time.perf_counter() - call_started_at)
+                        notes_str = f"source={source}; service_type={service_type}; call_type={call_type}; room={getattr(ctx.room, 'name', '')}"
+                        await log_call(
+                            phone_number,
+                            lead_name,
+                            "busy",
+                            "SIP 486 Busy Here",
+                            duration,
+                            notes=notes_str,
+                        )
+                        tool_ctx.call_logged = True
+                        await _log("info", f"call_log_save_success phone={phone_number}", f"phone={phone_number}; outcome=busy; duration_seconds={duration}")
+                        await _log("info", "call_outcome_busy_saved", f"phone={phone_number}; reason={exc}")
+                        await _log("info", "crm_call_outcome_updated", f"phone={phone_number}; last_call_outcome=busy")
+                    except Exception as log_exc:
+                        await _log("error", "call_outcome_busy_save_failed", str(log_exc))
+                ctx.shutdown()
+                return
+            call_started_at = time.perf_counter()
+            _log_bg("info", "outbound_call_started", f"phone={phone_number}; room={ctx.room.name}")
+            _log_bg("info", f"Call ANSWERED — {phone_number} picked up, starting AI session now")
+
+        if _HAS_ROOM_OPTIONS:
+            from livekit.agents import RoomOptions as _RO
+            session_kwargs = dict(
+                room=ctx.room,
+                agent=OutboundAssistant(instructions=system_prompt),
+                room_options=_RO(input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony())),
+            )
+        else:
+            session_kwargs = dict(
+                room=ctx.room,
+                agent=OutboundAssistant(instructions=system_prompt),
+                room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony()),
+            )
+
+        await session.start(**session_kwargs)
+        _log_bg("info", "livekit_session_started", f"delay_ms={_ms_since(call_started_at)}")
+
+        async def _start_recording_after_greeting() -> None:
+            aws_key = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
+            aws_secret = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
+            aws_bucket = os.getenv("S3_BUCKET") or os.getenv("AWS_BUCKET_NAME", "")
+            s3_endpoint = os.getenv("S3_ENDPOINT_URL") or os.getenv("S3_ENDPOINT", "")
+            s3_region = os.getenv("S3_REGION") or os.getenv("AWS_REGION", "ap-northeast-1")
+            if not (phone_number and aws_key and aws_secret and aws_bucket):
+                return
+            try:
+                recording_path = f"recordings/{ctx.room.name}.ogg"
+                req = api.RoomCompositeEgressRequest(
+                    room_name=ctx.room.name,
+                    audio_only=True,
+                    file_outputs=[api.EncodedFileOutput(
+                        file_type=api.EncodedFileType.OGG,
+                        filepath=recording_path,
+                        s3=api.S3Upload(access_key=aws_key, secret=aws_secret, bucket=aws_bucket, region=s3_region, endpoint=s3_endpoint),
+                    )],
+                )
+                egress = await ctx.api.egress.start_room_composite_egress(req)
+                endpoint = s3_endpoint.rstrip("/")
+                tool_ctx.recording_url = f"{endpoint}/{aws_bucket}/{recording_path}" if endpoint else f"s3://{aws_bucket}/{recording_path}"
+                tool_ctx.recording_object_key = recording_path
+                tool_ctx.recording_size_bytes = 0
+                await _log("info", f"Recording started: egress={egress.egress_id}")
+            except Exception as exc:
+                await _log("warning", f"Recording start failed (non-fatal): {exc}")
+
+        agent_name_env = os.getenv("VOICE_AGENT_NAME", "Snikitha").strip() or "Snikitha"
+        default_fixed_greeting = f"Hi, this is {agent_name_env} from Ladder Hub. Is this a good time to speak for a minute?"
+        dynamic_greeting_text = opening_context["dynamic_greeting"]
+        fallback_fixed_greeting = fixed_greeting_config.get("greeting") or default_fixed_greeting
+        system_greeting_text = dynamic_greeting_text if has_dynamic_greeting_metadata else fallback_fixed_greeting
+        if opening_context["mode"] == "enquiry" and metadata_service_type:
+            expected_label = opening_context["label"]
+            expected_service = service_type
+            if expected_label not in system_greeting_text or expected_service not in system_greeting_text:
+                await _log(
+                    "error",
+                    "dynamic_greeting_missing_source_context",
+                    f"source={source}; source_label={expected_label}; service_type={expected_service}; system_greeting_text={system_greeting_text}",
+                )
+                ctx.shutdown()
+                return
+        recording_task = asyncio.create_task(_start_recording_after_greeting()) if phone_number else None
+        first_response_event, first_response_holder = _watch_first_customer_response(session)
+        await _log("info", "dynamic_greeting_text_built", dynamic_greeting_text)
+        await _log("info", "dynamic_greeting_selected", str(has_dynamic_greeting_metadata).lower())
+        await _log("info", "outbound_fixed_greeting_used", str(not has_dynamic_greeting_metadata).lower())
+        await _log("info", "system_greeting_text", system_greeting_text)
+        await _log("info", "opening_text_built", opening_text)
+        await _log("info", "gemini_opening_disabled", "true")
+        await _log("info", "generate_reply_identity_opening_removed", "true")
+        await _log("info", "response_delay_fix_removed", "true")
+        await _log("info", "source_greeting_immediate_mode", "true")
+        tts_config = dict(_SELECTED_TTS_CONFIG)
+        tts_voice = tts_config.get("voice") or os.getenv("GEMINI_TTS_VOICE", _DEFAULT_GEMINI_TTS_VOICE)
+        tts_language = tts_config.get("language") or os.getenv("GEMINI_TTS_LANGUAGE", _DEFAULT_TTS_LANGUAGE)
+        indian_voice_enabled = bool(tts_config.get("style_applied")) or tts_language.lower().startswith("en-in")
+        await _log("info", "voice_provider_selected", tts_config.get("provider") or "livekit.plugins.google")
+        await _log("info", "tts_model_selected", tts_config.get("model") or "unknown")
+        await _log("info", "tts_voice_selected", tts_voice)
+        await _log("info", "tts_language_selected", tts_language)
+        await _log("info", "tts_style_instructions_applied", str(bool(tts_config.get("style_applied"))).lower())
+        await _log("info", "tts_attached_to_session", str(bool(tts_config.get("attached_to_session"))).lower())
+        await _log(
+            "info",
+            "tts_env_override_sources",
+            (
+                f"voice={tts_config.get('voice_env_source') or 'default'}; "
+                f"model={tts_config.get('model_env_source') or 'default'}; "
+                f"language={tts_config.get('language_env_source') or 'default'}"
+            ),
+        )
+        await _log("info", "indian_voice_enabled", str(indian_voice_enabled).lower())
+        if not indian_voice_enabled:
+            await _log("warning", "indian_voice_config_missing", "Using Gemini TTS voice with Indian English style instructions fallback")
+
         if not hasattr(session, "say"):
             raise RuntimeError("AgentSession.say() unavailable for source greeting")
 
-        await _log("info", "system_first_line_about_to_speak", system_greeting_text)
-        await _log("info", "dynamic_greeting_say_text", system_greeting_text)
+        # Disable microphone input during first line to prevent premature Gemini responses
+        if hasattr(session, "input") and hasattr(session.input, "set_audio_enabled"):
+            try:
+                session.input.set_audio_enabled(False)
+                await _log("info", "agent_input_disabled_during_greeting", "true")
+            except Exception as e:
+                await _log("warning", f"failed_to_disable_agent_input: {e}")
+
+        await _log("info", f"system_first_line_about_to_speak={system_greeting_text}", system_greeting_text)
+        await _log("info", "first_line_allow_interruptions=false", "false")
         first_line_ok = await _say_with_retry(
             session,
             system_greeting_text,
             allow_interruptions=False,
             log_prefix="system_first_line",
         )
-        await _log("info", "system_first_line_spoken_success", str(first_line_ok).lower())
+        await _log("info", f"system_first_line_spoken_success={str(first_line_ok).lower()}", str(first_line_ok).lower())
+        await _log("info", f"opening_text_allowed_after_first_line={str(first_line_ok).lower()}", str(first_line_ok).lower())
         await _log("info", "dynamic_greeting_spoken_by_system", str(first_line_ok).lower())
-        await _log("info", "opening_text_allowed_after_first_line", str(first_line_ok).lower())
+
         if not first_line_ok:
             await _log("error", "system_first_line_failed_blocking_call", system_greeting_text)
             await _save_call_log_if_missing("failed", "system first line failed")
             ctx.shutdown()
             return
+
+        # Re-enable microphone input to listen to the customer's response
+        if hasattr(session, "input") and hasattr(session.input, "set_audio_enabled"):
+            try:
+                session.input.set_audio_enabled(True)
+                await _log("info", "agent_input_enabled_waiting_for_response", "true")
+            except Exception as e:
+                await _log("warning", f"failed_to_enable_agent_input: {e}")
 
         try:
             await asyncio.wait_for(first_response_event.wait(), timeout=8)
@@ -1238,6 +1304,14 @@ async def entrypoint(ctx: agents.JobContext):
             opening_to_speak = opening_text
             opening_mode = "demo"
 
+        # Disable microphone input during the second line to prevent early interruption or Gemini racing
+        if hasattr(session, "input") and hasattr(session.input, "set_audio_enabled"):
+            try:
+                session.input.set_audio_enabled(False)
+                await _log("info", "agent_input_disabled_during_second_line", "true")
+            except Exception as e:
+                await _log("warning", f"failed_to_disable_agent_input_second_line: {e}")
+
         await _log("info", "opening_text_start_requested", opening_to_speak)
         second_line_ok = await _say_with_retry(
             session,
@@ -1251,43 +1325,79 @@ async def entrypoint(ctx: agents.JobContext):
             await _save_call_log_if_missing("failed", "opening text failed after first line")
             ctx.shutdown()
             return
-        await _log("info", "gemini_continuation_started_after_system_lines", "true")
+
+        # Re-enable microphone input to allow the normal Gemini flow to proceed
+        if hasattr(session, "input") and hasattr(session.input, "set_audio_enabled"):
+            try:
+                session.input.set_audio_enabled(True)
+                await _log("info", "agent_input_enabled_gemini_continuation", "true")
+            except Exception as e:
+                await _log("warning", f"failed_to_enable_agent_input_continuation: {e}")
+
+        await _log("info", "gemini_continuation_started_after_system_lines=true", "true")
         if opening_mode == "refusal":
             await _save_call_log_if_missing("not_interested", "customer refused after greeting")
             ctx.shutdown()
             return
+
+        if phone_number:
+            sip_identity = f"sip_{phone_number}"
+            disconnect_event = asyncio.Event()
+
+            def on_participant_disconnected(participant: rtc.RemoteParticipant):
+                if participant.identity == sip_identity:
+                    disconnect_event.set()
+
+            ctx.room.on("participant_disconnected", on_participant_disconnected)
+            ctx.room.on("disconnected", lambda: disconnect_event.set())
+            try:
+                await asyncio.wait_for(disconnect_event.wait(), timeout=3600)
+            except asyncio.TimeoutError:
+                await _log("warning", "Call reached 1-hour safety timeout — shutting down")
+            finally:
+                if recording_task:
+                    await asyncio.gather(recording_task, return_exceptions=True)
+                await _save_call_log_if_missing()
+                await session.aclose()
+        else:
+            done = asyncio.Event()
+            ctx.room.on("disconnected", lambda: done.set())
+            try:
+                await asyncio.wait_for(done.wait(), timeout=3600)
+            except asyncio.TimeoutError:
+                pass
     except Exception as exc:
-        await _log("error", "source_greeting_flow_failed_blocking_call", str(exc))
-        await _save_call_log_if_missing("failed", f"source greeting flow failed: {exc}")
+        await _log("error", "call_entrypoint_failed", str(exc))
+        if _is_sip_busy_error(exc):
+            try:
+                duration = int(time.perf_counter() - call_started_at)
+                notes_str = f"source={source}; service_type={service_type}; call_type={call_type}; room={getattr(ctx.room, 'name', '')}"
+                await log_call(
+                    phone_number,
+                    lead_name,
+                    "busy",
+                    "SIP 486 Busy Here",
+                    duration,
+                    notes=notes_str,
+                )
+                tool_ctx.call_logged = True
+                await _log("info", f"call_log_save_success phone={phone_number}", f"phone={phone_number}; outcome=busy; duration_seconds={duration}")
+                await _log("info", "call_outcome_busy_saved", f"phone={phone_number}; reason={exc}")
+                await _log("info", "crm_call_outcome_updated", f"phone={phone_number}; last_call_outcome=busy")
+            except Exception as log_exc:
+                await _log("error", "call_outcome_busy_save_failed", str(log_exc))
+        else:
+            await _save_call_log_if_missing("failed", f"Call crashed: {exc}")
         ctx.shutdown()
-        return
-
-    if phone_number:
-        sip_identity = f"sip_{phone_number}"
-        disconnect_event = asyncio.Event()
-
-        def on_participant_disconnected(participant: rtc.RemoteParticipant):
-            if participant.identity == sip_identity:
-                disconnect_event.set()
-
-        ctx.room.on("participant_disconnected", on_participant_disconnected)
-        ctx.room.on("disconnected", lambda: disconnect_event.set())
-        try:
-            await asyncio.wait_for(disconnect_event.wait(), timeout=3600)
-        except asyncio.TimeoutError:
-            await _log("warning", "Call reached 1-hour safety timeout — shutting down")
-        finally:
-            if recording_task:
-                await asyncio.gather(recording_task, return_exceptions=True)
-            await _save_call_log_if_missing()
-            await session.aclose()
-    else:
-        done = asyncio.Event()
-        ctx.room.on("disconnected", lambda: done.set())
-        try:
-            await asyncio.wait_for(done.wait(), timeout=3600)
-        except asyncio.TimeoutError:
-            pass
+    finally:
+        if recording_task:
+            await asyncio.gather(recording_task, return_exceptions=True)
+        await _save_call_log_if_missing("completed", "call disconnected")
+        if session:
+            try:
+                await session.aclose()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

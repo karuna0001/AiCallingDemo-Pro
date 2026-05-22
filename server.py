@@ -117,7 +117,13 @@ def _deployed_code_version() -> str:
     return "unknown"
 
 
-def _outbound_agent_name() -> str:
+async def _outbound_agent_name() -> str:
+    try:
+        db_val = await get_setting("OUTBOUND_AGENT_NAME", "")
+        if db_val and db_val.strip():
+            return db_val.strip()
+    except Exception:
+        pass
     return (os.getenv("OUTBOUND_AGENT_NAME") or DEFAULT_OUTBOUND_AGENT_NAME).strip() or DEFAULT_OUTBOUND_AGENT_NAME
 
 init_db()
@@ -778,7 +784,7 @@ async def api_dispatch_call(req: CallRequest):
         except TypeError:
             room_req = lk_api.CreateRoomRequest(**room_kwargs)
         await lk.room.create_room(room_req)
-        agent_name = _outbound_agent_name()
+        agent_name = await _outbound_agent_name()
         await log_error("server", "livekit_agent_dispatch_name", agent_name, "info")
         await lk.agent_dispatch.create_dispatch(lk_api.CreateAgentDispatchRequest(agent_name=agent_name, room=room_name, metadata=json.dumps(metadata)))
         await lk.aclose()
@@ -2072,7 +2078,7 @@ async def api_get_logs(limit: int = 200, level: Optional[str] = None, source: Op
 @app.get("/api/agent-runtime-health")
 async def api_agent_runtime_health():
     logs = await get_logs(source="agent", limit=500)
-    expected_agent_name = _outbound_agent_name()
+    expected_agent_name = await _outbound_agent_name()
 
     def _timestamp_age_seconds(row: Optional[dict]) -> Optional[int]:
         if not row:
@@ -3265,7 +3271,7 @@ async def _dispatch_one(lk, lk_api, contact: dict, room_name: str, prompt: Optio
         except TypeError:
             room_req = lk_api.CreateRoomRequest(**room_kwargs)
         await lk.room.create_room(room_req)
-        agent_name = _outbound_agent_name()
+        agent_name = await _outbound_agent_name()
         await log_error("server", "livekit_agent_dispatch_name", agent_name, "info")
         await lk.agent_dispatch.create_dispatch(lk_api.CreateAgentDispatchRequest(agent_name=agent_name, room=room_name, metadata=json.dumps(metadata)))
         return True
