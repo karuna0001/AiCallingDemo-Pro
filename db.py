@@ -207,7 +207,7 @@ def _require_supabase() -> tuple:
     return url, key
 
 
-_cached_adb = None
+_cached_adb_by_loop = {}
 _cached_sdb = None
 
 
@@ -221,12 +221,23 @@ def _sdb():
 
 
 async def _adb():
-    global _cached_adb
-    if _cached_adb is None:
+    global _cached_adb_by_loop
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None:
+        if loop not in _cached_adb_by_loop:
+            url, key = _require_supabase()
+            from supabase._async.client import create_client
+            _cached_adb_by_loop[loop] = await create_client(url, key)
+        return _cached_adb_by_loop[loop]
+    else:
         url, key = _require_supabase()
         from supabase._async.client import create_client
-        _cached_adb = await create_client(url, key)
-    return _cached_adb
+        return await create_client(url, key)
 
 
 def init_db() -> None:
