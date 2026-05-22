@@ -38,6 +38,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("outbound-agent")
 VOICE_FLOW_RUNTIME = "v3_immediate_source_greeting"
 DEFAULT_OUTBOUND_AGENT_NAME = "outbound-caller-v3"
+OPENING_RESPONSE_WAIT_SECONDS = 2
 
 
 class OutboundAssistant(Agent):
@@ -487,24 +488,24 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
         mode = "cold_call"
         template = "short_source_database"
         dynamic_greeting = (
-            f"Hi, this is {agent_name} from {caller_business}. We received your contact from our database. Is this a good time?"
+            f"Hi, {agent_name} from {caller_business}. We have your contact in our database. Is this a good time?"
         )
-        opening = "Great. Can I arrange a quick 10-minute Google Meet demo for you?"
+        opening = "Great. Can I arrange a quick 10-minute Google Meet demo?"
     elif label in {"Facebook", "Instagram", "our website", "Google", "WhatsApp"}:
         mode = "enquiry"
         template = "short_source_enquiry"
-        source_phrase = f"{label} enquiry" if label in {"Facebook", "Instagram", "Google", "WhatsApp"} else "website enquiry"
+        source_phrase = f"{label}" if label in {"Facebook", "Instagram", "Google", "WhatsApp"} else "our website"
         dynamic_greeting = (
-            f"Hi, this is {agent_name} from {caller_business}. We received your {source_phrase} for {service_type}. Is this a good time?"
+            f"Hi, {agent_name} from {caller_business}. You enquired on {source_phrase} for {service_type}. Is this a good time?"
         )
-        opening = "Great. Can I arrange a quick 10-minute Google Meet demo for you?"
+        opening = "Great. Can I arrange a quick 10-minute Google Meet demo?"
     else:
         mode = "generic"
         template = "short_source_records"
         dynamic_greeting = (
-            f"Hi, this is {agent_name} from {caller_business}. We received your enquiry for {service_type}. Is this a good time?"
+            f"Hi, {agent_name} from {caller_business}. You enquired for {service_type}. Is this a good time?"
         )
-        opening = "Great. Can I arrange a quick 10-minute Google Meet demo for you?"
+        opening = "Great. Can I arrange a quick 10-minute Google Meet demo?"
     return {
         "source": norm,
         "label": label,
@@ -514,7 +515,7 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
         "opening": opening,
         "legacy_source_opening": (
             f"We received your enquiry from {label} regarding {service_type}. "
-            "Can I arrange a quick 10-minute Google Meet demo for you?"
+            "Can I arrange a quick 10-minute Google Meet demo?"
         ) if mode == "enquiry" else "",
     }
 
@@ -598,6 +599,16 @@ def _watch_first_customer_response(session: AgentSession) -> tuple[asyncio.Event
         except Exception:
             pass
     return response_event, holder
+
+
+def _is_session_running(session: AgentSession | None) -> bool:
+    if not session:
+        return False
+    if getattr(session, "_activity", None) is None:
+        return False
+    if getattr(session, "_closed", False) or getattr(session, "closed", False):
+        return False
+    return True
 
 
 async def _say_with_retry(session: AgentSession, text: str, *, allow_interruptions: bool, log_prefix: str) -> bool:
@@ -1311,10 +1322,12 @@ async def entrypoint(ctx: agents.JobContext):
             except Exception as e:
                 await _log("warning", f"failed_to_enable_agent_input: {e}")
 
+        await _log("info", f"opening_response_wait_seconds={OPENING_RESPONSE_WAIT_SECONDS}", str(OPENING_RESPONSE_WAIT_SECONDS))
         try:
-            await asyncio.wait_for(first_response_event.wait(), timeout=8)
+            await asyncio.wait_for(first_response_event.wait(), timeout=OPENING_RESPONSE_WAIT_SECONDS)
         except asyncio.TimeoutError:
             first_response_holder["event"] = first_response_holder.get("event") or "timeout"
+            await _log("info", "no_response_after_greeting_continue=true", "true")
 
         first_response = first_response_holder.get("text", "")
         first_response_intent = _customer_response_intent(first_response)
@@ -1334,6 +1347,22 @@ async def entrypoint(ctx: agents.JobContext):
             opening_to_speak = opening_text
             opening_mode = "demo"
 
+        # Check if the session is still running before speaking the second line
+        session_running = _is_session_running(session)
+        await _log("info", f"session_running_before_second_line={str(session_running).lower()}", str(session_running).lower())
+
+        if not session_running:
+            await _log("info", "customer_disconnected_after_greeting=true", "true")
+            outcome = "no_response"
+            reason = "customer disconnected after greeting"
+            if first_response_holder.get("event") == "timeout":
+                reason = "no response after greeting"
+            await _save_call_log_if_missing(outcome, reason)
+            ctx.shutdown()
+            return
+
+        await _log("info", "customer_disconnected_after_greeting=false", "false")
+
         # Disable microphone input during the second line to prevent early interruption or Gemini racing
         if hasattr(session, "input") and hasattr(session.input, "set_audio_enabled"):
             try:
@@ -1352,7 +1381,11 @@ async def entrypoint(ctx: agents.JobContext):
         await _log("info", "opening_text_spoken_by_system", str(second_line_ok).lower())
         if not second_line_ok:
             await _log("error", "opening_text_failed_after_first_line", opening_to_speak)
-            await _save_call_log_if_missing("failed", "opening text failed after first line")
+            if not _is_session_running(session):
+                await _log("info", "customer_disconnected_during_second_line=true", "true")
+                await _save_call_log_if_missing("no_response", "customer disconnected during second line")
+            else:
+                await _save_call_log_if_missing("failed", "opening text failed after first line")
             ctx.shutdown()
             return
 
