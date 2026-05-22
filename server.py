@@ -708,13 +708,17 @@ async def api_dispatch_call(req: CallRequest):
     service_type = (req.service_type or "").strip() or "our service"
     requirement = (req.requirement or req.notes or "").strip()
     source = (req.source or "").strip()
-    call_type = (req.call_type or "welcome_call").strip()
+    requested_call_type = (req.call_type or "").strip()
+    call_type = "voice_call"
+    if requested_call_type and requested_call_type != "voice_call":
+        await log_error("server", "old_call_type_ignored_for_voice=true", f"requested_call_type={requested_call_type}", "info")
+    await log_error("server", "effective_voice_prompt_type=voice_call", "voice_call", "info")
     await log_error(
         "server",
         "single_call_payload_received",
         (
             f"phone={phone}; customer_name={customer_name}; business_name={business_name}; "
-            f"service_type={service_type}; source={source}; call_type={call_type}; "
+            f"service_type={service_type}; source={source}; requested_call_type={requested_call_type or 'missing'}; call_type={call_type}; "
             f"requirement_present={str(bool(requirement)).lower()}"
         ),
         "info",
