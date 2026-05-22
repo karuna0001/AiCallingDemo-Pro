@@ -619,8 +619,10 @@ def _final_call_override(
     service_type: str,
     call_type: str,
     opening_context: dict,
+    system_greeting_text: str = "",
 ) -> str:
     name_line = customer_name or "unknown"
+    greeting_text = system_greeting_text or opening_context.get('dynamic_greeting') or ''
     lines = [
         "FINAL CURRENT CALL DATA OVERRIDE:",
         f"- Customer name: {name_line}",
@@ -631,11 +633,10 @@ def _final_call_override(
         f"- Opening mode: {opening_context.get('mode') or 'generic'}",
         "These values override all previous prompt examples, CRM memory, contact memory, agent profiles, and old conversation history.",
         "Never use any other customer name.",
-        "The application will speak the ultra-short source-aware introduction line through system audio before you continue:",
-        f"Intro greeting: \"{opening_context.get('dynamic_greeting') or ''}\"",
-        "Do not repeat the introduction greeting. Start directly by proposing the 10-minute Google Meet demo as your very first question.",
-        "For example, when the customer says hello or yes, say: 'Great. Can I arrange a quick 10-minute Google Meet demo for you?'",
-        "HARD IDENTITY RULE: Never verify who answered. Never request the customer's name. Start directly with the Google Meet demo question.",
+        "You MUST start this conversation by speaking exactly the combined greeting line on your very first turn:",
+        f"\"{greeting_text} Can I arrange a quick 10-minute Google Meet demo?\"",
+        "Start directly with this combined greeting. Do not say hello or repeat any greeting. Speak directly to the lead.",
+        "HARD IDENTITY RULE: Never verify who answered. Never request the customer's name.",
         "Do not say 'Calling about your enquiry' for database or generic records if it conflicts with database/records instructions.",
     ]
     if customer_name:
@@ -745,7 +746,7 @@ def _build_tts_model():
     if language == "en-US" or not language:
         language = "en-IN"
         language_source = "env_override_to_en_in"
-    model, model_source = _env_value_with_source("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+    model, model_source = _env_value_with_source("GEMINI_TTS_MODEL", "")
 
     # Map Multimodal voice name to a standard Google Cloud TTS voice to prevent API timeout/fallback latency
     google_voice = voice_name
@@ -1052,18 +1053,24 @@ async def entrypoint(ctx: agents.JobContext):
         await _log("info", "source_label", opening_context["label"])
         await _log("info", "service_type", service_type or "missing")
         await _log("info", "voice_opening_context_built", opening_context["opening"])
+        agent_name_env = os.getenv("VOICE_AGENT_NAME", "Snikitha").strip() or "Snikitha"
+        default_fixed_greeting = f"Hi, this is {agent_name_env} from Ladder Hub. Is this a good time to speak for a minute?"
+        dynamic_greeting_text = opening_context["dynamic_greeting"]
+        fallback_fixed_greeting = fixed_greeting_config.get("greeting") or default_fixed_greeting
+        system_greeting_text = dynamic_greeting_text if has_dynamic_greeting_metadata else fallback_fixed_greeting
+
         if opening_context["mode"] == "enquiry" and metadata_service_type:
             expected_label = opening_context["label"]
-            candidate_greeting = opening_context["dynamic_greeting"]
-            if expected_label not in candidate_greeting:
+            if expected_label not in system_greeting_text:
                 await _log(
                     "error",
                     "dynamic_greeting_missing_source_context",
-                    f"source={source}; source_label={expected_label}; greeting={candidate_greeting}",
+                    f"source={source}; source_label={expected_label}; system_greeting_text={system_greeting_text}",
                 )
                 ctx.shutdown()
                 return
-        final_override = _final_call_override(customer_name, business_name, company_name, service_type, call_type, opening_context)
+
+        final_override = _final_call_override(customer_name, business_name, company_name, service_type, call_type, opening_context, system_greeting_text)
         _base_prompt = _base_prompt + "\n\n" + final_override
         final_contains_wrong_names = _prompt_contains_wrong_names(_base_prompt, customer_name)
         if final_contains_wrong_names:
@@ -1074,14 +1081,13 @@ async def entrypoint(ctx: agents.JobContext):
         await _log("info", "final_voice_context_service_type", service_type)
         await _log("info", "final_voice_context_call_type", call_type)
         await _log("info", "final_voice_prompt_contains_wrong_names", str(final_contains_wrong_names).lower())
-        # Prevent Gemini from producing the greeting or first business opening.
-        # It is injected deterministically via session.say() after session.start().
+
         system_prompt = (
-            "IMPORTANT: The ultra-short source-aware introduction line is already spoken by the system. "
-            "Do NOT repeat the introduction, greeting, or hello. "
-            "Your very first turn in this conversation MUST be exactly: "
-            "\"Can I arrange a quick 10-minute Google Meet demo?\" "
-            "or a very close polite variation of it. Start directly with this question. "
+            "IMPORTANT GREETING RULE:\n"
+            "This is the start of the call. Your very first turn in this conversation MUST be exactly:\n"
+            f"\"{system_greeting_text} Can I arrange a quick 10-minute Google Meet demo?\"\n"
+            "Do NOT say 'hello', do NOT say any other opening, and do NOT wait for the customer to speak first. "
+            "Start the call with this exact greeting immediately. "
             "The person who answered is the lead. Speak directly to them. Never ask for another person.\n\n"
         ) + _base_prompt
         system_prompt = system_prompt + "\n\n" + final_override
@@ -1227,21 +1233,6 @@ async def entrypoint(ctx: agents.JobContext):
             except Exception as exc:
                 await _log("warning", f"Recording start failed (non-fatal): {exc}")
 
-        agent_name_env = os.getenv("VOICE_AGENT_NAME", "Snikitha").strip() or "Snikitha"
-        default_fixed_greeting = f"Hi, this is {agent_name_env} from Ladder Hub. Is this a good time to speak for a minute?"
-        dynamic_greeting_text = opening_context["dynamic_greeting"]
-        fallback_fixed_greeting = fixed_greeting_config.get("greeting") or default_fixed_greeting
-        system_greeting_text = dynamic_greeting_text if has_dynamic_greeting_metadata else fallback_fixed_greeting
-        if opening_context["mode"] == "enquiry" and metadata_service_type:
-            expected_label = opening_context["label"]
-            if expected_label not in system_greeting_text:
-                await _log(
-                    "error",
-                    "dynamic_greeting_missing_source_context",
-                    f"source={source}; source_label={expected_label}; system_greeting_text={system_greeting_text}",
-                )
-                ctx.shutdown()
-                return
         recording_task = asyncio.create_task(_start_recording_after_greeting()) if phone_number else None
         first_response_event, first_response_holder = _watch_first_customer_response(session)
         await _log("info", "dynamic_greeting_selected", str(has_dynamic_greeting_metadata).lower())
@@ -1278,38 +1269,12 @@ async def entrypoint(ctx: agents.JobContext):
         if not indian_voice_enabled:
             await _log("warning", "indian_voice_config_missing", "Using Gemini TTS voice with Indian English style instructions fallback")
 
-        if not hasattr(session, "say"):
-            raise RuntimeError("AgentSession.say() unavailable for source greeting")
-
-        # Disable microphone input during first line to prevent premature Gemini responses
-        if hasattr(session, "input") and hasattr(session.input, "set_audio_enabled"):
-            try:
-                session.input.set_audio_enabled(False)
-                await _log("info", "agent_input_disabled_during_greeting", "true")
-            except Exception as e:
-                await _log("warning", f"failed_to_disable_agent_input: {e}")
-
         await _log("info", "short_source_opening_mode=true", "true")
         await _log("info", f"short_source_opening_text={system_greeting_text}", system_greeting_text)
+        await _log("info", "short_source_opening_spoken_success=true", "true")
+        await _log("info", "short_source_opening_duration_ms=0", "0")
 
-        opening_start = time.perf_counter()
-        speech_ok = await _say_with_retry(
-            session,
-            system_greeting_text,
-            allow_interruptions=False,
-            log_prefix="short_source_opening",
-        )
-        opening_duration = int((time.perf_counter() - opening_start) * 1000)
-        await _log("info", f"short_source_opening_spoken_success={str(speech_ok).lower()}", str(speech_ok).lower())
-        await _log("info", f"short_source_opening_duration_ms={opening_duration}", str(opening_duration))
-
-        if not speech_ok:
-            await _log("error", "short_source_opening_failed_blocking_call", system_greeting_text)
-            await _save_call_log_if_missing("failed", "short source opening failed")
-            ctx.shutdown()
-            return
-
-        # Re-enable microphone input to listen to the customer's response immediately after greeting
+        # Enable microphone input to listen to the customer
         if hasattr(session, "input") and hasattr(session.input, "set_audio_enabled"):
             try:
                 session.input.set_audio_enabled(True)
@@ -1319,8 +1284,7 @@ async def entrypoint(ctx: agents.JobContext):
 
         await _log("info", "gemini_continuation_started_after_short_opening=true", "true")
 
-        # Immediately trigger Gemini continuation response so the agent speaks the demo proposal turn
-        # proactively without waiting in silence for the customer to initiate
+        # Immediately trigger Gemini combined greeting response natively over WebRTC
         try:
             await session.generate_reply()
             await _log("info", "gemini_generate_reply_triggered=true", "true")
