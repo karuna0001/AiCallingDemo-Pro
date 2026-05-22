@@ -5,6 +5,7 @@ import os
 import re
 import ssl
 import subprocess
+import threading
 import time
 import certifi
 
@@ -36,6 +37,7 @@ load_dotenv(".env", override=False)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("outbound-agent")
 VOICE_FLOW_RUNTIME = "v3_immediate_source_greeting"
+DEFAULT_OUTBOUND_AGENT_NAME = "outbound-caller-v3"
 
 
 class OutboundAssistant(Agent):
@@ -102,6 +104,10 @@ def _agent_runtime_file() -> str:
     return os.path.abspath(__file__)
 
 
+def _outbound_agent_name() -> str:
+    return (os.getenv("OUTBOUND_AGENT_NAME") or DEFAULT_OUTBOUND_AGENT_NAME).strip() or DEFAULT_OUTBOUND_AGENT_NAME
+
+
 async def _log_agent_runtime_fingerprint() -> None:
     version = _deployed_code_version()
     runtime_file = _agent_runtime_file()
@@ -113,19 +119,51 @@ async def _log_agent_runtime_fingerprint() -> None:
 def _log_agent_startup_fingerprint() -> None:
     version = _deployed_code_version()
     runtime_file = _agent_runtime_file()
+    agent_name = _outbound_agent_name()
+    print("agent_worker_starting", flush=True)
+    print(f"agent_code_version={version}", flush=True)
+    print(f"agent_runtime_file={runtime_file}", flush=True)
+    print(f"voice_flow_runtime={VOICE_FLOW_RUNTIME}", flush=True)
+    print(f"outbound_agent_name={agent_name}", flush=True)
+    logger.info("agent_worker_starting")
     logger.info("agent_code_version=%s", version)
     logger.info("agent_runtime_file=%s", runtime_file)
     logger.info("voice_flow_runtime=%s", VOICE_FLOW_RUNTIME)
+    logger.info("outbound_agent_name=%s", agent_name)
 
     async def _write() -> None:
+        await log_error("agent", "agent_worker_starting", f"agent_name={agent_name}", "info")
         await log_error("agent", f"agent_code_version={version}", version, "info")
         await log_error("agent", f"agent_runtime_file={runtime_file}", runtime_file, "info")
         await log_error("agent", f"voice_flow_runtime={VOICE_FLOW_RUNTIME}", VOICE_FLOW_RUNTIME, "info")
+        await log_error("agent", f"outbound_agent_name={agent_name}", agent_name, "info")
 
     try:
         asyncio.run(_write())
     except Exception as exc:
         logger.warning("agent_startup_fingerprint_log_failed %s", exc)
+
+
+def _start_agent_heartbeat_thread() -> None:
+    async def _heartbeat_loop() -> None:
+        while True:
+            try:
+                detail = (
+                    f"voice_flow_runtime={VOICE_FLOW_RUNTIME}; "
+                    f"agent_name={_outbound_agent_name()}; "
+                    f"agent_code_version={_deployed_code_version()}; "
+                    f"agent_runtime_file={_agent_runtime_file()}"
+                )
+                logger.info("agent_worker_heartbeat %s", detail)
+                await log_error("agent", "agent_worker_heartbeat", detail, "info")
+            except Exception as exc:
+                logger.warning("agent_worker_heartbeat_failed %s", exc)
+            await asyncio.sleep(60)
+
+    def _run() -> None:
+        asyncio.run(_heartbeat_loop())
+
+    threading.Thread(target=_run, name="agent-worker-heartbeat", daemon=True).start()
 
 
 def _is_sip_busy_error(exc: Exception) -> bool:
@@ -798,6 +836,7 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
 
 async def entrypoint(ctx: agents.JobContext):
     call_started_at = time.perf_counter()
+    await _log("info", f"outbound_agent_name={_outbound_agent_name()}", _outbound_agent_name())
     await _log_agent_runtime_fingerprint()
     await _log("info", "deployed_code_version", _deployed_code_version())
     await _log("info", "voice_flow_version", VOICE_FLOW_RUNTIME)
@@ -1255,4 +1294,5 @@ if __name__ == "__main__":
     init_db()
     load_db_settings_to_env()
     _log_agent_startup_fingerprint()
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name="outbound-caller"))
+    _start_agent_heartbeat_thread()
+    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name=_outbound_agent_name()))

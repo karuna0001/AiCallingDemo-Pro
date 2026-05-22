@@ -94,6 +94,8 @@ from whatsapp import (
 load_dotenv(".env", override=False)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("server")
+VOICE_FLOW_RUNTIME = "v3_immediate_source_greeting"
+DEFAULT_OUTBOUND_AGENT_NAME = "outbound-caller-v3"
 
 
 def _deployed_code_version() -> str:
@@ -113,6 +115,10 @@ def _deployed_code_version() -> str:
     except Exception:
         pass
     return "unknown"
+
+
+def _outbound_agent_name() -> str:
+    return (os.getenv("OUTBOUND_AGENT_NAME") or DEFAULT_OUTBOUND_AGENT_NAME).strip() or DEFAULT_OUTBOUND_AGENT_NAME
 
 init_db()
 
@@ -672,6 +678,7 @@ async def serve_dashboard():
 
 @app.post("/api/call")
 async def api_dispatch_call(req: CallRequest):
+    await log_error("server", "single_call_route_entered", "endpoint=/api/call", "info")
     # ── Outbound calling-window guard ──────────────────────────────────────
     if not await _is_outbound_allowed():
         raise HTTPException(403, await _outbound_window_error())
@@ -767,7 +774,9 @@ async def api_dispatch_call(req: CallRequest):
         except TypeError:
             room_req = lk_api.CreateRoomRequest(**room_kwargs)
         await lk.room.create_room(room_req)
-        await lk.agent_dispatch.create_dispatch(lk_api.CreateAgentDispatchRequest(agent_name="outbound-caller", room=room_name, metadata=json.dumps(metadata)))
+        agent_name = _outbound_agent_name()
+        await log_error("server", "livekit_agent_dispatch_name", agent_name, "info")
+        await lk.agent_dispatch.create_dispatch(lk_api.CreateAgentDispatchRequest(agent_name=agent_name, room=room_name, metadata=json.dumps(metadata)))
         await lk.aclose()
         await session.close()
         await log_error("server", f"Call dispatched to {phone}", f"room={room_name}", "info")
@@ -2056,6 +2065,65 @@ async def api_get_logs(limit: int = 200, level: Optional[str] = None, source: Op
     return await get_logs(level=level, source=source, limit=limit)
 
 
+@app.get("/api/agent-runtime-health")
+async def api_agent_runtime_health():
+    logs = await get_logs(source="agent", limit=500)
+    expected_agent_name = _outbound_agent_name()
+
+    def _timestamp_age_seconds(row: Optional[dict]) -> Optional[int]:
+        if not row:
+            return None
+        raw = str(row.get("timestamp") or "").strip()
+        if not raw:
+            return None
+        try:
+            ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+            return max(0, int((datetime.now() - ts).total_seconds()))
+        except Exception:
+            return None
+
+    heartbeat = next(
+        (
+            row for row in logs
+            if row.get("message") == "agent_worker_heartbeat"
+            and VOICE_FLOW_RUNTIME in str(row.get("detail") or "")
+        ),
+        None,
+    )
+    startup = next(
+        (
+            row for row in logs
+            if row.get("message") == "agent_worker_starting"
+            or str(row.get("message") or "").startswith("voice_flow_runtime=")
+        ),
+        None,
+    )
+    latest_agent_log = logs[0] if logs else None
+    heartbeat_age_seconds = _timestamp_age_seconds(heartbeat)
+    worker_heartbeat_seen = heartbeat is not None
+    worker_heartbeat_fresh = heartbeat_age_seconds is not None and heartbeat_age_seconds <= 180
+    if not worker_heartbeat_seen:
+        diagnosis = "worker heartbeat missing: agent.py is not running or cannot write error_logs"
+    elif not worker_heartbeat_fresh:
+        diagnosis = "worker heartbeat stale: agent.py started but heartbeat stopped"
+    else:
+        diagnosis = "worker heartbeat fresh: if per-call logs are missing, LiveKit is routing calls to another worker/agent name"
+    return {
+        "worker_heartbeat_seen": worker_heartbeat_seen,
+        "worker_heartbeat_fresh": worker_heartbeat_fresh,
+        "heartbeat_age_seconds": heartbeat_age_seconds,
+        "expected_voice_flow_runtime": VOICE_FLOW_RUNTIME,
+        "expected_agent_name": expected_agent_name,
+        "startup_log_seen": startup is not None,
+        "latest_heartbeat": heartbeat,
+        "latest_startup_log": startup,
+        "latest_agent_log": latest_agent_log,
+        "diagnosis": diagnosis,
+    }
+
+
 @app.delete("/api/logs")
 async def api_clear_logs():
     await clear_errors()
@@ -3193,7 +3261,9 @@ async def _dispatch_one(lk, lk_api, contact: dict, room_name: str, prompt: Optio
         except TypeError:
             room_req = lk_api.CreateRoomRequest(**room_kwargs)
         await lk.room.create_room(room_req)
-        await lk.agent_dispatch.create_dispatch(lk_api.CreateAgentDispatchRequest(agent_name="outbound-caller", room=room_name, metadata=json.dumps(metadata)))
+        agent_name = _outbound_agent_name()
+        await log_error("server", "livekit_agent_dispatch_name", agent_name, "info")
+        await lk.agent_dispatch.create_dispatch(lk_api.CreateAgentDispatchRequest(agent_name=agent_name, room=room_name, metadata=json.dumps(metadata)))
         return True
     except Exception as exc:
         logger.error("Campaign dispatch error for %s: %s", contact.get("phone"), exc)
