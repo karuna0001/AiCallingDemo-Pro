@@ -92,6 +92,7 @@ class AppointmentTools(llm.ToolContext):
                 recording_size_bytes=self.recording_size_bytes,
             )
             self.call_logged = True
+            await _log("call_log_save_success", f"phone={self.phone_number or 'unknown'}; outcome={outcome}; duration_seconds={duration}")
         except Exception as exc:
             logger.error("Failed to log call: %s", exc)
         # Give Gemini ~1.5s to finish speaking the goodbye line before we tear down.

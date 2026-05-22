@@ -35,6 +35,7 @@ from tools import AppointmentTools
 load_dotenv(".env", override=False)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("outbound-agent")
+VOICE_FLOW_RUNTIME = "v3_immediate_source_greeting"
 
 
 class OutboundAssistant(Agent):
@@ -95,6 +96,36 @@ def _deployed_code_version() -> str:
     except Exception:
         pass
     return "unknown"
+
+
+def _agent_runtime_file() -> str:
+    return os.path.abspath(__file__)
+
+
+async def _log_agent_runtime_fingerprint() -> None:
+    version = _deployed_code_version()
+    runtime_file = _agent_runtime_file()
+    await _log("info", f"agent_code_version={version}", version)
+    await _log("info", f"agent_runtime_file={runtime_file}", runtime_file)
+    await _log("info", f"voice_flow_runtime={VOICE_FLOW_RUNTIME}", VOICE_FLOW_RUNTIME)
+
+
+def _log_agent_startup_fingerprint() -> None:
+    version = _deployed_code_version()
+    runtime_file = _agent_runtime_file()
+    logger.info("agent_code_version=%s", version)
+    logger.info("agent_runtime_file=%s", runtime_file)
+    logger.info("voice_flow_runtime=%s", VOICE_FLOW_RUNTIME)
+
+    async def _write() -> None:
+        await log_error("agent", f"agent_code_version={version}", version, "info")
+        await log_error("agent", f"agent_runtime_file={runtime_file}", runtime_file, "info")
+        await log_error("agent", f"voice_flow_runtime={VOICE_FLOW_RUNTIME}", VOICE_FLOW_RUNTIME, "info")
+
+    try:
+        asyncio.run(_write())
+    except Exception as exc:
+        logger.warning("agent_startup_fingerprint_log_failed %s", exc)
 
 
 def _is_sip_busy_error(exc: Exception) -> bool:
@@ -767,8 +798,9 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
 
 async def entrypoint(ctx: agents.JobContext):
     call_started_at = time.perf_counter()
+    await _log_agent_runtime_fingerprint()
     await _log("info", "deployed_code_version", _deployed_code_version())
-    await _log("info", "voice_flow_version", "v2_deterministic_indian")
+    await _log("info", "voice_flow_version", VOICE_FLOW_RUNTIME)
     await _log("info", "outbound_call_started", f"room={getattr(ctx.room, 'name', '')}")
     metadata = {}
     raw_job_metadata = getattr(ctx.job, "metadata", "") or ""
@@ -1070,6 +1102,7 @@ async def entrypoint(ctx: agents.JobContext):
                 recording_size_bytes=tool_ctx.recording_size_bytes,
             )
             tool_ctx.call_logged = True
+            await _log("info", "call_log_save_success", f"phone={phone_number}; outcome={outcome}; duration_seconds={duration}")
             await _log("info", "call_log_saved_on_disconnect", f"phone={phone_number}; outcome={outcome}; duration_seconds={duration}")
         except Exception as exc:
             await _log("error", "call_log_save_on_disconnect_failed", str(exc))
@@ -1221,4 +1254,5 @@ async def entrypoint(ctx: agents.JobContext):
 if __name__ == "__main__":
     init_db()
     load_db_settings_to_env()
+    _log_agent_startup_fingerprint()
     agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name="outbound-caller"))
