@@ -640,11 +640,10 @@ def _final_call_override(
         f"- Opening mode: {opening_context.get('mode') or 'generic'}",
         "These values override all previous prompt examples, CRM memory, contact memory, agent profiles, and old conversation history.",
         "Never use any other customer name.",
-        "The application will speak the source-aware greeting and demo line through system audio before you continue:",
-        f"Source-aware greeting: \"{opening_context.get('dynamic_greeting') or ''}\"",
-        f"\"{opening_context.get('opening') or ''}\"",
-        "Do not repeat the greeting. Do not repeat the demo line. Do not replace it with any other first-business question.",
-        "After the system has spoken that opening line, continue from the customer's next response.",
+        "The application will speak the combined source-aware greeting and demo request through system audio before you continue:",
+        f"Combined greeting: \"{opening_context.get('dynamic_greeting') or ''}\"",
+        "Do not repeat the combined greeting. Do not repeat the demo question. Do not replace it with any other first-business question.",
+        "After the system has spoken that combined line, continue from the customer's next response.",
         "HARD IDENTITY RULE: Never verify who answered. Never request the customer's name. Start directly with enquiry/source/demo context.",
         "Do not say 'we received your enquiry' for database or generic record sources.",
         "Do not hardcode Facebook; only mention Facebook when the current source label is Facebook.",
@@ -1076,14 +1075,13 @@ async def entrypoint(ctx: agents.JobContext):
         await _log("info", "final_voice_context_service_type", service_type)
         await _log("info", "final_voice_context_call_type", call_type)
         await _log("info", "final_voice_prompt_contains_wrong_names", str(final_contains_wrong_names).lower())
-        # Prevent Gemini from producing the greeting or first business opening.
-        # Both are injected deterministically via session.say() after session.start().
+        # Prevent Gemini from producing the combined greeting or first business opening.
+        # It is injected deterministically via session.say() after session.start().
         system_prompt = (
-            "IMPORTANT: The source-aware greeting and demo line are already handled by the system. "
-            "Do NOT speak first. Do NOT generate an opening greeting. "
-            "Do NOT respond to the customer's first reply after the source-aware greeting. "
-            "Do NOT repeat the source reminder or demo line. Continue only after the system demo line has been spoken "
-            "and the customer responds again. "
+            "IMPORTANT: The combined source-aware greeting and demo question are already handled by the system. "
+            "Do NOT speak first. Do NOT generate an opening greeting or introduction. "
+            "Do NOT repeat the source reminder or demo line. Continue only after the combined system line has been spoken "
+            "and the customer responds to the demo request. "
             "The person who answered is the lead. Speak directly to them. Never ask for another person.\n\n"
         ) + _base_prompt
         system_prompt = system_prompt + "\n\n" + final_override
@@ -1294,23 +1292,20 @@ async def entrypoint(ctx: agents.JobContext):
             except Exception as e:
                 await _log("warning", f"failed_to_disable_agent_input: {e}")
 
-        await _log("info", f"system_first_line_about_to_speak={system_greeting_text}", system_greeting_text)
-        await _log("info", "first_line_allow_interruptions=false", "false")
-        first_line_ok = await _say_with_retry(
+        await _log("info", "combined_opening_mode=true", "true")
+        await _log("info", f"combined_opening_text={system_greeting_text}", system_greeting_text)
+
+        combined_ok = await _say_with_retry(
             session,
             system_greeting_text,
             allow_interruptions=False,
-            log_prefix="system_first_line",
+            log_prefix="combined_opening",
         )
-        await _log("info", f"system_first_line_spoken_success={str(first_line_ok).lower()}", str(first_line_ok).lower())
-        if first_line_ok:
-            await _log("info", "first_line_audio_sent_after_warmup=true", "true")
-        await _log("info", f"opening_text_allowed_after_first_line={str(first_line_ok).lower()}", str(first_line_ok).lower())
-        await _log("info", "dynamic_greeting_spoken_by_system", str(first_line_ok).lower())
+        await _log("info", f"combined_opening_spoken_success={str(combined_ok).lower()}", str(combined_ok).lower())
 
-        if not first_line_ok:
-            await _log("error", "system_first_line_failed_blocking_call", system_greeting_text)
-            await _save_call_log_if_missing("failed", "system first line failed")
+        if not combined_ok:
+            await _log("error", "combined_opening_failed_blocking_call", system_greeting_text)
+            await _save_call_log_if_missing("failed", "combined opening failed")
             ctx.shutdown()
             return
 
@@ -1318,90 +1313,11 @@ async def entrypoint(ctx: agents.JobContext):
         if hasattr(session, "input") and hasattr(session.input, "set_audio_enabled"):
             try:
                 session.input.set_audio_enabled(True)
-                await _log("info", "agent_input_enabled_waiting_for_response", "true")
+                await _log("info", "agent_input_enabled_after_combined_opening=true", "true")
             except Exception as e:
                 await _log("warning", f"failed_to_enable_agent_input: {e}")
 
-        await _log("info", f"opening_response_wait_seconds={OPENING_RESPONSE_WAIT_SECONDS}", str(OPENING_RESPONSE_WAIT_SECONDS))
-        try:
-            await asyncio.wait_for(first_response_event.wait(), timeout=OPENING_RESPONSE_WAIT_SECONDS)
-        except asyncio.TimeoutError:
-            first_response_holder["event"] = first_response_holder.get("event") or "timeout"
-            await _log("info", "no_response_after_greeting_continue=true", "true")
-
-        first_response = first_response_holder.get("text", "")
-        first_response_intent = _customer_response_intent(first_response)
-        await _log(
-            "info",
-            "opening_text_customer_response",
-            f"intent={first_response_intent}; event={first_response_holder.get('event') or 'timeout'}; text={first_response}",
-        )
-
-        if first_response_intent == "busy":
-            opening_to_speak = "No problem. When is a good time to call back?"
-            opening_mode = "busy"
-        elif first_response_intent == "refusal":
-            opening_to_speak = "No worries at all. Thank you for your time."
-            opening_mode = "refusal"
-        else:
-            opening_to_speak = opening_text
-            opening_mode = "demo"
-
-        # Check if the session is still running before speaking the second line
-        session_running = _is_session_running(session)
-        await _log("info", f"session_running_before_second_line={str(session_running).lower()}", str(session_running).lower())
-
-        if not session_running:
-            await _log("info", "customer_disconnected_after_greeting=true", "true")
-            outcome = "no_response"
-            reason = "customer disconnected after greeting"
-            if first_response_holder.get("event") == "timeout":
-                reason = "no response after greeting"
-            await _save_call_log_if_missing(outcome, reason)
-            ctx.shutdown()
-            return
-
-        await _log("info", "customer_disconnected_after_greeting=false", "false")
-
-        # Disable microphone input during the second line to prevent early interruption or Gemini racing
-        if hasattr(session, "input") and hasattr(session.input, "set_audio_enabled"):
-            try:
-                session.input.set_audio_enabled(False)
-                await _log("info", "agent_input_disabled_during_second_line", "true")
-            except Exception as e:
-                await _log("warning", f"failed_to_disable_agent_input_second_line: {e}")
-
-        await _log("info", "opening_text_start_requested", opening_to_speak)
-        second_line_ok = await _say_with_retry(
-            session,
-            opening_to_speak,
-            allow_interruptions=False,
-            log_prefix="opening_text",
-        )
-        await _log("info", "opening_text_spoken_by_system", str(second_line_ok).lower())
-        if not second_line_ok:
-            await _log("error", "opening_text_failed_after_first_line", opening_to_speak)
-            if not _is_session_running(session):
-                await _log("info", "customer_disconnected_during_second_line=true", "true")
-                await _save_call_log_if_missing("no_response", "customer disconnected during second line")
-            else:
-                await _save_call_log_if_missing("failed", "opening text failed after first line")
-            ctx.shutdown()
-            return
-
-        # Re-enable microphone input to allow the normal Gemini flow to proceed
-        if hasattr(session, "input") and hasattr(session.input, "set_audio_enabled"):
-            try:
-                session.input.set_audio_enabled(True)
-                await _log("info", "agent_input_enabled_gemini_continuation", "true")
-            except Exception as e:
-                await _log("warning", f"failed_to_enable_agent_input_continuation: {e}")
-
-        await _log("info", "gemini_continuation_started_after_system_lines=true", "true")
-        if opening_mode == "refusal":
-            await _save_call_log_if_missing("not_interested", "customer refused after greeting")
-            ctx.shutdown()
-            return
+        await _log("info", "gemini_continuation_started_after_combined_opening=true", "true")
 
         if phone_number:
             sip_identity = f"sip_{phone_number}"
