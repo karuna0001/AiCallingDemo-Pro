@@ -1124,7 +1124,8 @@ async def entrypoint(ctx: agents.JobContext):
                 "{customer_name}": customer_name or "there",
                 "{lead_name}": lead_name or "there",
                 "{service_type}": service_type or "AI voice calling",
-                "{source}": source or "records",
+                "{service}": service_type or "AI voice calling",
+                "{source}": opening_context.get("label") or source or "records",
                 "{source_phrase}": opening_context.get("label") or "records",
             }
             for k, v in replacements.items():
