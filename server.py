@@ -240,6 +240,7 @@ async def _startup():
     logger.info("deployed_code_version=%s", version)
     try:
         await log_error("server", "deployed_code_version", version, "info")
+        await log_error("server", "voice_flow_version", "v2_deterministic_indian", "info")
     except Exception:
         pass
     if _scheduler:

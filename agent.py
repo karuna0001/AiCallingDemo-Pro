@@ -112,6 +112,13 @@ def _first_text(*values, default: str = "") -> str:
     return default
 
 
+def _env_value_with_source(key: str, default: str = "") -> tuple[str, str]:
+    value = os.getenv(key)
+    if value:
+        return value, "env"
+    return default, "default"
+
+
 _TRUTHY = {"1", "true", "yes", "on", "enabled", "fixed"}
 _FALSEY = {"0", "false", "no", "off", "disabled"}
 _AI_GREETING_MODES = {"ai", "auto", "autonomous", "dynamic", "gemini", "model"}
@@ -129,6 +136,10 @@ _SELECTED_TTS_CONFIG = {
     "voice": _DEFAULT_GEMINI_TTS_VOICE,
     "language": _DEFAULT_TTS_LANGUAGE,
     "style_applied": False,
+    "attached_to_session": False,
+    "voice_env_source": "default",
+    "model_env_source": "default",
+    "language_env_source": "default",
 }
 _STALE_SAMPLE_NAMES = ("Prasanth", "Prashanth", "Ramesh", "Sample Lead", "Suresh", "Test Lead", "Unknown Lead")
 _IDENTITY_BAN_PATTERNS = (
@@ -605,18 +616,22 @@ def _build_realtime_model(system_prompt: str):
 
 def _build_tts_model():
     global _SELECTED_TTS_CONFIG
+    voice_name, voice_source = _env_value_with_source("GEMINI_TTS_VOICE", _DEFAULT_GEMINI_TTS_VOICE)
+    language, language_source = _env_value_with_source("GEMINI_TTS_LANGUAGE", _DEFAULT_TTS_LANGUAGE)
+    model, model_source = _env_value_with_source("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
     if not _google_tts:
         _SELECTED_TTS_CONFIG = {
             "provider": "livekit.plugins.google",
             "model": "unavailable",
-            "voice": os.getenv("GEMINI_TTS_VOICE", _DEFAULT_GEMINI_TTS_VOICE),
-            "language": os.getenv("GEMINI_TTS_LANGUAGE", _DEFAULT_TTS_LANGUAGE),
+            "voice": voice_name,
+            "language": language,
             "style_applied": False,
+            "attached_to_session": False,
+            "voice_env_source": voice_source,
+            "model_env_source": model_source,
+            "language_env_source": language_source,
         }
         return None
-    voice_name = os.getenv("GEMINI_TTS_VOICE", _DEFAULT_GEMINI_TTS_VOICE)
-    language = os.getenv("GEMINI_TTS_LANGUAGE", _DEFAULT_TTS_LANGUAGE)
-    model = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
     attempts = (
         {"model": model, "voice_name": voice_name, "language": language, "instructions": _TTS_STYLE_INSTRUCTIONS},
         {"model": model, "voice_name": voice_name, "instructions": _TTS_STYLE_INSTRUCTIONS},
@@ -634,6 +649,10 @@ def _build_tts_model():
                 "voice": kwargs.get("voice_name", voice_name),
                 "language": kwargs.get("language", language),
                 "style_applied": bool(kwargs.get("instructions")),
+                "attached_to_session": False,
+                "voice_env_source": voice_source,
+                "model_env_source": model_source,
+                "language_env_source": language_source,
             }
             return tts
         except TypeError as exc:
@@ -646,6 +665,10 @@ def _build_tts_model():
         "voice": voice_name,
         "language": language,
         "style_applied": False,
+        "attached_to_session": False,
+        "voice_env_source": voice_source,
+        "model_env_source": model_source,
+        "language_env_source": language_source,
     }
     return _google_tts(voice_name=voice_name)
 
@@ -660,30 +683,38 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
         else:
             logger.warning("Google TTS unavailable; deterministic system greeting session.say() may not be able to speak")
         try:
-            return AgentSession(llm=realtime_model, **realtime_kwargs)
+            session = AgentSession(llm=realtime_model, **realtime_kwargs)
+            _SELECTED_TTS_CONFIG["attached_to_session"] = bool(tts_model)
+            return session
         except TypeError as exc:
             if "tts" not in str(exc).lower():
                 raise
             logger.warning("AgentSession rejected TTS with realtime llm argument: %s", exc)
         try:
-            return AgentSession(realtime_model=realtime_model, **realtime_kwargs)
+            session = AgentSession(realtime_model=realtime_model, **realtime_kwargs)
+            _SELECTED_TTS_CONFIG["attached_to_session"] = bool(tts_model)
+            return session
         except TypeError as exc:
             if "tts" not in str(exc).lower():
                 raise
             logger.warning("AgentSession rejected TTS with realtime_model argument: %s", exc)
+        _SELECTED_TTS_CONFIG["provider"] = "livekit.plugins.google.realtime"
+        _SELECTED_TTS_CONFIG["attached_to_session"] = False
         try:
             return AgentSession(llm=realtime_model, tools=tools)
         except TypeError:
             return AgentSession(realtime_model=realtime_model, tools=tools)
     if not (_google_llm and _google_tts and _deepgram_stt):
         raise RuntimeError("Gemini Live unavailable and pipeline fallback plugins are incomplete")
-    return AgentSession(
+    session = AgentSession(
         vad=silero.VAD.load(),
         stt=_deepgram_stt(model="nova-2", language="en"),
         llm=_google_llm(model="gemini-2.0-flash"),
         tts=_build_tts_model(),
         tools=tools,
     )
+    _SELECTED_TTS_CONFIG["attached_to_session"] = True
+    return session
 
 
 async def entrypoint(ctx: agents.JobContext):
@@ -736,6 +767,7 @@ async def entrypoint(ctx: agents.JobContext):
     await _log("info", "agent_context_customer_name", customer_name or "missing")
     await _log("info", "agent_context_business_name", business_name)
     await _log("info", "agent_context_service_type", service_type)
+    await _log("info", "agent_context_source", source or "missing")
     await _log("info", "agent_context_call_type", call_type)
 
     if metadata.get("voice_override"):
@@ -822,6 +854,18 @@ async def entrypoint(ctx: agents.JobContext):
     await _log("info", "dynamic_greeting_text_built", opening_context["dynamic_greeting"])
     await _log("info", "voice_opening_text_built", opening_context["opening"])
     await _log("info", "voice_opening_context_built", opening_context["opening"])
+    if opening_context["mode"] == "enquiry" and metadata_service_type:
+        expected_label = opening_context["label"]
+        expected_service = service_type
+        candidate_greeting = opening_context["dynamic_greeting"]
+        if expected_label not in candidate_greeting or expected_service not in candidate_greeting:
+            await _log(
+                "error",
+                "dynamic_greeting_missing_source_context",
+                f"source={source}; source_label={expected_label}; service_type={expected_service}; greeting={candidate_greeting}",
+            )
+            ctx.shutdown()
+            return
     final_override = _final_call_override(customer_name, business_name, company_name, service_type, call_type, opening_context)
     _base_prompt = _base_prompt + "\n\n" + final_override
     final_contains_wrong_names = _prompt_contains_wrong_names(_base_prompt, customer_name)
@@ -950,6 +994,17 @@ async def entrypoint(ctx: agents.JobContext):
     dynamic_greeting_text = opening_context["dynamic_greeting"]
     fallback_fixed_greeting = fixed_greeting_config.get("greeting") or _DEFAULT_FIXED_GREETING
     system_greeting_text = dynamic_greeting_text if has_dynamic_greeting_metadata else fallback_fixed_greeting
+    if opening_context["mode"] == "enquiry" and metadata_service_type:
+        expected_label = opening_context["label"]
+        expected_service = service_type
+        if expected_label not in system_greeting_text or expected_service not in system_greeting_text:
+            await _log(
+                "error",
+                "dynamic_greeting_missing_source_context",
+                f"source={source}; source_label={expected_label}; service_type={expected_service}; system_greeting_text={system_greeting_text}",
+            )
+            ctx.shutdown()
+            return
     active_model = os.getenv("GEMINI_MODEL", "")
     recording_task = asyncio.create_task(_start_recording_after_greeting()) if phone_number else None
     first_response_event, first_response_holder = _watch_first_customer_response(session)
@@ -972,6 +1027,16 @@ async def entrypoint(ctx: agents.JobContext):
     await _log("info", "tts_voice_selected", tts_voice)
     await _log("info", "tts_language_selected", tts_language)
     await _log("info", "tts_style_instructions_applied", str(bool(tts_config.get("style_applied"))).lower())
+    await _log("info", "tts_attached_to_session", str(bool(tts_config.get("attached_to_session"))).lower())
+    await _log(
+        "info",
+        "tts_env_override_sources",
+        (
+            f"voice={tts_config.get('voice_env_source') or 'default'}; "
+            f"model={tts_config.get('model_env_source') or 'default'}; "
+            f"language={tts_config.get('language_env_source') or 'default'}"
+        ),
+    )
     await _log("info", "indian_voice_enabled", str(indian_voice_enabled).lower())
     if not indian_voice_enabled:
         await _log("warning", "indian_voice_config_missing", "Using Gemini TTS voice with Indian English style instructions fallback")

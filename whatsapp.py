@@ -1214,6 +1214,8 @@ async def _schedule_or_start_call(
 
     Returns: 'scheduled' | 'queued' | 'dispatched' | 'skipped_no_livekit'
     """
+    contact = {**(contact or {}), "source": (contact or {}).get("source") or source}
+
     def done(call_status: str, action_id: Optional[str] = None, next_allowed_at=None, skip_reason: str = "", error: str = ""):
         if return_details:
             return {
@@ -1436,8 +1438,9 @@ async def run_due_automation_actions() -> dict:
             if action_type == "call_only":
                 rule = payload.get("rule") or {}
                 call_type = payload.get("call_type") or "welcome_call"
-                contact = {k: payload.get(k, "") for k in ("phone", "lead_name", "business_name", "service_type")}
+                contact = {k: payload.get(k, "") for k in ("phone", "lead_name", "business_name", "service_type", "source")}
                 contact["phone"] = phone
+                contact["source"] = contact.get("source") or source
                 call_status = await _schedule_or_start_call(
                     phone, contact, call_type, event_type, source, delay_minutes=0, rule=rule,
                     fallback_action=payload.get("fallback_action"),
@@ -3083,11 +3086,12 @@ async def _promote_waiting_for_reply_calls(phone: str) -> int:
                     payload = _json.loads(raw_payload or "{}")
                 except Exception:
                     pass
-            contact = {k: payload.get(k, "") for k in ("phone", "lead_name", "business_name", "service_type")}
-            contact["phone"] = phone
             call_type = payload.get("call_type") or "welcome_call"
             event_type = row.get("event_type") or ""
             source = row.get("source") or ""
+            contact = {k: payload.get(k, "") for k in ("phone", "lead_name", "business_name", "service_type", "source")}
+            contact["phone"] = phone
+            contact["source"] = contact.get("source") or source
             rule = payload.get("rule") or {}
 
             call_status = await _schedule_or_start_call(
