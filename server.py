@@ -594,7 +594,6 @@ async def api_health():
     trunk_id = await status_value("OUTBOUND_TRUNK_ID")
     gemini_model = await status_value("GEMINI_MODEL")
     gemini_voice = await status_value("GEMINI_TTS_VOICE")
-    prompt_saved = await status_value("SYSTEM_PROMPT", "system_prompt")
     s3_key = await status_value("S3_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")
     s3_secret = await status_value("S3_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY")
     s3_bucket = await status_value("S3_BUCKET", "AWS_BUCKET_NAME")
@@ -624,37 +623,10 @@ async def api_health():
     except ValueError:
         recording_retention_days = 7
     whatsapp_gemini_model = await get_whatsapp_gemini_model()
-    whatsapp_chat_prompt = (
-        await get_setting("AI_PROMPT_whatsapp_chat", "")
-        or await get_setting("AI_PROMPT_whatsapp_chat_prompt", "")
-        or get_default_prompt("whatsapp_chat")
-    )
-    active_prompt_types = []
-    for pt, _label, _default in PROMPT_TYPES:
-        saved = await get_setting(_AI_PROMPT_KEY.format(pt), "")
-        alias_saved = ""
-        for alias, canonical in _PROMPT_TYPE_ALIASES.items():
-            if canonical == pt:
-                alias_saved = alias_saved or await get_setting(_AI_PROMPT_KEY.format(alias), "")
-        if saved or alias_saved:
-            active_prompt_types.append(pt)
-    legacy_prompt_saved = await get_setting("system_prompt", "") or prompt_saved
-    default_agent_profile_prompt = ""
-    try:
-        for profile in await get_all_agent_profiles():
-            if profile.get("is_default") and (profile.get("system_prompt") or "").strip():
-                default_agent_profile_prompt = profile.get("system_prompt") or ""
-                break
-    except Exception:
-        default_agent_profile_prompt = ""
-    if default_agent_profile_prompt:
-        prompt_mode = "agent_profile"
-    elif active_prompt_types:
-        prompt_mode = "call_type"
-    elif legacy_prompt_saved:
-        prompt_mode = "legacy"
-    else:
-        prompt_mode = "default"
+    voice_call_prompt = await get_setting("AI_PROMPT_voice_call", "")
+    whatsapp_chat_prompt = await get_setting("AI_PROMPT_whatsapp_chat", "")
+    active_prompt_types = ["voice_call", "whatsapp_chat"]
+    prompt_mode = "simple"
     supabase_configured, supabase_error = await supabase_status(supabase_url, supabase_key)
     response = {
         "status": "ok",
@@ -664,10 +636,11 @@ async def api_health():
         "trunk_configured": bool(trunk_id),
         "gemini_model_configured": bool(gemini_model),
         "gemini_tts_voice_configured": bool(gemini_voice),
-        "prompt_configured": bool(default_agent_profile_prompt or active_prompt_types or legacy_prompt_saved),
+        "prompt_configured": bool(voice_call_prompt or whatsapp_chat_prompt),
         "prompt_mode": prompt_mode,
         "active_prompt_types": active_prompt_types,
-        "default_prompt_used": prompt_mode == "default",
+        "default_prompt_used": not bool(voice_call_prompt and whatsapp_chat_prompt),
+        "voice_call_prompt_configured": bool(voice_call_prompt),
         "whatsapp_ai_provider": "gemini",
         "whatsapp_gemini_model": whatsapp_gemini_model,
         "whatsapp_gemini_model_configured": bool(whatsapp_gemini_model),

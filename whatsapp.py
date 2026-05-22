@@ -1409,6 +1409,10 @@ async def run_due_automation_actions() -> dict:
         logger.debug("run_due_automation_actions fetch failed: %s", exc)
         return {"processed": 0, "error": str(exc)}
 
+    if not due:
+        await _db().log_error("automation", "automation_queue_empty", "automation_queue_empty=true", "info")
+        return {"processed": 0, "total_due": 0, "automation_queue_empty": True}
+
     processed = 0
     for action in due:
         action_id = action.get("id", "")
