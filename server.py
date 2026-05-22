@@ -715,13 +715,8 @@ async def api_dispatch_call(req: CallRequest):
 
     await log_error("server", "prompt_resolution_started", f"phone={phone}; call_type=voice_call", "info")
     await log_error("server", "prompt_type_requested", "voice_call", "info")
-    effective_voice = effective_model = effective_tools = None
     if req.agent_profile_id:
-        profile = await get_agent_profile(req.agent_profile_id)
-        if profile:
-            effective_voice = profile.get("voice")
-            effective_model = profile.get("model")
-            effective_tools = profile.get("enabled_tools")
+        await log_error("server", "agent_profile_prompt_ignored_for_voice", f"agent_profile_id={req.agent_profile_id}", "info")
     effective_prompt, prompt_meta = await resolve_voice_call_prompt_with_meta(
         lead_name=lead_name,
         business_name=business_name,
@@ -749,12 +744,6 @@ async def api_dispatch_call(req: CallRequest):
         "prompt_mode_selected": prompt_meta.get("prompt_mode_selected", ""),
         "prompt_default_used": str(prompt_meta.get("prompt_default_used", False)).lower(),
     }
-    if effective_voice:
-        metadata["voice_override"] = effective_voice
-    if effective_model:
-        metadata["model_override"] = effective_model
-    if effective_tools:
-        metadata["tools_override"] = effective_tools
     await log_error(
         "server",
         "outbound_metadata_prepared",
@@ -1179,6 +1168,11 @@ async def api_reset_prompt():
 _AI_PROMPT_KEY = "AI_PROMPT_{}"
 _AI_PROMPT_DEFAULT_TYPE_KEY = "AI_PROMPT_DEFAULT_TYPE"
 _VALID_PROMPT_TYPES = {pt for pt, _, _ in PROMPT_TYPES}
+_SIMPLE_PROMPT_TYPES = ("voice_call", "whatsapp_chat")
+_SIMPLE_PROMPT_LABELS = {
+    "voice_call": "Voice Call",
+    "whatsapp_chat": "WhatsApp Chat",
+}
 _PROMPT_TYPE_ALIASES = {
     "follow_up": "followup_call",
     "followup": "followup_call",
@@ -1293,6 +1287,10 @@ async def resolve_voice_call_prompt_with_meta(
     business_name: str = "our company",
     service_type: str = "our service",
 ) -> tuple[str, dict]:
+    await log_error("server", "voice_prompt_simple_mode", "true", "info")
+    await log_error("server", "old_prompt_types_ignored", "true", "info")
+    await log_error("server", "legacy_prompt_ignored_for_voice", "true", "info")
+    await log_error("server", "agent_profile_prompt_ignored_for_voice", "true", "info")
     saved = await get_setting("AI_PROMPT_voice_call", "")
     if saved:
         cleaned, removed, phrase = _sanitize_voice_prompt_setting_text(saved)
@@ -1312,8 +1310,8 @@ async def resolve_voice_call_prompt_with_meta(
     return prompt, {
         "prompt_type_requested": "voice_call",
         "prompt_type_resolved": "voice_call",
-        "prompt_source_selected": "AI_PROMPT_voice_call" if saved else "built_in:voice_call",
-        "prompt_mode_selected": "call_type" if saved else "default",
+        "prompt_source_selected": "AI_PROMPT_voice_call",
+        "prompt_mode_selected": "simple",
         "prompt_default_used": not bool(saved),
     }
 
@@ -1363,65 +1361,59 @@ def _crm_status_to_call_type(crm_status: str) -> str:
 
 @app.get("/api/ai-prompts")
 async def api_list_ai_prompts():
-    default_type = await get_setting(_AI_PROMPT_DEFAULT_TYPE_KEY, "welcome_call")
+    await log_error("server", "old_prompt_types_hidden", "true", "info")
     result = []
-    for pt, label, _ in PROMPT_TYPES:
+    for pt in _SIMPLE_PROMPT_TYPES:
         saved = await get_setting(_AI_PROMPT_KEY.format(pt), "")
         result.append({
             "type": pt,
-            "label": label,
+            "label": _SIMPLE_PROMPT_LABELS[pt],
             "prompt": saved if saved else get_default_prompt(pt),
             "is_saved": bool(saved),
-            "is_default": (pt == default_type),
+            "is_default": False,
         })
     return result
 
 
 @app.get("/api/ai-prompts/resolve")
 async def api_resolve_ai_prompt(call_type: str = "welcome_call"):
-    resolved_type = _resolve_prompt_type(call_type)
-    if resolved_type not in _VALID_PROMPT_TYPES:
-        raise HTTPException(400, f"Unknown call type: {call_type}. Valid: {sorted(_VALID_PROMPT_TYPES)}")
-    saved, key, resolved_type = await _saved_call_type_prompt(call_type)
-    prompt = saved if saved else get_default_prompt(resolved_type)
+    saved = await get_setting("AI_PROMPT_voice_call", "")
+    prompt = saved if saved else get_default_prompt("voice_call")
     return {
-        "type": resolved_type,
-        "label": get_prompt_label(resolved_type),
+        "type": "voice_call",
+        "label": "Voice Call",
         "prompt": prompt,
         "is_saved": bool(saved),
-        "source_key": key or f"built_in:{resolved_type}",
+        "source_key": "AI_PROMPT_voice_call",
     }
 
 
 @app.get("/api/ai-prompts/{prompt_type}")
 async def api_get_ai_prompt(prompt_type: str):
-    if prompt_type not in _VALID_PROMPT_TYPES:
+    if prompt_type not in _SIMPLE_PROMPT_TYPES:
         raise HTTPException(404, f"Unknown prompt type: {prompt_type}")
-    default_type = await get_setting(_AI_PROMPT_DEFAULT_TYPE_KEY, "welcome_call")
     saved = await get_setting(_AI_PROMPT_KEY.format(prompt_type), "")
     return {
         "type": prompt_type,
-        "label": get_prompt_label(prompt_type),
+        "label": _SIMPLE_PROMPT_LABELS[prompt_type],
         "prompt": saved if saved else get_default_prompt(prompt_type),
         "is_saved": bool(saved),
-        "is_default": (prompt_type == default_type),
+        "is_default": False,
         "default_prompt": get_default_prompt(prompt_type),
     }
 
 
 @app.post("/api/ai-prompts/{prompt_type}")
 async def api_save_ai_prompt(prompt_type: str, req: AiPromptRequest):
-    if prompt_type not in _VALID_PROMPT_TYPES:
+    if prompt_type not in _SIMPLE_PROMPT_TYPES:
         raise HTTPException(400, f"Unknown prompt type: {prompt_type}")
     await set_setting(_AI_PROMPT_KEY.format(prompt_type), req.prompt)
-    if req.is_default:
-        await set_setting(_AI_PROMPT_DEFAULT_TYPE_KEY, prompt_type)
-    return {"status": "saved", "type": prompt_type, "is_default": req.is_default}
+    return {"status": "saved", "type": prompt_type, "is_default": False}
 
 
 @app.post("/api/ai-prompts/{prompt_type}/reset")
 async def api_reset_ai_prompt(prompt_type: str):
-    if prompt_type not in _VALID_PROMPT_TYPES:
+    if prompt_type not in _SIMPLE_PROMPT_TYPES:
         raise HTTPException(400, f"Unknown prompt type: {prompt_type}")
     await set_setting(_AI_PROMPT_KEY.format(prompt_type), "")
     return {
@@ -2847,9 +2839,9 @@ async def _run_batch(batch_id: str) -> None:
     b["started_at"] = datetime.now().isoformat()
     items = b["items"]
 
-    profile = None
     if b.get("agent_profile_id"):
-        profile = await get_agent_profile(b["agent_profile_id"])
+        await log_error("server", "agent_profile_prompt_ignored_for_voice", f"batch_id={batch_id}; agent_profile_id={b['agent_profile_id']}", "info")
+    profile = None
 
     url = await eff("LIVEKIT_URL")
     key = await eff("LIVEKIT_API_KEY")
@@ -3137,6 +3129,8 @@ async def _build_dispatch_metadata(contact: dict, prompt: Optional[str], profile
 
     # Voice calls use only the dedicated safe voice prompt. Request/campaign,
     # agent-profile, legacy, and old call-type prompt text must not drive openings.
+    if prompt:
+        await log_error("server", "legacy_prompt_ignored_for_voice", "campaign_or_custom_prompt_ignored", "info")
     saved_prompt, prompt_meta = await resolve_voice_call_prompt_with_meta(
         lead_name=lead_name,
         business_name=business_name,
@@ -3161,12 +3155,7 @@ async def _build_dispatch_metadata(contact: dict, prompt: Optional[str], profile
         "prompt_default_used": str(prompt_meta.get("prompt_default_used", False)).lower(),
     }
     if profile:
-        if profile.get("voice"):
-            metadata["voice_override"] = profile["voice"]
-        if profile.get("model"):
-            metadata["model_override"] = profile["model"]
-        if profile.get("enabled_tools"):
-            metadata["tools_override"] = profile["enabled_tools"]
+        await log_error("server", "agent_profile_prompt_ignored_for_voice", "profile_supplied_but_not_used", "info")
     return metadata
 
 
@@ -3298,7 +3287,9 @@ async def _run_campaign(campaign_id: str) -> None:
     contacts = deduped
     await update_campaign_contacts(campaign_id, contacts)
 
-    profile = await get_agent_profile(campaign.get("agent_profile_id")) if campaign.get("agent_profile_id") else None
+    if campaign.get("agent_profile_id"):
+        await log_error("server", "agent_profile_prompt_ignored_for_voice", f"campaign_id={campaign_id}; agent_profile_id={campaign.get('agent_profile_id')}", "info")
+    profile = None
     url = await eff("LIVEKIT_URL")
     key = await eff("LIVEKIT_API_KEY")
     secret = await eff("LIVEKIT_API_SECRET")

@@ -169,11 +169,10 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
 <section id="prompt" class="panel">
 <div class="card">
   <h2>✏️ AI Prompt Manager</h2>
-  <p class="muted" style="margin-bottom:10px">Fixed greeting is controlled separately via <b>OUTBOUND_FIXED_GREETING</b>. These prompts guide the <b>conversation after the greeting</b>.</p>
+  <p class="muted" style="margin-bottom:10px">Voice calls use Voice Call Prompt. WhatsApp AI uses WhatsApp Chat Prompt.</p>
   <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
     <label style="font-weight:600">Prompt Type:</label>
     <select id="pm-type" style="min-width:220px" onchange="loadPromptType()"></select>
-    <span id="pm-default-badge" style="display:none;background:#7c6af7;color:#fff;border-radius:12px;padding:2px 10px;font-size:0.8rem;font-weight:700">⭐ Default</span>
     <span id="pm-saved-badge" style="display:none;background:#00ff88;color:#000;border-radius:12px;padding:2px 10px;font-size:0.8rem;font-weight:700">Saved</span>
   </div>
   <div id="pm-risky-warn" style="display:none;background:#2d1b1b;color:#f87171;border:1px solid #f87171;border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:0.9rem">
@@ -183,21 +182,10 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
   <div class="row" style="gap:8px;margin-top:10px;flex-wrap:wrap">
     <button class="primary" onclick="savePromptType()">💾 Save Prompt</button>
     <button onclick="resetPromptType()">↺ Reset Default</button>
-    <button onclick="setPromptTypeAsDefault()">⭐ Set as Default</button>
     <button onclick="loadPromptType()">🔄 Reload</button>
     <span id="pm-char-count" class="muted" style="align-self:center"></span>
   </div>
   <p id="pm-msg" class="muted" style="margin-top:6px;min-height:1.2em"></p>
-</div>
-<div class="card" style="margin-top:10px">
-  <h3>🌐 Legacy Global Prompt (Fallback)</h3>
-  <p class="muted" style="font-size:0.85rem">Used only if no Call Type prompt and no Agent Profile prompt is set. Kept for backward compatibility.</p>
-  <textarea id="prompt-text" style="min-height:200px;width:100%;box-sizing:border-box"></textarea>
-  <div class="row" style="gap:8px;margin-top:6px">
-    <span id="prompt-count" class="muted"></span>
-    <button class="primary" onclick="savePrompt()">💾 Save Global</button>
-    <button class="danger" onclick="resetPrompt()">Reset</button>
-  </div>
 </div>
 </section>
 <section id="appointments" class="panel"><div class="card"><h2>📅 Appointments</h2><div class="row"><input id="appt-search" placeholder="Search name or phone"><input id="appt-date" type="date"><select id="appt-status"><option value="">All statuses</option><option value="booked">Booked</option><option value="completed">Completed</option><option value="no_show">No Show</option><option value="cancelled">Cancelled</option><option value="rescheduled">Rescheduled</option></select><button onclick="loadAppointments()">Filter</button></div><div id="appt-list" style="margin-top:16px;overflow-x:auto"></div></div><div class="card" style="margin-top:16px"><h2>Appointment Settings</h2><div class="grid cols-3"><div><label>Default demo duration</label><input id="appt-demo-duration" type="number" min="1" value="30"></div><div><label>Buffer minutes</label><input id="appt-buffer" type="number" min="0" value="15"></div><div><label>Slot interval</label><input id="appt-slot-interval" type="number" min="0" placeholder="duration + buffer"></div><div><label>Working timezone</label><input id="appt-timezone" value="Asia/Kolkata"></div><div><label>Minimum notice time</label><input id="appt-min-notice" type="number" min="0" value="30"></div><div><label>Max booking days ahead</label><input id="appt-max-days" type="number" min="1" value="30"></div></div><div class="row" style="margin-top:12px"><button class="primary" onclick="saveAppointmentSettings()">Save Appointment Settings</button><button onclick="loadAppointmentSettings()">Refresh</button></div></div><div class="card" style="margin-top:16px"><h2>Appointment Staff</h2><div class="grid cols-3"><input id="staff-name" placeholder="Name"><input id="staff-email" placeholder="Email"><input id="staff-whatsapp" placeholder="WhatsApp number"><input id="staff-calendar" placeholder="Calendar email"><input id="staff-days" placeholder="Working days: mon,tue,wed,thu,fri,sat"><input id="staff-timezone" placeholder="Timezone" value="Asia/Kolkata"><input id="staff-start" type="time" value="09:00"><input id="staff-end" type="time" value="18:00"><input id="staff-order" type="number" value="0" placeholder="Round-robin order"><label><input id="staff-active" type="checkbox" checked style="width:auto"> Active</label></div><div class="row" style="margin-top:12px"><button class="primary" onclick="saveAppointmentStaff()">Save Staff</button><button onclick="resetAppointmentStaffForm()">New Staff</button></div><input id="staff-id" type="hidden"><div id="appt-staff-list" style="margin-top:12px"></div></div></section>
@@ -637,7 +625,7 @@ const tabs=[['stats','📊 Stats'],['single','📞 Single Call'],['batch','📋 
 function scheduleLogsRefresh(){setInterval(()=>{if(!logsPaused&&document.body.classList.contains('authenticated'))try{loadLogs()}catch(e){}},8000)}
 async function loadLeadStatuses(){try{const r=await api('/api/crm/statuses');leadStatuses=Array.isArray(r)?r:[]}catch(e){leadStatuses=[]}}
 async function logout(){await fetch('/api/auth/logout',{method:'POST'});showLogin('')}
-function switchTab(name){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id===name));if(name==='stats')loadStats();if(name==='campaigns'){loadCampaigns();_startCampaignProgressPoll()}if(name==='batch-monitor')refreshBatchMonitor();if(name==='scheduled')loadScheduledCalls();if(name==='agents')loadAgentProfiles();if(name==='prompt'){initPromptManager();loadPrompt();}if(name==='kb')initKB();if(name==='automation')initAutomation();if(name==='whatsapp')initWhatsApp();if(name==='appointments')loadAppointments();if(name==='calls')loadCalls();if(name==='crm')loadCRM();if(name==='settings'){loadSettings();loadOutboundSchedule();}if(name==='logs')loadLogs()}
+function switchTab(name){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id===name));if(name==='stats')loadStats();if(name==='campaigns'){loadCampaigns();_startCampaignProgressPoll()}if(name==='batch-monitor')refreshBatchMonitor();if(name==='scheduled')loadScheduledCalls();if(name==='agents')loadAgentProfiles();if(name==='prompt'){initPromptManager();}if(name==='kb')initKB();if(name==='automation')initAutomation();if(name==='whatsapp')initWhatsApp();if(name==='appointments')loadAppointments();if(name==='calls')loadCalls();if(name==='crm')loadCRM();if(name==='settings'){loadSettings();loadOutboundSchedule();}if(name==='logs')loadLogs()}
 function _mkChart(id,type,data,options={}){if(charts[id])charts[id].destroy();charts[id]=new Chart($(id),{type,data,options:{responsive:true,plugins:{legend:{labels:{color:'#ddd'}}},scales:type==='doughnut'?{}:{x:{ticks:{color:'#aaa'},grid:{color:'#222'}},y:{ticks:{color:'#aaa'},grid:{color:'#222'}}},...options}})}
 function _renderCharts(d){const outcomes=d.outcomes||{};_mkChart('chart-outcomes','doughnut',{labels:Object.keys(outcomes),datasets:[{data:Object.values(outcomes),backgroundColor:['#00ff88','#00ccff','#ffaa00','#ff4d4d','#888']}]});_mkChart('chart-timeline','line',{labels:(d.timeline||[]).map(x=>x.date.slice(5)),datasets:[{label:'Calls',data:(d.timeline||[]).map(x=>x.count),borderColor:'#00ccff',backgroundColor:'#00ccff33'}]});const dur=d.duration_by_outcome||{};_mkChart('chart-duration','bar',{labels:Object.keys(dur),datasets:[{label:'Avg sec',data:Object.values(dur),backgroundColor:'#00ff88'}]})}
 function loadCharts(d){try{_renderCharts(d)}catch(e){$('stats-error').textContent='Charts unavailable: '+e.message}}
@@ -758,8 +746,6 @@ async function kbLoadSample(){
     toast('Sample data loaded');
   }catch(e){toast(e.message,'err');}
 }
-// ── Legacy global prompt ────────────────────────────────────────────────────
-async function loadPrompt(){const p=await api('/api/prompt');$('prompt-text').value=p.prompt;$('prompt-count').textContent=p.prompt.length+' chars'}window.savePrompt=async()=>{await api('/api/prompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:$('prompt-text').value})});toast('Global prompt saved')};window.resetPrompt=async()=>{await api('/api/prompt',{method:'DELETE'});loadPrompt();toast('Global prompt reset')};$('prompt-text') && ($('prompt-text').oninput=()=>$('prompt-count').textContent=($('prompt-text').value||'').length+' chars');
 // ── AI Prompt Manager ────────────────────────────────────────────────────────
 const _PM_RISKY=['SPEAK FIRST','Do NOT wait for the lead','Open with:','The moment the call connects'];
 let _pmTypes=[];
@@ -768,7 +754,7 @@ async function initPromptManager(){
     const list=await api('/api/ai-prompts');
     _pmTypes=list;
     const sel=$('pm-type');
-    sel.innerHTML=list.map(p=>`<option value="${esc(p.type)}">${esc(p.label)}${p.is_default?' ⭐':''}</option>`).join('');
+    sel.innerHTML=list.map(p=>`<option value="${esc(p.type)}">${esc(p.label)}</option>`).join('');
     await loadPromptType();
   }catch(e){toast('Prompt Manager load failed: '+e.message,'err');}
 }
@@ -778,7 +764,6 @@ async function loadPromptType(){
     const p=await api('/api/ai-prompts/'+type);
     $('pm-text').value=p.prompt;
     $('pm-char-count').textContent=p.prompt.length+' chars';
-    $('pm-default-badge').style.display=p.is_default?'inline':'none';
     $('pm-saved-badge').style.display=p.is_saved?'inline':'none';
     $('pm-msg').textContent='';
     checkRiskyPhrases();
@@ -810,17 +795,6 @@ async function resetPromptType(){
     $('pm-saved-badge').style.display='none';
     checkRiskyPhrases();
     toast('Reset to default: '+type);
-  }catch(e){toast(e.message,'err');}
-}
-async function setPromptTypeAsDefault(){
-  const type=$('pm-type')?.value;if(!type)return;
-  try{
-    await api('/api/ai-prompts/'+type,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:$('pm-text').value,is_default:true})});
-    // Refresh dropdown to show new star
-    await initPromptManager();
-    $('pm-type').value=type;
-    await loadPromptType();
-    toast(type+' set as default');
   }catch(e){toast(e.message,'err');}
 }
 async function loadAppointments(){const d=$('appt-date').value,s=$('appt-status').value,q=$('appt-search').value;const p=new URLSearchParams();if(d)p.set('date',d);if(s)p.set('status',s);if(q)p.set('q',q);$('appt-list').innerHTML=table(await api('/api/appointments?'+p.toString()),['name','phone','date','time','service','staff_name','status'],r=>`<div class="row-actions"><button class="primary" onclick="setApptStatus('${r.id}','completed')">Done</button><button class="warn" onclick="setApptStatus('${r.id}','no_show')">No-Show</button><button onclick="openRescheduleModal('${r.id}','${r.date}','${r.time}')">Resch</button><button onclick="openApptNotesModal('${r.id}', \`${esc(r.notes||'').replace(/`/g,'')}\`)">Notes</button><button class="danger" onclick="cancelAppointment('${r.id}')">Cancel</button></div>`);loadAppointmentSettings();loadAppointmentStaff()}

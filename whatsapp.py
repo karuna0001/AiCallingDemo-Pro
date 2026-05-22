@@ -2264,9 +2264,7 @@ async def generate_whatsapp_ai_reply(
             (crm_contact or {}).get("name"),
             conversation.get("contact_name"),
         )
-        saved_prompt_primary = await _gs("AI_PROMPT_whatsapp_chat", "")
-        saved_prompt_legacy = await _gs("AI_PROMPT_whatsapp_chat_prompt", "")
-        saved_prompt = saved_prompt_primary or saved_prompt_legacy or None
+        saved_prompt = await _gs("AI_PROMPT_whatsapp_chat", "") or None
         prompt_source = "db" if saved_prompt else "default"
         if "lead follow" in lower_text or "follow-up" in lower_text or "follow up" in lower_text:
             return {

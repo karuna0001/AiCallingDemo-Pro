@@ -841,10 +841,15 @@ async def entrypoint(ctx: agents.JobContext):
     prompt_mode_selected = _first_text(metadata.get("prompt_mode_selected"), default="unknown")
     prompt_default_used = _first_text(metadata.get("prompt_default_used"), default="false").lower() in ("1", "true", "yes", "on")
     await _log("info", "prompt_resolution_started", f"call_type={call_type}")
-    await _log("info", "prompt_type_requested", call_type)
+    await _log("info", "prompt_type_requested", "voice_call")
     await _log("info", "prompt_source_selected", prompt_source_selected)
     await _log("info", "prompt_mode_selected", prompt_mode_selected)
     await _log("info", "prompt_default_used", str(prompt_default_used).lower())
+    await _log("info", "voice_prompt_simple_mode", "true")
+    await _log("info", "old_prompt_types_hidden", "true")
+    await _log("info", "old_prompt_types_ignored", "true")
+    await _log("info", "agent_profile_prompt_ignored_for_voice", "true")
+    await _log("info", "legacy_prompt_ignored_for_voice", "true")
 
     _base_prompt = build_prompt(
         lead_name,
