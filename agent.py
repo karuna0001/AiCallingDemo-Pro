@@ -41,6 +41,40 @@ DEFAULT_OUTBOUND_AGENT_NAME = "outbound-caller-v3"
 OPENING_RESPONSE_WAIT_SECONDS = 2
 
 
+import uuid
+from datetime import datetime
+
+# Thread-safe in-memory log buffer for batching Supabase inserts
+_LOG_BUFFER = []
+_LOG_BUFFER_LOCK = threading.Lock()
+
+def _queue_log_to_buffer(level: str, msg: str, detail: str = "") -> None:
+    log_entry = {
+        "id": str(uuid.uuid4()),
+        "source": "agent",
+        "level": level,
+        "message": msg[:500],
+        "detail": detail[:2000],
+        "timestamp": datetime.now().isoformat(),
+    }
+    with _LOG_BUFFER_LOCK:
+        _LOG_BUFFER.append(log_entry)
+
+async def _flush_logs_to_db() -> None:
+    global _LOG_BUFFER
+    if not _LOG_BUFFER:
+        return
+    with _LOG_BUFFER_LOCK:
+        to_flush = list(_LOG_BUFFER)
+        _LOG_BUFFER.clear()
+    if to_flush:
+        try:
+            from db import log_errors_batch
+            await log_errors_batch(to_flush)
+        except Exception as exc:
+            logger.warning("Failed to flush buffered logs: %s", exc)
+
+
 class OutboundAssistant(Agent):
     def __init__(self, instructions: str) -> None:
         super().__init__(instructions=instructions, tools=[])
@@ -54,7 +88,7 @@ async def _log(level: str, msg: str, detail: str = "") -> None:
     else:
         logger.error(msg)
     try:
-        await log_error("agent", msg, detail, level)
+        _queue_log_to_buffer(level, msg, detail)
     except Exception:
         pass
 
@@ -66,16 +100,11 @@ def _log_bg(level: str, msg: str, detail: str = "") -> None:
         logger.warning("%s %s", msg, detail)
     else:
         logger.error("%s %s", msg, detail)
-    async def _write() -> None:
-        try:
-            await log_error("agent", msg, detail, level)
-        except Exception:
-            pass
-
     try:
-        asyncio.create_task(_write())
+        _queue_log_to_buffer(level, msg, detail)
     except Exception:
         pass
+
 
 
 def _ms_since(start: float) -> int:
@@ -909,6 +938,18 @@ async def entrypoint(ctx: agents.JobContext):
             await _log("error", "call_log_save_on_disconnect_failed", str(exc))
 
     try:
+        # Start a background task to flush logs periodically every 2.0 seconds
+        async def _periodic_flush():
+            while True:
+                try:
+                    await asyncio.sleep(2.0)
+                    await _flush_logs_to_db()
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    pass
+        flush_task = asyncio.create_task(_periodic_flush())
+
         await _log("info", f"outbound_agent_name={_outbound_agent_name()}", _outbound_agent_name())
         await _log_agent_runtime_fingerprint()
         await _log("info", "deployed_code_version", _deployed_code_version())
@@ -1341,6 +1382,15 @@ async def entrypoint(ctx: agents.JobContext):
             await _save_call_log_if_missing("failed", f"Call crashed: {exc}")
         ctx.shutdown()
     finally:
+        # Cancel background periodic flush task and run final flush
+        if 'flush_task' in locals():
+            flush_task.cancel()
+            try:
+                await flush_task
+            except Exception:
+                pass
+        await _flush_logs_to_db()
+
         if recording_task:
             await asyncio.gather(recording_task, return_exceptions=True)
         await _save_call_log_if_missing("completed", "call disconnected")

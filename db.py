@@ -207,16 +207,26 @@ def _require_supabase() -> tuple:
     return url, key
 
 
+_cached_adb = None
+_cached_sdb = None
+
+
 def _sdb():
-    url, key = _require_supabase()
-    from supabase import create_client
-    return create_client(url, key)
+    global _cached_sdb
+    if _cached_sdb is None:
+        url, key = _require_supabase()
+        from supabase import create_client
+        _cached_sdb = create_client(url, key)
+    return _cached_sdb
 
 
 async def _adb():
-    url, key = _require_supabase()
-    from supabase._async.client import create_client
-    return await create_client(url, key)
+    global _cached_adb
+    if _cached_adb is None:
+        url, key = _require_supabase()
+        from supabase._async.client import create_client
+        _cached_adb = await create_client(url, key)
+    return _cached_adb
 
 
 def init_db() -> None:
@@ -322,6 +332,17 @@ async def log_error(source: str, message: str, detail: str = "", level: str = "e
         await db.table("error_logs").insert({"id": str(uuid.uuid4()), "source": source, "level": level, "message": message[:500], "detail": detail[:2000], "timestamp": datetime.now().isoformat()}).execute()
     except Exception:
         pass
+
+
+async def log_errors_batch(logs: list[dict]) -> None:
+    if not logs:
+        return
+    try:
+        db = await _adb()
+        await db.table("error_logs").insert(logs).execute()
+    except Exception:
+        pass
+
 
 
 async def get_errors(limit: int = 100) -> list:
