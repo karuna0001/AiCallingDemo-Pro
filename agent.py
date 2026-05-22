@@ -485,32 +485,31 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
 
     if label == "database":
         mode = "cold_call"
+        template = "short_source_database"
         dynamic_greeting = (
-            f"Hi, this is {agent_name} from {caller_business}. We provide fully automated bulk AI voice calling, "
-            "WhatsApp messaging, and CRM follow-up automation for businesses. "
-            "Is this a good time to speak for a minute?"
+            f"Hi, this is {agent_name} from {caller_business}. We received your contact from our database. Is this a good time?"
         )
-        opening = "Great. Are you interested in a quick 10-minute Google Meet demo?"
+        opening = "Great. Can I arrange a quick 10-minute Google Meet demo for you?"
     elif label in {"Facebook", "Instagram", "our website", "Google", "WhatsApp"}:
         mode = "enquiry"
+        template = "short_source_enquiry"
+        source_phrase = f"{label} enquiry" if label in {"Facebook", "Instagram", "Google", "WhatsApp"} else "website enquiry"
         dynamic_greeting = (
-            f"Hi, this is {agent_name} from {caller_business}. "
-            f"We received your enquiry from {label} regarding {service_type}. "
-            "Is this a good time to speak for a minute?"
+            f"Hi, this is {agent_name} from {caller_business}. We received your {source_phrase} for {service_type}. Is this a good time?"
         )
         opening = "Great. Can I arrange a quick 10-minute Google Meet demo for you?"
     else:
         mode = "generic"
+        template = "short_source_records"
         dynamic_greeting = (
-            f"Hi, this is {agent_name} from {caller_business}. "
-            "I'm calling regarding AI voice calling and WhatsApp CRM automation. "
-            "Is this a good time to speak for a minute?"
+            f"Hi, this is {agent_name} from {caller_business}. We received your enquiry for {service_type}. Is this a good time?"
         )
         opening = "Great. Can I arrange a quick 10-minute Google Meet demo for you?"
     return {
         "source": norm,
         "label": label,
         "mode": mode,
+        "template": template,
         "dynamic_greeting": dynamic_greeting,
         "opening": opening,
         "legacy_source_opening": (
@@ -705,6 +704,8 @@ except ImportError:
 def _build_realtime_model(system_prompt: str):
     model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
     voice = os.getenv("GEMINI_TTS_VOICE", _DEFAULT_GEMINI_TTS_VOICE)
+    if voice == "Aoede" or not voice:
+        voice = "Kore"
     klass = _google_realtime or _google_beta_realtime
     if not klass:
         return None
@@ -738,6 +739,12 @@ def _build_tts_model():
     global _SELECTED_TTS_CONFIG
     voice_name, voice_source = _env_value_with_source("GEMINI_TTS_VOICE", _DEFAULT_GEMINI_TTS_VOICE)
     language, language_source = _env_value_with_source("GEMINI_TTS_LANGUAGE", _DEFAULT_TTS_LANGUAGE)
+    if voice_name == "Aoede" or not voice_name:
+        voice_name = "Kore"
+        voice_source = "env_override_aoede_to_kore"
+    if language == "en-US" or not language:
+        language = "en-IN"
+        language_source = "env_override_to_en_in"
     model, model_source = _env_value_with_source("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
     if not _google_tts:
         _SELECTED_TTS_CONFIG = {
@@ -932,6 +939,7 @@ async def entrypoint(ctx: agents.JobContext):
                 f"customer_name={customer_name or 'missing'}; "
                 f"business_name={business_name}; "
                 f"service_type={service_type}; "
+                f"source={source}; "
                 f"call_type={call_type}; "
                 f"phone_present={str(bool(phone_number)).lower()}; "
                 f"keys={','.join(sorted(metadata.keys()))}"
@@ -1021,6 +1029,8 @@ async def entrypoint(ctx: agents.JobContext):
         _base_prompt, _ = await _sanitize_competing_opening_questions(_base_prompt)
         _base_prompt, _ = await _strip_stale_names_from_prompt(_base_prompt, customer_name)
         opening_context = _voice_opening_context(source, company_name or business_name or "Ladder Hub", service_type or "AI voice calling and WhatsApp CRM automation")
+        first_line_template = opening_context.get("template", "short_source_records")
+        await _log("info", f"first_line_template={first_line_template}", first_line_template)
         if not source or not service_type:
             await _log("warning", "voice_opening_missing_data", f"source={source or 'missing'}; service_type={service_type or 'missing'}")
         await _log("info", "voice_opening_source", source or "unknown")
@@ -1166,6 +1176,20 @@ async def entrypoint(ctx: agents.JobContext):
         await session.start(**session_kwargs)
         _log_bg("info", "livekit_session_started", f"delay_ms={_ms_since(call_started_at)}")
 
+        # Disable microphone input immediately after session start to prevent premature Gemini responses during warmup/greeting
+        if hasattr(session, "input") and hasattr(session.input, "set_audio_enabled"):
+            try:
+                session.input.set_audio_enabled(False)
+                await _log("info", "agent_input_disabled_during_greeting", "true")
+            except Exception as e:
+                await _log("warning", f"failed_to_disable_agent_input: {e}")
+
+        # SIP answered audio warmup delay
+        sip_warmup_ms = 1000
+        await _log("info", "sip_answered_audio_warmup_ms=1000", "1000")
+        await asyncio.sleep(sip_warmup_ms / 1000.0)
+        await _log("info", "first_line_audio_warmup_done=true", "true")
+
         async def _start_recording_after_greeting() -> None:
             aws_key = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
             aws_secret = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
@@ -1224,6 +1248,10 @@ async def entrypoint(ctx: agents.JobContext):
         tts_config = dict(_SELECTED_TTS_CONFIG)
         tts_voice = tts_config.get("voice") or os.getenv("GEMINI_TTS_VOICE", _DEFAULT_GEMINI_TTS_VOICE)
         tts_language = tts_config.get("language") or os.getenv("GEMINI_TTS_LANGUAGE", _DEFAULT_TTS_LANGUAGE)
+        if tts_voice == "Aoede" or not tts_voice:
+            tts_voice = "Kore"
+        if tts_language == "en-US" or not tts_language:
+            tts_language = "en-IN"
         indian_voice_enabled = bool(tts_config.get("style_applied")) or tts_language.lower().startswith("en-in")
         await _log("info", "voice_provider_selected", tts_config.get("provider") or "livekit.plugins.google")
         await _log("info", "tts_model_selected", tts_config.get("model") or "unknown")
@@ -1264,6 +1292,8 @@ async def entrypoint(ctx: agents.JobContext):
             log_prefix="system_first_line",
         )
         await _log("info", f"system_first_line_spoken_success={str(first_line_ok).lower()}", str(first_line_ok).lower())
+        if first_line_ok:
+            await _log("info", "first_line_audio_sent_after_warmup=true", "true")
         await _log("info", f"opening_text_allowed_after_first_line={str(first_line_ok).lower()}", str(first_line_ok).lower())
         await _log("info", "dynamic_greeting_spoken_by_system", str(first_line_ok).lower())
 
