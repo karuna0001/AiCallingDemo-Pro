@@ -497,6 +497,12 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
     compact = norm.replace("_", "")
     caller_business = business_name or "Ladder Hub"
     agent_name = (os.getenv("VOICE_AGENT_NAME") or "Snikitha").strip() or "Snikitha"
+
+    if service_type and service_type.strip() and service_type.lower() not in {"our service", "our services", "ai voice calling and whatsapp crm automation"}:
+        service_suffix = f" for {service_type.strip()}"
+    else:
+        service_suffix = ""
+
     if norm in _SOURCE_LABELS:
         label = _SOURCE_LABELS[norm]
     elif compact in {"facebooklead", "facebookads", "fblead", "fbads", "metalead", "metaads"}:
@@ -516,19 +522,19 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
     if label == "database":
         mode = "cold_call"
         template = "short_source_database"
-        dynamic_greeting = f"Hi, {agent_name} from {caller_business}. Calling about your database enquiry."
-        opening = "Calling about your database enquiry."
+        dynamic_greeting = f"Hi, {agent_name} from {caller_business}. Calling regarding your database enquiry{service_suffix}."
+        opening = f"Calling regarding your database enquiry{service_suffix}."
     elif label in {"Facebook", "Instagram", "our website", "Google", "WhatsApp"}:
         mode = "enquiry"
         template = "short_source_enquiry"
         source_phrase = f"{label}" if label in {"Facebook", "Instagram", "Google", "WhatsApp"} else "our website"
-        dynamic_greeting = f"Hi, {agent_name} from {caller_business}. Calling about your {source_phrase} enquiry."
-        opening = f"Calling about your {source_phrase} enquiry."
+        dynamic_greeting = f"Hi, {agent_name} from {caller_business}. Calling regarding your {source_phrase} enquiry{service_suffix}."
+        opening = f"Calling regarding your {source_phrase} enquiry{service_suffix}."
     else:
         mode = "generic"
         template = "short_source_records"
-        dynamic_greeting = f"Hi, {agent_name} from {caller_business}. Calling about your enquiry."
-        opening = "Calling about your enquiry."
+        dynamic_greeting = f"Hi, {agent_name} from {caller_business}. Calling regarding your enquiry{service_suffix}."
+        opening = f"Calling regarding your enquiry{service_suffix}."
     return {
         "source": norm,
         "label": label,
@@ -648,10 +654,9 @@ def _final_call_override(
     service_type: str,
     call_type: str,
     opening_context: dict,
-    system_greeting_text: str = "",
+    first_turn_text: str = "",
 ) -> str:
     name_line = customer_name or "unknown"
-    greeting_text = system_greeting_text or opening_context.get('dynamic_greeting') or ''
     lines = [
         "FINAL CURRENT CALL DATA OVERRIDE:",
         f"- Customer name: {name_line}",
@@ -663,10 +668,10 @@ def _final_call_override(
         "These values override all previous prompt examples, CRM memory, contact memory, agent profiles, and old conversation history.",
         "Never use any other customer name.",
         "You MUST start this conversation by speaking exactly the combined greeting line on your very first turn:",
-        f"\"{greeting_text} Can I arrange a quick 10-minute Google Meet demo?\"",
+        f"\"{first_turn_text}\"",
         "Start directly with this combined greeting. Do not say hello or repeat any greeting. Speak directly to the lead.",
         "HARD IDENTITY RULE: Never verify who answered. Never request the customer's name.",
-        "Do not say 'Calling about your enquiry' for database or generic records if it conflicts with database/records instructions.",
+        "Do not say 'Calling regarding your enquiry' for database or generic records if it conflicts with database/records instructions.",
     ]
     if customer_name:
         lines.extend([
@@ -1100,7 +1105,42 @@ async def entrypoint(ctx: agents.JobContext):
         fallback_fixed_greeting = fixed_greeting_config.get("greeting") or default_fixed_greeting
         system_greeting_text = dynamic_greeting_text if has_dynamic_greeting_metadata else fallback_fixed_greeting
 
-        if opening_context["mode"] == "enquiry" and metadata_service_type:
+        # Customizable Welcome Greeting Parser
+        custom_greeting = None
+        custom_greeting_match = re.search(r"WELCOME_GREETING:\s*([^\n\r]+)", _base_prompt, re.IGNORECASE)
+        if custom_greeting_match:
+            custom_greeting = custom_greeting_match.group(1).strip()
+            # If quotes exist, strip them
+            if custom_greeting.startswith('"') and custom_greeting.endswith('"'):
+                custom_greeting = custom_greeting[1:-1].strip()
+            elif custom_greeting.startswith("'") and custom_greeting.endswith("'"):
+                custom_greeting = custom_greeting[1:-1].strip()
+
+            # Dynamic replacements of variables
+            replacements = {
+                "{agent_name}": agent_name_env,
+                "{caller_business}": business_name or company_name or "Ladder Hub",
+                "{company_name}": company_name or business_name or "Ladder Hub",
+                "{customer_name}": customer_name or "there",
+                "{lead_name}": lead_name or "there",
+                "{service_type}": service_type or "AI voice calling",
+                "{source}": source or "records",
+                "{source_phrase}": opening_context.get("label") or "records",
+            }
+            for k, v in replacements.items():
+                custom_greeting = custom_greeting.replace(k, v)
+                custom_greeting = custom_greeting.replace(k.upper(), v)
+
+            # Strip the WELCOME_GREETING line from the prompt
+            _base_prompt = re.sub(r"WELCOME_GREETING:\s*[^\n\r]+", "", _base_prompt, flags=re.IGNORECASE)
+            
+            system_greeting_text = custom_greeting
+            first_turn_text = custom_greeting
+            await _log("info", "custom_welcome_greeting_parsed", custom_greeting)
+        else:
+            first_turn_text = f"{system_greeting_text} Can I arrange a quick 10-minute Google Meet demo?"
+
+        if opening_context["mode"] == "enquiry" and metadata_service_type and not custom_greeting:
             expected_label = opening_context["label"]
             if expected_label not in system_greeting_text:
                 await _log(
@@ -1111,7 +1151,7 @@ async def entrypoint(ctx: agents.JobContext):
                 ctx.shutdown()
                 return
 
-        final_override = _final_call_override(customer_name, business_name, company_name, service_type, call_type, opening_context, system_greeting_text)
+        final_override = _final_call_override(customer_name, business_name, company_name, service_type, call_type, opening_context, first_turn_text)
         _base_prompt = _base_prompt + "\n\n" + final_override
         final_contains_wrong_names = _prompt_contains_wrong_names(_base_prompt, customer_name)
         if final_contains_wrong_names:
@@ -1123,10 +1163,17 @@ async def entrypoint(ctx: agents.JobContext):
         await _log("info", "final_voice_context_call_type", call_type)
         await _log("info", "final_voice_prompt_contains_wrong_names", str(final_contains_wrong_names).lower())
 
-        system_prompt = (
+        accent_instructions = (
+            "━━━ INDIAN ACCENT & CONVERSATIONAL TONE GUIDELINES ━━━\n"
+            "You are calling an Indian customer. You MUST speak English with a natural, warm, polite, and respectful Indian English accent (Indian English dialect and intonation).\n"
+            "Incorporate local Indian conversational cadences, warm rhythm, clear pronunciation, and professional phrasing.\n"
+            "Sound like a real, helpful person calling from India, maintaining a warm and familiar tone.\n\n"
+        )
+
+        system_prompt = accent_instructions + (
             "IMPORTANT GREETING RULE:\n"
             "This is the start of the call. Your very first turn in this conversation MUST be exactly:\n"
-            f"\"{system_greeting_text} Can I arrange a quick 10-minute Google Meet demo?\"\n"
+            f"\"{first_turn_text}\"\n"
             "Do NOT say 'hello', do NOT say any other opening, and do NOT wait for the customer to speak first. "
             "Start the call with this exact greeting immediately. "
             "The person who answered is the lead. Speak directly to them. Never ask for another person.\n\n"
