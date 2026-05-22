@@ -746,6 +746,18 @@ def _build_tts_model():
         language = "en-IN"
         language_source = "env_override_to_en_in"
     model, model_source = _env_value_with_source("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+
+    # Map Multimodal voice name to a standard Google Cloud TTS voice to prevent API timeout/fallback latency
+    google_voice = voice_name
+    if "-" not in voice_name:
+        norm_lang = (language or "en-IN").strip().lower()
+        if norm_lang.startswith("en-in"):
+            google_voice = "en-IN-Wavenet-A"
+        elif norm_lang.startswith("en-gb"):
+            google_voice = "en-GB-Wavenet-A"
+        else:
+            google_voice = "en-US-Wavenet-F"
+
     if not _google_tts:
         _SELECTED_TTS_CONFIG = {
             "provider": "livekit.plugins.google",
@@ -760,11 +772,11 @@ def _build_tts_model():
         }
         return None
     attempts = (
-        {"model": model, "voice_name": voice_name, "language": language, "instructions": _TTS_STYLE_INSTRUCTIONS},
-        {"model": model, "voice_name": voice_name, "instructions": _TTS_STYLE_INSTRUCTIONS},
-        {"voice_name": voice_name, "language": language, "instructions": _TTS_STYLE_INSTRUCTIONS},
-        {"voice_name": voice_name, "instructions": _TTS_STYLE_INSTRUCTIONS},
-        {"voice_name": voice_name},
+        {"model": model, "voice_name": google_voice, "language": language, "instructions": _TTS_STYLE_INSTRUCTIONS},
+        {"model": model, "voice_name": google_voice, "instructions": _TTS_STYLE_INSTRUCTIONS},
+        {"voice_name": google_voice, "language": language, "instructions": _TTS_STYLE_INSTRUCTIONS},
+        {"voice_name": google_voice, "instructions": _TTS_STYLE_INSTRUCTIONS},
+        {"voice_name": google_voice},
     )
     last_exc = None
     for kwargs in attempts:
@@ -773,8 +785,8 @@ def _build_tts_model():
             _SELECTED_TTS_CONFIG = {
                 "provider": "livekit.plugins.google",
                 "model": kwargs.get("model", model),
-                "voice": kwargs.get("voice_name", voice_name),
-                "language": kwargs.get("language", language),
+                "voice": voice_name,
+                "language": language,
                 "style_applied": bool(kwargs.get("instructions")),
                 "attached_to_session": False,
                 "voice_env_source": voice_source,
@@ -797,7 +809,7 @@ def _build_tts_model():
         "model_env_source": model_source,
         "language_env_source": language_source,
     }
-    return _google_tts(voice_name=voice_name)
+    return _google_tts(voice_name=google_voice)
 
 
 def _build_session(tools: list, system_prompt: str) -> AgentSession:
@@ -1306,6 +1318,14 @@ async def entrypoint(ctx: agents.JobContext):
                 await _log("warning", f"failed_to_enable_agent_input: {e}")
 
         await _log("info", "gemini_continuation_started_after_short_opening=true", "true")
+
+        # Immediately trigger Gemini continuation response so the agent speaks the demo proposal turn
+        # proactively without waiting in silence for the customer to initiate
+        try:
+            await session.generate_reply()
+            await _log("info", "gemini_generate_reply_triggered=true", "true")
+        except Exception as exc:
+            await _log("warning", f"failed_to_trigger_gemini_generate_reply: {exc}")
 
         if phone_number:
             sip_identity = f"sip_{phone_number}"
