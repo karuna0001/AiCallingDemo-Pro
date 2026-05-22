@@ -243,6 +243,7 @@ async def _startup():
         await log_error("server", "voice_flow_version", "v2_deterministic_indian", "info")
     except Exception:
         pass
+    await _sanitize_saved_voice_prompt_setting()
     if _scheduler:
         _scheduler.start()
         await _reschedule_all_campaigns()
@@ -1183,6 +1184,49 @@ _PROMPT_TYPE_ALIASES = {
     "payment_follow_up": "payment_followup",
     "missed_call": "missed_call_retry",
 }
+_VOICE_B2B_WRONG_PERSON_PHRASES = (
+    "business development executive",
+    "business development",
+    "decision maker",
+    "owner",
+    "manager",
+    "concerned person",
+    "can i speak to",
+    "may i speak to",
+    "who handles",
+    "right person",
+    "am i speaking",
+)
+_VOICE_B2B_WRONG_PERSON_PATTERNS = tuple(
+    re.compile(r"\b" + r"\s+".join(re.escape(part) for part in phrase.split()) + r"\b", flags=re.IGNORECASE)
+    for phrase in _VOICE_B2B_WRONG_PERSON_PHRASES
+)
+
+
+def _sanitize_voice_prompt_setting_text(text: str) -> tuple[str, bool, str]:
+    cleaned = text or ""
+    removed = False
+    first_phrase = ""
+    for phrase, pattern in zip(_VOICE_B2B_WRONG_PERSON_PHRASES, _VOICE_B2B_WRONG_PERSON_PATTERNS):
+        if pattern.search(cleaned):
+            first_phrase = first_phrase or phrase
+            cleaned = pattern.sub("", cleaned)
+            removed = True
+    if removed:
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, removed, first_phrase
+
+
+async def _sanitize_saved_voice_prompt_setting() -> None:
+    try:
+        saved = await get_setting("AI_PROMPT_voice_call", "")
+        cleaned, removed, phrase = _sanitize_voice_prompt_setting_text(saved)
+        if removed:
+            await set_setting("AI_PROMPT_voice_call", cleaned)
+            await log_error("server", "AI_PROMPT_voice_call_b2b_phrase_removed", f"phrase={phrase}", "warning")
+    except Exception as exc:
+        logger.warning("AI_PROMPT_voice_call cleanup skipped: %s", exc)
 
 
 def _resolve_prompt_type(call_type: str, fallback: str = "welcome_call") -> str:
@@ -1249,6 +1293,12 @@ async def resolve_voice_call_prompt_with_meta(
     service_type: str = "our service",
 ) -> tuple[str, dict]:
     saved = await get_setting("AI_PROMPT_voice_call", "")
+    if saved:
+        cleaned, removed, phrase = _sanitize_voice_prompt_setting_text(saved)
+        if removed:
+            saved = cleaned
+            await set_setting("AI_PROMPT_voice_call", cleaned)
+            await log_error("server", "AI_PROMPT_voice_call_b2b_phrase_removed", f"phrase={phrase}", "warning")
     kb = await get_knowledge_base()
     prompt = build_prompt_for_type(
         prompt_type="voice_call",

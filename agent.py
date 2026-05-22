@@ -160,6 +160,23 @@ _IDENTITY_BAN_PATTERNS = (
     r"lookup_contact\s+at\s+call\s+start",
     r"lookup_contact\s*â†’\s*call\s+at\s+call\s+start[^\n]*",
 )
+_B2B_WRONG_PERSON_PHRASES = (
+    "business development executive",
+    "business development",
+    "decision maker",
+    "owner",
+    "manager",
+    "concerned person",
+    "can i speak to",
+    "may i speak to",
+    "who handles",
+    "right person",
+    "am i speaking",
+)
+_B2B_WRONG_PERSON_PATTERNS = tuple(
+    re.compile(r"\b" + r"\s+".join(re.escape(part) for part in phrase.split()) + r"\b", flags=re.IGNORECASE)
+    for phrase in _B2B_WRONG_PERSON_PHRASES
+)
 _SOURCE_LABELS = {
     "facebook": "Facebook",
     "fb": "Facebook",
@@ -331,6 +348,27 @@ async def _sanitize_competing_opening_questions(prompt: str) -> tuple[str, bool]
 
 def _identity_prompt_safe(prompt: str) -> bool:
     return not any(re.search(pattern, prompt, flags=re.IGNORECASE) for pattern in _IDENTITY_BAN_PATTERNS)
+
+
+def _detect_b2b_wrong_person_phrase(prompt: str) -> str:
+    for phrase, pattern in zip(_B2B_WRONG_PERSON_PHRASES, _B2B_WRONG_PERSON_PATTERNS):
+        if pattern.search(prompt or ""):
+            return phrase
+    return ""
+
+
+async def _sanitize_b2b_wrong_person_phrases(prompt: str) -> tuple[str, bool]:
+    cleaned = prompt
+    removed = False
+    for pattern in _B2B_WRONG_PERSON_PATTERNS:
+        cleaned_new = pattern.sub("", cleaned)
+        if cleaned_new != cleaned:
+            removed = True
+            cleaned = cleaned_new
+    if removed:
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned, removed
 
 
 async def _strip_stale_names_from_prompt(prompt: str, customer_name: str) -> tuple[str, bool]:
@@ -884,18 +922,29 @@ async def entrypoint(ctx: agents.JobContext):
         "Do NOT speak first. Do NOT generate an opening greeting. "
         "Do NOT respond to the customer's first reply after the source-aware greeting. "
         "Do NOT repeat the source reminder or demo line. Continue only after the system demo line has been spoken "
-        "and the customer responds again.\n\n"
+        "and the customer responds again. "
+        "The person who answered is the lead. Speak directly to them. Never ask for another person.\n\n"
     ) + _base_prompt
     system_prompt = system_prompt + "\n\n" + final_override
     system_prompt, _ = await _sanitize_competing_opening_questions(system_prompt)
     system_prompt, banned_identity_removed = await _sanitize_identity_confirmation(system_prompt)
+    await _log("info", "voice_prompt_source_text_checked", "true")
+    system_prompt, b2b_wrong_person_removed = await _sanitize_b2b_wrong_person_phrases(system_prompt)
+    b2b_wrong_person_phrase = _detect_b2b_wrong_person_phrase(system_prompt)
+    final_voice_prompt_b2b_safe = not bool(b2b_wrong_person_phrase)
     final_voice_prompt_identity_safe = _identity_prompt_safe(system_prompt)
     opening_text = opening_context["opening"]
     opening_present = opening_text in system_prompt
     await _log("info", "final_voice_prompt_preview_safe", f"opening_text_present={str(opening_present).lower()}; opening_text={opening_text}")
     await _log("info", "identity_confirmation_disabled", "true")
     await _log("info", "banned_identity_phrase_removed", str(banned_identity_removed).lower())
+    await _log("info", "b2b_wrong_person_phrase_removed", str(b2b_wrong_person_removed).lower())
+    await _log("info", "final_voice_prompt_b2b_safe", str(final_voice_prompt_b2b_safe).lower())
     await _log("info", "final_voice_prompt_identity_safe", str(final_voice_prompt_identity_safe).lower())
+    if not final_voice_prompt_b2b_safe:
+        await _log("error", "b2b_wrong_person_phrase_detected", b2b_wrong_person_phrase)
+        ctx.shutdown()
+        return
     if not final_voice_prompt_identity_safe:
         await _log("error", "voice_call_blocked_identity_prompt_unsafe", "Final voice prompt still contains banned identity confirmation text")
         ctx.shutdown()
