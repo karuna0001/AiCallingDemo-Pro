@@ -2,7 +2,7 @@
 SYSTEM MODIFICATION RECORD - OUTBOUND VOICE CALL SYSTEM
 ================================================================================
 
-Date/Time: 2026-05-23 01:18:00 IST (Asia/Kolkata)
+Date/Time: 2026-05-23 01:32:00 IST (Asia/Kolkata)
 Status: SUCCESS
 Target Branch: phase-6-6-outbound-crm-fix
 
@@ -13,6 +13,9 @@ Target Branch: phase-6-6-outbound-crm-fix
 - Need standard welcome greeting to use Snikitha's exact dynamic phrasing:
   "Hi, Snikitha from Ladder Hub. Calling regarding your facebook enquiry for voice call ai agent service."
 - Need the ability to customize the greeting directly within the system prompt editor without touching code.
+- Support Excel/Google Sheet column headers as greeting variables:
+  * mapping `{source}` directly to pretty labels (e.g. `Facebook`, `Instagram`, `Google`).
+  * mapping `{service}` directly to the actual service value (e.g. `Ai Voice calling`, `website development`, `digital marketing`).
 
 --------------------------------------------------------------------------------
 2. MODIFICATIONS COMPLETED (WHAT WAS DONE)
@@ -22,7 +25,7 @@ Target Branch: phase-6-6-outbound-crm-fix
 - Custom greeting parser (`WELCOME_GREETING:`): Implemented a case-insensitive regex scanner in the boot flow of `entrypoint` to match `WELCOME_GREETING: <custom text>`. 
   * If found, it scrapes the custom greeting, performs dynamic token interpolation (`{agent_name}`, `{company_name}`, `{customer_name}`, `{service_type}`, etc.), strips the tag line from the prompt block so the model doesn't see it, and uses it as the first turn greeting (fully bypassing the default quick 10-minute demo suffix).
   * If not found, falls back gracefully to standard dynamic/fixed greetings with the demo suffix.
-- Bypass Validation Rule: Bypassed the source label validation rule when a `WELCOME_GREETING` is explicitly set to prevent call shutdowns caused by user-defined messages not matching exact CRM labels.
+- Excel Column Header Greeting Variables: Added `{source}` and `{service}` mappings directly inside the customizable greeting parser to support easy, direct variable replacement matching Google Sheet column names.
 
 --------------------------------------------------------------------------------
 3. VERIFICATION & STATUS
