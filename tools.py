@@ -41,6 +41,7 @@ class AppointmentTools(llm.ToolContext):
         self.recording_url: Optional[str] = None
         self.recording_object_key: Optional[str] = None
         self.recording_size_bytes: int = 0
+        self.call_logged: bool = False
         super().__init__(tools=[])
 
     def build_tool_list(self, enabled: list) -> list:
@@ -90,6 +91,7 @@ class AppointmentTools(llm.ToolContext):
                 recording_object_key=self.recording_object_key,
                 recording_size_bytes=self.recording_size_bytes,
             )
+            self.call_logged = True
         except Exception as exc:
             logger.error("Failed to log call: %s", exc)
         # Give Gemini ~1.5s to finish speaking the goodbye line before we tear down.

@@ -529,6 +529,16 @@ def _watch_first_customer_response(session: AgentSession) -> tuple[asyncio.Event
     return response_event, holder
 
 
+async def _say_with_retry(session: AgentSession, text: str, *, allow_interruptions: bool, log_prefix: str) -> bool:
+    for attempt in (1, 2):
+        try:
+            await session.say(text, allow_interruptions=allow_interruptions)
+            return True
+        except Exception as exc:
+            await _log("warning", f"{log_prefix}_say_failed", f"attempt={attempt}; error={exc}")
+    return False
+
+
 def _final_call_override(
     customer_name: str,
     business_name: str,
@@ -1014,7 +1024,6 @@ async def entrypoint(ctx: agents.JobContext):
         )
 
     await session.start(**session_kwargs)
-    session_started_at = time.perf_counter()
     _log_bg("info", "livekit_session_started", f"delay_ms={_ms_since(call_started_at)}")
 
     async def _start_recording_after_greeting() -> None:
@@ -1045,6 +1054,26 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as exc:
             await _log("warning", f"Recording start failed (non-fatal): {exc}")
 
+    async def _save_call_log_if_missing(outcome: str = "completed", reason: str = "call disconnected before end_call tool") -> None:
+        if not phone_number or tool_ctx.call_logged:
+            return
+        try:
+            duration = int(time.perf_counter() - call_started_at)
+            await log_call(
+                phone_number,
+                lead_name,
+                outcome,
+                reason,
+                duration,
+                tool_ctx.recording_url,
+                recording_object_key=tool_ctx.recording_object_key,
+                recording_size_bytes=tool_ctx.recording_size_bytes,
+            )
+            tool_ctx.call_logged = True
+            await _log("info", "call_log_saved_on_disconnect", f"phone={phone_number}; outcome={outcome}; duration_seconds={duration}")
+        except Exception as exc:
+            await _log("error", "call_log_save_on_disconnect_failed", str(exc))
+
     dynamic_greeting_text = opening_context["dynamic_greeting"]
     fallback_fixed_greeting = fixed_greeting_config.get("greeting") or _DEFAULT_FIXED_GREETING
     system_greeting_text = dynamic_greeting_text if has_dynamic_greeting_metadata else fallback_fixed_greeting
@@ -1059,7 +1088,6 @@ async def entrypoint(ctx: agents.JobContext):
             )
             ctx.shutdown()
             return
-    active_model = os.getenv("GEMINI_MODEL", "")
     recording_task = asyncio.create_task(_start_recording_after_greeting()) if phone_number else None
     first_response_event, first_response_holder = _watch_first_customer_response(session)
     await _log("info", "dynamic_greeting_text_built", dynamic_greeting_text)
@@ -1069,9 +1097,8 @@ async def entrypoint(ctx: agents.JobContext):
     await _log("info", "opening_text_built", opening_text)
     await _log("info", "gemini_opening_disabled", "true")
     await _log("info", "generate_reply_identity_opening_removed", "true")
-    deterministic_greeting_enabled = True
-    await _log("info", "system_opening_flow_active", str(deterministic_greeting_enabled).lower())
-    await _log("info", "deterministic_greeting_enabled", str(deterministic_greeting_enabled).lower())
+    await _log("info", "response_delay_fix_removed", "true")
+    await _log("info", "source_greeting_immediate_mode", "true")
     tts_config = dict(_SELECTED_TTS_CONFIG)
     tts_voice = tts_config.get("voice") or os.getenv("GEMINI_TTS_VOICE", _DEFAULT_GEMINI_TTS_VOICE)
     tts_language = tts_config.get("language") or os.getenv("GEMINI_TTS_LANGUAGE", _DEFAULT_TTS_LANGUAGE)
@@ -1095,78 +1122,73 @@ async def entrypoint(ctx: agents.JobContext):
     if not indian_voice_enabled:
         await _log("warning", "indian_voice_config_missing", "Using Gemini TTS voice with Indian English style instructions fallback")
 
-    if deterministic_greeting_enabled:
+    try:
+        if not hasattr(session, "say"):
+            raise RuntimeError("AgentSession.say() unavailable for source greeting")
+
+        await _log("info", "system_first_line_about_to_speak", system_greeting_text)
+        await _log("info", "dynamic_greeting_say_text", system_greeting_text)
+        first_line_ok = await _say_with_retry(
+            session,
+            system_greeting_text,
+            allow_interruptions=False,
+            log_prefix="system_first_line",
+        )
+        await _log("info", "system_first_line_spoken_success", str(first_line_ok).lower())
+        await _log("info", "dynamic_greeting_spoken_by_system", str(first_line_ok).lower())
+        await _log("info", "opening_text_allowed_after_first_line", str(first_line_ok).lower())
+        if not first_line_ok:
+            await _log("error", "system_first_line_failed_blocking_call", system_greeting_text)
+            await _save_call_log_if_missing("failed", "system first line failed")
+            ctx.shutdown()
+            return
+
         try:
-            greeting_requested_at = time.perf_counter()
-            greeting_start_delay_ms = _ms_since(call_started_at)
-            await _log("info", "dynamic_greeting_say_text", system_greeting_text)
-            _log_bg("info", "Dynamic source greeting mode enabled - speaking greeting immediately")
-            _log_bg(
-                "info",
-                "dynamic_greeting_start_requested",
-                f"delay_ms={greeting_start_delay_ms}; since_session_ms={_ms_since(session_started_at)}",
-            )
-            _log_bg("info", "dynamic_greeting_started_at", f"delay_ms={greeting_start_delay_ms}")
-            if not hasattr(session, "say"):
-                raise RuntimeError("AgentSession.say() unavailable for deterministic system greeting")
-            await session.say(system_greeting_text, allow_interruptions=True)
-            await _log("info", "dynamic_greeting_completed_at", f"duration_ms={_ms_since(greeting_requested_at)}")
-            await _log("info", "dynamic_greeting_delay_ms", str(greeting_start_delay_ms))
-            await _log("info", "dynamic_greeting_spoken_by_system", "true")
-            await _log("info", "Dynamic source greeting sent - waiting for customer response before system opening")
-            # The next customer reply is handled here so Gemini cannot invent the first business line.
-            await _log("info", "ai_context_loaded_after_greeting", "not_applicable; prompt_context_loaded_before_session_start")
-            try:
-                wait_seconds = max(int(os.getenv("OPENING_RESPONSE_WAIT_SECONDS", "12")), 1)
-            except ValueError:
-                wait_seconds = 12
-            try:
-                await asyncio.wait_for(first_response_event.wait(), timeout=wait_seconds)
-            except asyncio.TimeoutError:
-                await _log("warning", "opening_text_wait_timeout", f"seconds={wait_seconds}; using_unclear_intent")
+            await asyncio.wait_for(first_response_event.wait(), timeout=8)
+        except asyncio.TimeoutError:
+            first_response_holder["event"] = first_response_holder.get("event") or "timeout"
 
-            first_response = first_response_holder.get("text", "")
-            first_response_intent = _customer_response_intent(first_response)
-            await _log(
-                "info",
-                "opening_text_customer_response",
-                f"intent={first_response_intent}; event={first_response_holder.get('event') or 'timeout'}; text={first_response}",
-            )
+        first_response = first_response_holder.get("text", "")
+        first_response_intent = _customer_response_intent(first_response)
+        await _log(
+            "info",
+            "opening_text_customer_response",
+            f"intent={first_response_intent}; event={first_response_holder.get('event') or 'timeout'}; text={first_response}",
+        )
 
-            if first_response_intent == "busy":
-                callback_text = "No problem. When is a good time to call back?"
-                callback_requested_at = time.perf_counter()
-                await _log("info", "opening_text_start_requested", "busy_callback_prompt")
-                await session.say(callback_text, allow_interruptions=True)
-                callback_duration_ms = _ms_since(callback_requested_at)
-                await _log("info", "opening_text_completed_at", f"mode=busy; duration_ms={callback_duration_ms}")
-                await _log("info", "opening_text_duration_ms", str(callback_duration_ms))
-                await _log("info", "opening_text_spoken_by_system", "true")
-            elif first_response_intent == "refusal":
-                refusal_text = "No worries at all. Thank you for your time."
-                refusal_requested_at = time.perf_counter()
-                await _log("info", "opening_text_start_requested", "refusal_close_prompt")
-                await session.say(refusal_text, allow_interruptions=True)
-                refusal_duration_ms = _ms_since(refusal_requested_at)
-                await _log("info", "opening_text_completed_at", f"mode=refusal; duration_ms={refusal_duration_ms}")
-                await _log("info", "opening_text_duration_ms", str(refusal_duration_ms))
-                await _log("info", "opening_text_spoken_by_system", "true")
-                await asyncio.sleep(1)
-                ctx.shutdown()
-                return
-            else:
-                opening_requested_at = time.perf_counter()
-                await _log("info", "opening_text_start_requested", opening_text)
-                await session.say(opening_text, allow_interruptions=True)
-                opening_duration_ms = _ms_since(opening_requested_at)
-                await _log("info", "opening_text_completed_at", f"duration_ms={opening_duration_ms}")
-                await _log("info", "opening_text_duration_ms", str(opening_duration_ms))
-                await _log("info", "opening_text_spoken_by_system", "true")
-        except Exception as exc:
-            await _log("warning", "fixed_greeting_failed_no_autonomous_fallback", str(exc))
-    else:
-        await _log("info", "fixed_greeting_disabled", fixed_greeting_config["reason"])
-        await _log("warning", "system_opening_flow_inactive", f"reason={fixed_greeting_config['reason']}")
+        if first_response_intent == "busy":
+            opening_to_speak = "No problem. When is a good time to call back?"
+            opening_mode = "busy"
+        elif first_response_intent == "refusal":
+            opening_to_speak = "No worries at all. Thank you for your time."
+            opening_mode = "refusal"
+        else:
+            opening_to_speak = opening_text
+            opening_mode = "demo"
+
+        await _log("info", "opening_text_start_requested", opening_to_speak)
+        second_line_ok = await _say_with_retry(
+            session,
+            opening_to_speak,
+            allow_interruptions=False,
+            log_prefix="opening_text",
+        )
+        await _log("info", "opening_text_spoken_by_system", str(second_line_ok).lower())
+        if not second_line_ok:
+            await _log("error", "opening_text_failed_after_first_line", opening_to_speak)
+            await _save_call_log_if_missing("failed", "opening text failed after first line")
+            ctx.shutdown()
+            return
+        await _log("info", "gemini_continuation_started_after_system_lines", "true")
+        if opening_mode == "refusal":
+            await _save_call_log_if_missing("not_interested", "customer refused after greeting")
+            ctx.shutdown()
+            return
+    except Exception as exc:
+        await _log("error", "source_greeting_flow_failed_blocking_call", str(exc))
+        await _save_call_log_if_missing("failed", f"source greeting flow failed: {exc}")
+        ctx.shutdown()
+        return
 
     if phone_number:
         sip_identity = f"sip_{phone_number}"
@@ -1182,9 +1204,11 @@ async def entrypoint(ctx: agents.JobContext):
             await asyncio.wait_for(disconnect_event.wait(), timeout=3600)
         except asyncio.TimeoutError:
             await _log("warning", "Call reached 1-hour safety timeout — shutting down")
-        if recording_task:
-            await asyncio.gather(recording_task, return_exceptions=True)
-        await session.aclose()
+        finally:
+            if recording_task:
+                await asyncio.gather(recording_task, return_exceptions=True)
+            await _save_call_log_if_missing()
+            await session.aclose()
     else:
         done = asyncio.Event()
         ctx.room.on("disconnected", lambda: done.set())
