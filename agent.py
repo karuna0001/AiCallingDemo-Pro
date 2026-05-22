@@ -487,28 +487,19 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
     if label == "database":
         mode = "cold_call"
         template = "short_source_database"
-        dynamic_greeting = (
-            f"Hi, {agent_name} from {caller_business}. We have your contact in our database. "
-            "Can I arrange a quick 10-minute Google Meet demo?"
-        )
-        opening = "Can I arrange a quick 10-minute Google Meet demo?"
+        dynamic_greeting = f"Hi, {agent_name} from {caller_business}. Calling about your database enquiry."
+        opening = "Calling about your database enquiry."
     elif label in {"Facebook", "Instagram", "our website", "Google", "WhatsApp"}:
         mode = "enquiry"
         template = "short_source_enquiry"
         source_phrase = f"{label}" if label in {"Facebook", "Instagram", "Google", "WhatsApp"} else "our website"
-        dynamic_greeting = (
-            f"Hi, {agent_name} from {caller_business}. You enquired on {source_phrase} for {service_type}. "
-            "Can I arrange a quick 10-minute Google Meet demo?"
-        )
-        opening = "Can I arrange a quick 10-minute Google Meet demo?"
+        dynamic_greeting = f"Hi, {agent_name} from {caller_business}. Calling about your {source_phrase} enquiry."
+        opening = f"Calling about your {source_phrase} enquiry."
     else:
         mode = "generic"
         template = "short_source_records"
-        dynamic_greeting = (
-            f"Hi, {agent_name} from {caller_business}. You enquired for {service_type}. "
-            "Can I arrange a quick 10-minute Google Meet demo?"
-        )
-        opening = "Can I arrange a quick 10-minute Google Meet demo?"
+        dynamic_greeting = f"Hi, {agent_name} from {caller_business}. Calling about your enquiry."
+        opening = "Calling about your enquiry."
     return {
         "source": norm,
         "label": label,
@@ -516,10 +507,7 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
         "template": template,
         "dynamic_greeting": dynamic_greeting,
         "opening": opening,
-        "legacy_source_opening": (
-            f"We received your enquiry from {label} regarding {service_type}. "
-            "Can I arrange a quick 10-minute Google Meet demo?"
-        ) if mode == "enquiry" else "",
+        "legacy_source_opening": "",
     }
 
 
@@ -643,13 +631,12 @@ def _final_call_override(
         f"- Opening mode: {opening_context.get('mode') or 'generic'}",
         "These values override all previous prompt examples, CRM memory, contact memory, agent profiles, and old conversation history.",
         "Never use any other customer name.",
-        "The application will speak the combined source-aware greeting and demo request through system audio before you continue:",
-        f"Combined greeting: \"{opening_context.get('dynamic_greeting') or ''}\"",
-        "Do not repeat the combined greeting. Do not repeat the demo question. Do not replace it with any other first-business question.",
-        "After the system has spoken that combined line, continue from the customer's next response.",
-        "HARD IDENTITY RULE: Never verify who answered. Never request the customer's name. Start directly with enquiry/source/demo context.",
-        "Do not say 'we received your enquiry' for database or generic record sources.",
-        "Do not hardcode Facebook; only mention Facebook when the current source label is Facebook.",
+        "The application will speak the ultra-short source-aware introduction line through system audio before you continue:",
+        f"Intro greeting: \"{opening_context.get('dynamic_greeting') or ''}\"",
+        "Do not repeat the introduction greeting. Start directly by proposing the 10-minute Google Meet demo as your very first question.",
+        "For example, when the customer says hello or yes, say: 'Great. Can I arrange a quick 10-minute Google Meet demo for you?'",
+        "HARD IDENTITY RULE: Never verify who answered. Never request the customer's name. Start directly with the Google Meet demo question.",
+        "Do not say 'Calling about your enquiry' for database or generic records if it conflicts with database/records instructions.",
     ]
     if customer_name:
         lines.extend([
@@ -1055,13 +1042,12 @@ async def entrypoint(ctx: agents.JobContext):
         await _log("info", "voice_opening_context_built", opening_context["opening"])
         if opening_context["mode"] == "enquiry" and metadata_service_type:
             expected_label = opening_context["label"]
-            expected_service = service_type
             candidate_greeting = opening_context["dynamic_greeting"]
-            if expected_label not in candidate_greeting or expected_service not in candidate_greeting:
+            if expected_label not in candidate_greeting:
                 await _log(
                     "error",
                     "dynamic_greeting_missing_source_context",
-                    f"source={source}; source_label={expected_label}; service_type={expected_service}; greeting={candidate_greeting}",
+                    f"source={source}; source_label={expected_label}; greeting={candidate_greeting}",
                 )
                 ctx.shutdown()
                 return
@@ -1076,13 +1062,14 @@ async def entrypoint(ctx: agents.JobContext):
         await _log("info", "final_voice_context_service_type", service_type)
         await _log("info", "final_voice_context_call_type", call_type)
         await _log("info", "final_voice_prompt_contains_wrong_names", str(final_contains_wrong_names).lower())
-        # Prevent Gemini from producing the combined greeting or first business opening.
+        # Prevent Gemini from producing the greeting or first business opening.
         # It is injected deterministically via session.say() after session.start().
         system_prompt = (
-            "IMPORTANT: The combined source-aware greeting and demo question are already handled by the system. "
-            "Do NOT speak first. Do NOT generate an opening greeting or introduction. "
-            "Do NOT repeat the source reminder or demo line. Continue only after the combined system line has been spoken "
-            "and the customer responds to the demo request. "
+            "IMPORTANT: The ultra-short source-aware introduction line is already spoken by the system. "
+            "Do NOT repeat the introduction, greeting, or hello. "
+            "Your very first turn in this conversation MUST be exactly: "
+            "\"Can I arrange a quick 10-minute Google Meet demo?\" "
+            "or a very close polite variation of it. Start directly with this question. "
             "The person who answered is the lead. Speak directly to them. Never ask for another person.\n\n"
         ) + _base_prompt
         system_prompt = system_prompt + "\n\n" + final_override
@@ -1194,9 +1181,9 @@ async def entrypoint(ctx: agents.JobContext):
             except Exception as e:
                 await _log("warning", f"failed_to_disable_agent_input: {e}")
 
-        # SIP answered audio warmup delay
-        sip_warmup_ms = 1000
-        await _log("info", "sip_answered_audio_warmup_ms=1000", "1000")
+        # SIP answered audio warmup delay (reduced to 600ms for ultra-fast opening)
+        sip_warmup_ms = 600
+        await _log("info", "sip_answered_audio_warmup_ms=600", "600")
         await asyncio.sleep(sip_warmup_ms / 1000.0)
         await _log("info", "first_line_audio_warmup_done=true", "true")
 
@@ -1235,12 +1222,11 @@ async def entrypoint(ctx: agents.JobContext):
         system_greeting_text = dynamic_greeting_text if has_dynamic_greeting_metadata else fallback_fixed_greeting
         if opening_context["mode"] == "enquiry" and metadata_service_type:
             expected_label = opening_context["label"]
-            expected_service = service_type
-            if expected_label not in system_greeting_text or expected_service not in system_greeting_text:
+            if expected_label not in system_greeting_text:
                 await _log(
                     "error",
                     "dynamic_greeting_missing_source_context",
-                    f"source={source}; source_label={expected_label}; service_type={expected_service}; system_greeting_text={system_greeting_text}",
+                    f"source={source}; source_label={expected_label}; system_greeting_text={system_greeting_text}",
                 )
                 ctx.shutdown()
                 return
@@ -1291,32 +1277,35 @@ async def entrypoint(ctx: agents.JobContext):
             except Exception as e:
                 await _log("warning", f"failed_to_disable_agent_input: {e}")
 
-        await _log("info", "combined_opening_mode=true", "true")
-        await _log("info", f"combined_opening_text={system_greeting_text}", system_greeting_text)
+        await _log("info", "short_source_opening_mode=true", "true")
+        await _log("info", f"short_source_opening_text={system_greeting_text}", system_greeting_text)
 
-        combined_ok = await _say_with_retry(
+        opening_start = time.perf_counter()
+        speech_ok = await _say_with_retry(
             session,
             system_greeting_text,
             allow_interruptions=False,
-            log_prefix="combined_opening",
+            log_prefix="short_source_opening",
         )
-        await _log("info", f"combined_opening_spoken_success={str(combined_ok).lower()}", str(combined_ok).lower())
+        opening_duration = int((time.perf_counter() - opening_start) * 1000)
+        await _log("info", f"short_source_opening_spoken_success={str(speech_ok).lower()}", str(speech_ok).lower())
+        await _log("info", f"short_source_opening_duration_ms={opening_duration}", str(opening_duration))
 
-        if not combined_ok:
-            await _log("error", "combined_opening_failed_blocking_call", system_greeting_text)
-            await _save_call_log_if_missing("failed", "combined opening failed")
+        if not speech_ok:
+            await _log("error", "short_source_opening_failed_blocking_call", system_greeting_text)
+            await _save_call_log_if_missing("failed", "short source opening failed")
             ctx.shutdown()
             return
 
-        # Re-enable microphone input to listen to the customer's response
+        # Re-enable microphone input to listen to the customer's response immediately after greeting
         if hasattr(session, "input") and hasattr(session.input, "set_audio_enabled"):
             try:
                 session.input.set_audio_enabled(True)
-                await _log("info", "agent_input_enabled_after_combined_opening=true", "true")
+                await _log("info", "agent_input_enabled_after_short_opening=true", "true")
             except Exception as e:
                 await _log("warning", f"failed_to_enable_agent_input: {e}")
 
-        await _log("info", "gemini_continuation_started_after_combined_opening=true", "true")
+        await _log("info", "gemini_continuation_started_after_short_opening=true", "true")
 
         if phone_number:
             sip_identity = f"sip_{phone_number}"
