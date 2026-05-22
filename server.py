@@ -94,7 +94,7 @@ from whatsapp import (
 load_dotenv(".env", override=False)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("server")
-VOICE_FLOW_RUNTIME = "v3_immediate_source_greeting"
+VOICE_FLOW_RUNTIME = "v4_combined_opening"
 DEFAULT_OUTBOUND_AGENT_NAME = "outbound-caller-v3"
 
 

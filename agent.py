@@ -36,7 +36,7 @@ from tools import AppointmentTools
 load_dotenv(".env", override=False)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("outbound-agent")
-VOICE_FLOW_RUNTIME = "v3_immediate_source_greeting"
+VOICE_FLOW_RUNTIME = "v4_combined_opening"
 DEFAULT_OUTBOUND_AGENT_NAME = "outbound-caller-v3"
 OPENING_RESPONSE_WAIT_SECONDS = 2
 
@@ -488,24 +488,27 @@ def _voice_opening_context(source: str, business_name: str, service_type: str) -
         mode = "cold_call"
         template = "short_source_database"
         dynamic_greeting = (
-            f"Hi, {agent_name} from {caller_business}. We have your contact in our database. Is this a good time?"
+            f"Hi, {agent_name} from {caller_business}. We have your contact in our database. "
+            "Can I arrange a quick 10-minute Google Meet demo?"
         )
-        opening = "Great. Can I arrange a quick 10-minute Google Meet demo?"
+        opening = "Can I arrange a quick 10-minute Google Meet demo?"
     elif label in {"Facebook", "Instagram", "our website", "Google", "WhatsApp"}:
         mode = "enquiry"
         template = "short_source_enquiry"
         source_phrase = f"{label}" if label in {"Facebook", "Instagram", "Google", "WhatsApp"} else "our website"
         dynamic_greeting = (
-            f"Hi, {agent_name} from {caller_business}. You enquired on {source_phrase} for {service_type}. Is this a good time?"
+            f"Hi, {agent_name} from {caller_business}. You enquired on {source_phrase} for {service_type}. "
+            "Can I arrange a quick 10-minute Google Meet demo?"
         )
-        opening = "Great. Can I arrange a quick 10-minute Google Meet demo?"
+        opening = "Can I arrange a quick 10-minute Google Meet demo?"
     else:
         mode = "generic"
         template = "short_source_records"
         dynamic_greeting = (
-            f"Hi, {agent_name} from {caller_business}. You enquired for {service_type}. Is this a good time?"
+            f"Hi, {agent_name} from {caller_business}. You enquired for {service_type}. "
+            "Can I arrange a quick 10-minute Google Meet demo?"
         )
-        opening = "Great. Can I arrange a quick 10-minute Google Meet demo?"
+        opening = "Can I arrange a quick 10-minute Google Meet demo?"
     return {
         "source": norm,
         "label": label,
@@ -1049,8 +1052,6 @@ async def entrypoint(ctx: agents.JobContext):
         await _log("info", "voice_opening_mode", opening_context["mode"])
         await _log("info", "source_label", opening_context["label"])
         await _log("info", "service_type", service_type or "missing")
-        await _log("info", "dynamic_greeting_text_built", opening_context["dynamic_greeting"])
-        await _log("info", "voice_opening_text_built", opening_context["opening"])
         await _log("info", "voice_opening_context_built", opening_context["opening"])
         if opening_context["mode"] == "enquiry" and metadata_service_type:
             expected_label = opening_context["label"]
@@ -1245,11 +1246,9 @@ async def entrypoint(ctx: agents.JobContext):
                 return
         recording_task = asyncio.create_task(_start_recording_after_greeting()) if phone_number else None
         first_response_event, first_response_holder = _watch_first_customer_response(session)
-        await _log("info", "dynamic_greeting_text_built", dynamic_greeting_text)
         await _log("info", "dynamic_greeting_selected", str(has_dynamic_greeting_metadata).lower())
         await _log("info", "outbound_fixed_greeting_used", str(not has_dynamic_greeting_metadata).lower())
         await _log("info", "system_greeting_text", system_greeting_text)
-        await _log("info", "opening_text_built", opening_text)
         await _log("info", "gemini_opening_disabled", "true")
         await _log("info", "generate_reply_identity_opening_removed", "true")
         await _log("info", "response_delay_fix_removed", "true")
