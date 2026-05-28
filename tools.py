@@ -3,7 +3,9 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from livekit import agents, api
 from livekit.agents import llm
@@ -11,8 +13,11 @@ from livekit.agents import llm
 from db import (
     add_contact_memory, check_slot, compress_contact_memory, get_appointments_by_phone,
     get_calls_by_phone, get_contact_memory, get_next_available, insert_appointment,
-    log_call, log_error,
+    log_call, log_error, get_setting, get_appointment_settings,
+    create_followup_action, update_lead_journey,
+    mark_lead_stop_automation, set_next_best_action, reschedule_appointment,
 )
+from followup import parse_followup_time
 
 logger = logging.getLogger("appointment-tools")
 _STALE_SAMPLE_NAMES = ("Prasanth", "Prashanth", "Ramesh", "Sample Lead", "Suresh", "Test Lead", "Unknown Lead")
@@ -51,6 +56,9 @@ class AppointmentTools(llm.ToolContext):
             self.check_availability, self.book_appointment, self.end_call,
             self.transfer_to_human, self.send_sms_confirmation, self.lookup_contact,
             self.remember_details, self.book_calcom, self.cancel_calcom,
+            self.schedule_callback, self.schedule_whatsapp_followup,
+            self.mark_not_interested, self.mark_wrong_number, self.send_details_link,
+            self.book_demo_or_appointment, self.reschedule_demo,
         ]
         if not enabled:
             return all_methods
@@ -76,6 +84,185 @@ class AppointmentTools(llm.ToolContext):
             return f"Confirmed! Booking ID: {booking_id}. See you on {date} at {time} for {service}."
         except Exception:
             return "Technical issue saving the booking. Our team will confirm shortly."
+
+    async def _followup_timezone(self) -> str:
+        return await get_setting("FOLLOWUP_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata"
+
+    async def _snap_call_time_to_window(self, scheduled_at: datetime) -> datetime:
+        enabled = (await get_setting("OUTBOUND_CALLING_ENABLED", os.getenv("OUTBOUND_CALLING_ENABLED", "true")) or "true").lower() != "false"
+        if not enabled:
+            return scheduled_at
+        start_s = await get_setting("OUTBOUND_START_TIME", os.getenv("OUTBOUND_START_TIME", "10:00")) or "10:00"
+        end_s = await get_setting("OUTBOUND_END_TIME", os.getenv("OUTBOUND_END_TIME", "19:00")) or "19:00"
+        days_raw = await get_setting("OUTBOUND_ALLOWED_DAYS", os.getenv("OUTBOUND_ALLOWED_DAYS", "mon,tue,wed,thu,fri,sat")) or "mon,tue,wed,thu,fri,sat"
+        allowed = {d.strip().lower()[:3] for d in days_raw.split(",") if d.strip()}
+        start_h, start_m = [int(x) for x in start_s.split(":")[:2]]
+        end_h, end_m = [int(x) for x in end_s.split(":")[:2]]
+        labels = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+        candidate = scheduled_at
+        for _ in range(8):
+            label = labels[candidate.weekday()]
+            start_dt = candidate.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+            end_dt = candidate.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+            if label in allowed and start_dt <= candidate <= end_dt:
+                return candidate
+            if label in allowed and candidate < start_dt:
+                return start_dt
+            candidate = (candidate + timedelta(days=1)).replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+        return candidate
+
+    @llm.function_tool
+    async def schedule_callback(self, callback_time_text: str, phone_number: Optional[str] = None, channel: str = "call", reason: str = "customer_requested_callback") -> str:
+        """Schedule a saved follow-up when the customer asks to call/message later."""
+        phone = phone_number or self.phone_number or ""
+        if not phone:
+            return "I could not schedule that because the phone number is missing."
+        tz = await self._followup_timezone()
+        scheduled_at = parse_followup_time(callback_time_text, timezone=tz)
+        channel = (channel or "call").lower()
+        if channel == "call":
+            scheduled_at = await self._snap_call_time_to_window(scheduled_at)
+        action_type = "call_only" if channel == "call" else "whatsapp_message"
+        action = "call_customer" if channel == "call" else "message_customer"
+        action_id = await create_followup_action(
+            phone, "callback_requested", action_type, channel, scheduled_at,
+            reason=reason, payload={"callback_time_text": callback_time_text}, priority=2,
+        )
+        await update_lead_journey(phone, {
+            "journey_stage": "callback_requested",
+            "crm_status": "callback_requested",
+            "preferred_callback_at": scheduled_at.isoformat(),
+            "preferred_channel": channel,
+            "last_intent": "callback_request",
+        })
+        await set_next_best_action(phone, action, channel, scheduled_at, reason)
+        await _log("callback_scheduled", f"phone={phone}; action_id={action_id}; scheduled_at={scheduled_at.isoformat()}; channel={channel}")
+        return f"Sure, I have saved a {channel} follow-up for {scheduled_at.strftime('%d %b %I:%M %p')}."
+
+    @llm.function_tool
+    async def schedule_whatsapp_followup(self, message_time_text: str, reason: str = "customer_requested_message_followup", template_purpose: str = "no_response_followup_template") -> str:
+        """Schedule a WhatsApp follow-up when the customer asks for a later message."""
+        if not self.phone_number:
+            return "I could not schedule the WhatsApp follow-up because the phone number is missing."
+        tz = await self._followup_timezone()
+        scheduled_at = parse_followup_time(message_time_text, timezone=tz)
+        action_id = await create_followup_action(
+            self.phone_number, "message_followup_requested", "whatsapp_template", "whatsapp", scheduled_at,
+            reason=reason, payload={"template_purpose": template_purpose, "message_time_text": message_time_text}, priority=3,
+        )
+        await update_lead_journey(self.phone_number, {
+            "journey_stage": "message_followup_requested",
+            "crm_status": "message_followup_requested",
+            "preferred_channel": "whatsapp",
+            "last_intent": "message_later",
+        })
+        await set_next_best_action(self.phone_number, "message_customer", "whatsapp", scheduled_at, reason)
+        await _log("whatsapp_followup_scheduled", f"phone={self.phone_number}; action_id={action_id}; scheduled_at={scheduled_at.isoformat()}")
+        return f"Done, I will send the WhatsApp follow-up on {scheduled_at.strftime('%d %b %I:%M %p')}."
+
+    @llm.function_tool
+    async def mark_not_interested(self, reason: str = "not_interested") -> str:
+        """Stop future automation when the customer says they are not interested."""
+        if self.phone_number:
+            await mark_lead_stop_automation(self.phone_number, reason, "not_interested")
+            await _log("automation_stopped_not_interested", f"phone={self.phone_number}; reason={reason}")
+        return "Understood. I have marked this lead as not interested."
+
+    @llm.function_tool
+    async def mark_wrong_number(self, reason: str = "wrong_number") -> str:
+        """Stop future automation when the customer says this is the wrong number."""
+        if self.phone_number:
+            await mark_lead_stop_automation(self.phone_number, reason, "wrong_number")
+            await _log("automation_stopped_wrong_number", f"phone={self.phone_number}; reason={reason}")
+        return "Sorry about that. I have marked this as a wrong number."
+
+    @llm.function_tool
+    async def send_details_link(self, details_type: str = "service_details", message: str = "") -> str:
+        """Send service/package details on WhatsApp and schedule a soft follow-up."""
+        if not self.phone_number:
+            return "I could not send details because the phone number is missing."
+        details = message or await get_setting("FOLLOWUP_DETAILS_MESSAGE", "")
+        details = details or "Here are the details. Our team can also share pricing and a quick demo link on WhatsApp."
+        try:
+            from whatsapp import is_whatsapp_service_window_open, resolve_wa_template, send_whatsapp_template, send_whatsapp_text
+            if await is_whatsapp_service_window_open(self.phone_number):
+                await send_whatsapp_text(self.phone_number, details)
+                await _log("followup_details_whatsapp_path", f"phone={self.phone_number}; path=free_text_24h_window_open")
+            else:
+                template_purpose = await get_setting("FOLLOWUP_DETAILS_TEMPLATE_PURPOSE", "no_response_followup_template") or "no_response_followup_template"
+                template = await resolve_wa_template(template_purpose)
+                if template:
+                    await send_whatsapp_template(
+                        self.phone_number,
+                        template,
+                        "en",
+                        [],
+                        event_type="details_sent",
+                        source_type="followup_tool",
+                        source_id=self.phone_number,
+                        template_purpose=template_purpose,
+                    )
+                    await _log("followup_details_whatsapp_path", f"phone={self.phone_number}; path=template_24h_window_closed; template_purpose={template_purpose}")
+                else:
+                    await _log("followup_details_whatsapp_path", f"phone={self.phone_number}; path=skipped_24h_window_closed_template_missing", "warning")
+        except Exception as exc:
+            await _log("followup_details_send_failed", str(exc), "warning")
+        followup_at = datetime.now() + timedelta(hours=24)
+        await create_followup_action(
+            self.phone_number, "details_sent", "whatsapp_template", "whatsapp", followup_at,
+            reason="followup_after_details", payload={"template_purpose": "no_response_followup_template", "details_type": details_type},
+        )
+        await update_lead_journey(self.phone_number, {
+            "journey_stage": "details_sent",
+            "last_intent": "details_request",
+            "preferred_channel": "whatsapp",
+        })
+        await set_next_best_action(self.phone_number, "followup_after_details", "whatsapp", followup_at, "details_sent")
+        return "I have sent the details on WhatsApp and saved a follow-up."
+
+    @llm.function_tool
+    async def book_demo_or_appointment(self, name: str, date: str, time: str, service: str = "Google Meet demo") -> str:
+        """Book a demo/appointment after the customer agrees to a date and time."""
+        phone = self.phone_number or ""
+        if not phone:
+            return "I could not book that demo because the phone number is missing."
+        booking_id = await insert_appointment(name or self.lead_name or "Lead", phone, date, time, service)
+        try:
+            from whatsapp import send_appointment_confirmation
+            await send_appointment_confirmation(phone, {"name": name or self.lead_name or "Lead", "date": date, "time": time, "service": service})
+        except Exception as exc:
+            await _log("appointment_confirmation_failed", str(exc), "warning")
+        try:
+            settings = await get_appointment_settings()
+            tz_name = (
+                await get_setting("FOLLOWUP_TIMEZONE", "")
+                or await get_setting("APPOINTMENT_TIMEZONE", "")
+                or settings.get("timezone")
+                or "Asia/Kolkata"
+            )
+            tz = ZoneInfo(tz_name)
+            appt_dt = datetime.fromisoformat(f"{date}T{time[:5]}:00").replace(tzinfo=tz)
+            now_tz = datetime.now(tz)
+            for label, delta in (("24h", timedelta(hours=24)), ("2h", timedelta(hours=2)), ("15m", timedelta(minutes=15))):
+                reminder_at = appt_dt - delta
+                if reminder_at > now_tz:
+                    await create_followup_action(phone, "demo_reminder", "demo_reminder", "whatsapp", reminder_at, reason=f"demo_reminder_{label}", payload={"template_purpose": "reminder_template", "booking_id": booking_id, "date": date, "time": time})
+                    await _log("demo_reminder_scheduled", f"phone={phone}; booking_id={booking_id}; reminder_at={reminder_at.isoformat()}; label={label}")
+        except Exception as exc:
+            await _log("demo_reminder_schedule_failed", str(exc), "warning")
+        await update_lead_journey(phone, {"journey_stage": "demo_booked", "crm_status": "demo_booked", "last_intent": "demo_request"})
+        return f"Confirmed. Your demo is booked for {date} at {time}. Booking ID: {booking_id}."
+
+    @llm.function_tool
+    async def reschedule_demo(self, appointment_id: str, new_date: str, new_time: str) -> str:
+        """Reschedule an existing demo appointment."""
+        if not appointment_id:
+            return "I need the appointment ID to reschedule this demo."
+        result = await reschedule_appointment(appointment_id, new_date, new_time)
+        phone = self.phone_number or result.get("phone") or ""
+        if phone:
+            await update_lead_journey(phone, {"journey_stage": "demo_reschedule_requested", "crm_status": "demo_reschedule_requested", "last_intent": "reschedule_request"})
+        return f"Rescheduled to {new_date} at {new_time}."
 
     @llm.function_tool
     async def end_call(self, outcome: str, reason: str = "") -> str:

@@ -21,6 +21,8 @@ from typing import Optional
 
 import aiohttp
 
+from followup import detect_followup_intent, parse_followup_time
+
 logger = logging.getLogger("whatsapp")
 
 # ── WhatsApp settings keys ─────────────────────────────────────────────────
@@ -475,6 +477,11 @@ async def send_whatsapp_template(
                     if messages and isinstance(messages, list):
                         msg_id = messages[0].get("id")
                     await log_and_record("sent", msg_id, None)
+                    try:
+                        from db import update_lead_journey
+                        await update_lead_journey(phone, {"last_whatsapp_sent_at": datetime.now().isoformat()})
+                    except Exception:
+                        pass
                     return {"success": True, "provider_message_id": msg_id, "error": None, "reason": None}
                 else:
                     error_data = resp_json.get("error") or resp_json
@@ -2169,6 +2176,11 @@ async def send_whatsapp_text(phone: str, message: str) -> dict:
                 if resp.status in (200, 201):
                     messages = resp_json.get("messages") or []
                     msg_id = messages[0].get("id") if messages else None
+                    try:
+                        from db import update_lead_journey
+                        await update_lead_journey(phone, {"last_whatsapp_sent_at": datetime.now().isoformat()})
+                    except Exception:
+                        pass
                     return {"success": True, "provider_message_id": msg_id, "error": None}
                 else:
                     error_data = resp_json.get("error") or resp_json
@@ -3206,6 +3218,46 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
     # Update conversation last message
     await update_conversation_last_message(conv_id, text or f"[{msg_type}]", increment_unread=True)
 
+    followup_intent = detect_followup_intent(text)
+    try:
+        from db import (
+            create_followup_action, get_setting, mark_lead_stop_automation,
+            set_next_best_action, update_lead_journey,
+        )
+        now_iso = datetime.now().isoformat()
+        await update_lead_journey(phone, {"last_customer_reply_at": now_iso, "last_intent": followup_intent or "message_received"})
+        if followup_intent:
+            await _db().log_error("followup", "customer_intent_detected", f"phone={phone}; intent={followup_intent}; text={text[:120]}", "info")
+        tz_name = await get_setting("FOLLOWUP_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata"
+        if followup_intent == "callback_request":
+            scheduled_at = parse_followup_time(text, timezone=tz_name)
+            action_id = await create_followup_action(phone, "callback_requested", "call_only", "call", scheduled_at, reason="whatsapp_callback_request", payload={"text": text}, source="whatsapp", source_id=provider_msg_id)
+            await update_lead_journey(phone, {"journey_stage": "callback_requested", "crm_status": "callback_requested", "preferred_channel": "call", "preferred_callback_at": scheduled_at.isoformat()})
+            await set_next_best_action(phone, "call_customer", "call", scheduled_at, "whatsapp_callback_request")
+            await _db().log_error("followup", "callback_scheduled", f"phone={phone}; action_id={action_id}; scheduled_at={scheduled_at.isoformat()}", "info")
+        elif followup_intent == "message_later":
+            scheduled_at = parse_followup_time(text, timezone=tz_name)
+            action_id = await create_followup_action(phone, "message_followup_requested", "whatsapp_template", "whatsapp", scheduled_at, reason="whatsapp_message_later", payload={"template_purpose": "no_response_followup_template", "text": text}, source="whatsapp", source_id=provider_msg_id)
+            await update_lead_journey(phone, {"journey_stage": "message_followup_requested", "crm_status": "message_followup_requested", "preferred_channel": "whatsapp"})
+            await set_next_best_action(phone, "message_customer", "whatsapp", scheduled_at, "whatsapp_message_later")
+            await _db().log_error("followup", "whatsapp_followup_scheduled", f"phone={phone}; action_id={action_id}; scheduled_at={scheduled_at.isoformat()}", "info")
+        elif followup_intent == "not_interested":
+            await mark_lead_stop_automation(phone, "not_interested", "not_interested")
+            await _db().log_error("followup", "automation_stopped_not_interested", f"phone={phone}", "info")
+            return
+        elif followup_intent == "wrong_number":
+            await mark_lead_stop_automation(phone, "wrong_number", "wrong_number")
+            await _db().log_error("followup", "automation_stopped_wrong_number", f"phone={phone}", "info")
+            return
+        elif followup_intent == "details_request":
+            await update_lead_journey(phone, {"journey_stage": "details_requested", "next_best_action": "send_details", "next_action_channel": "whatsapp"})
+        elif followup_intent == "demo_request":
+            await update_lead_journey(phone, {"journey_stage": "demo_requested", "next_best_action": "book_demo", "next_action_channel": "whatsapp"})
+        elif followup_intent == "reschedule_request":
+            await update_lead_journey(phone, {"journey_stage": "demo_reschedule_requested", "crm_status": "demo_reschedule_requested", "next_best_action": "reschedule_demo"})
+    except Exception as exc:
+        await _log_whatsapp_ai_event(phone, "followup_intent_update_failed", str(exc)[:500], "warning")
+
     # Opt-out check
     if _is_opt_out(text):
         await patch_conversation(conv_id, {"ai_enabled": False, "status": "opted_out"})
@@ -3252,7 +3304,7 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
     # Fix 2: Intent detection (skip if we already promoted a waiting call
     # for this phone — that call covers the customer's request).
     intent = _detect_inbound_intent(text)
-    if promoted == 0 and intent == "callback":
+    if promoted == 0 and intent == "callback" and followup_intent != "callback_request":
         try:
             await _handle_inbound_intent(phone, intent, conv)
         except Exception as exc:

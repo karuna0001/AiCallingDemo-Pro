@@ -58,6 +58,10 @@ from db import (
     update_campaign_contacts, update_campaign_run_stats, update_campaign_status,
     update_crm_contact_followup, update_crm_contact_full, update_crm_contact_notes,
     update_crm_contact_status, delete_crm_contact_by_phone,
+    create_followup_action, get_due_followup_actions, get_followup_actions,
+    get_lead_followup_state, increment_lead_attempts, mark_lead_stop_automation,
+    reschedule_followup_action, set_next_best_action, update_followup_action_status,
+    update_lead_journey,
     get_knowledge_base, save_knowledge_base, get_kb_section, save_kb_section,
     _KB_SECTIONS,
 )
@@ -79,7 +83,7 @@ from whatsapp import (
     insert_automation_action, get_automation_actions, update_automation_action_status,
     run_due_automation_actions,
     send_callback_confirmation, send_appointment_confirmation, send_showroom_visit_confirmation,
-    handle_call_outcome_whatsapp_fallback,
+    handle_call_outcome_whatsapp_fallback, resolve_wa_template, _schedule_or_start_call,
     # Phase 8 — WhatsApp Inbox
     get_conversations, get_conversation_by_id, get_messages, patch_conversation,
     save_wa_message, send_whatsapp_text, is_whatsapp_service_window_open,
@@ -90,6 +94,7 @@ from whatsapp import (
     get_whatsapp_gemini_model,
     run_due_appointment_reminders,
 )
+from followup import parse_followup_time
 
 load_dotenv(".env", override=False)
 logging.basicConfig(level=logging.INFO)
@@ -246,6 +251,165 @@ def _run_due_appointment_reminders_sync():
         logger.exception("Due appointment reminders failed: %s", exc)
 
 
+async def run_due_followup_actions() -> dict:
+    if (await get_setting("FOLLOWUP_ENABLED", "true") or "true").lower() == "false":
+        return {"processed": 0, "disabled": True}
+    due = await get_due_followup_actions(limit=50)
+    if not due:
+        return {"processed": 0, "total_due": 0}
+    processed = 0
+    for action in due:
+        action_id = action.get("id", "")
+        phone = action.get("phone_number", "")
+        channel = (action.get("channel") or "").lower()
+        action_type = action.get("action_type") or ""
+        await log_error("followup", "followup_action_due", f"id={action_id}; phone={phone}; action_type={action_type}; channel={channel}", "info")
+        try:
+            state = await get_lead_followup_state(phone) or {}
+            status = state.get("crm_status") or ""
+            if state.get("stop_automation") or status in CRM_TERMINAL_STATUSES:
+                await update_followup_action_status(action_id, "skipped", {"reason": "stop_automation", "status": status})
+                await log_error("followup", "followup_action_skipped_stop_automation", f"id={action_id}; phone={phone}; status={status}", "info")
+                processed += 1
+                continue
+            if int(action.get("attempt_number") or 0) >= int(action.get("max_attempts") or 3):
+                await update_followup_action_status(action_id, "skipped", {"reason": "max_attempts_reached"})
+                processed += 1
+                continue
+            payload = action.get("payload") or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            if channel == "call" or action_type in {"call_only", "call_customer", "callback_call"}:
+                if not await _is_outbound_allowed():
+                    win = await _outbound_window_error()
+                    next_allowed = win.get("next_allowed_at") or (datetime.now().isoformat())
+                    await reschedule_followup_action(action_id, next_allowed, "outside_outbound_window")
+                    await log_error("followup", "followup_action_rescheduled_outside_window", f"id={action_id}; phone={phone}; next_allowed_at={next_allowed}", "info")
+                    processed += 1
+                    continue
+                contact = {
+                    "phone": phone,
+                    "lead_name": state.get("lead_name") or action.get("lead_name") or "there",
+                    "business_name": state.get("business_name") or "our company",
+                    "service_type": state.get("service_type") or "our service",
+                    "source": state.get("source") or action.get("source") or "followup",
+                }
+                result = await _schedule_or_start_call(phone, contact, "voice_call", action.get("event_type") or "followup", action.get("source") or "followup", delay_minutes=0, return_details=True)
+                await increment_lead_attempts(phone, "call")
+                await update_followup_action_status(action_id, "completed", result if isinstance(result, dict) else {"result": result})
+                await log_error("followup", "followup_action_executed", f"id={action_id}; phone={phone}; channel=call; result={result}", "info")
+            else:
+                template_purpose = payload.get("template_purpose") or ("reminder_template" if action_type == "demo_reminder" else "no_response_followup_template")
+                message = payload.get("message") or action.get("reason") or "Following up as requested."
+                template = await resolve_wa_template(template_purpose)
+                service_window_open = await is_whatsapp_service_window_open(phone)
+                if action_type in {"whatsapp_message", "message_customer"} and service_window_open:
+                    wa_result = await send_whatsapp_text(phone, message)
+                    await log_error("followup", "followup_whatsapp_path", f"id={action_id}; phone={phone}; path=free_text_24h_window_open", "info")
+                elif template:
+                    wa_result = await send_whatsapp_template(phone, template, "en", [], event_type=action.get("event_type") or "followup", source_type="followup_actions", source_id=action_id, template_purpose=template_purpose)
+                    await log_error("followup", "followup_whatsapp_path", f"id={action_id}; phone={phone}; path=template; template_purpose={template_purpose}; service_window_open={str(service_window_open).lower()}", "info")
+                else:
+                    wa_result = {"success": False, "error": "outside_24h_window_template_missing" if not service_window_open else "template_missing", "reason": "template_missing"}
+                    await log_error("followup", "followup_whatsapp_path", f"id={action_id}; phone={phone}; path=skipped_template_missing; service_window_open={str(service_window_open).lower()}", "warning")
+                await increment_lead_attempts(phone, "whatsapp")
+                final_status = "completed" if wa_result.get("success") else ("skipped" if wa_result.get("reason") == "duplicate_suppressed_cooldown" else "failed")
+                await update_followup_action_status(action_id, final_status, wa_result, wa_result.get("error") or "")
+                await log_error("followup", "followup_action_executed", f"id={action_id}; phone={phone}; channel=whatsapp; status={final_status}", "info")
+                if action.get("event_type") == "no_response_followup":
+                    await log_error("followup", "no_response_followup_sent", f"id={action_id}; phone={phone}; status={final_status}", "info")
+            processed += 1
+        except Exception as exc:
+            await update_followup_action_status(action_id, "failed", {}, str(exc)[:500])
+            await log_error("followup", "followup_action_failed", f"id={action_id}; phone={phone}; error={exc}", "error")
+            processed += 1
+    return {"processed": processed, "total_due": len(due)}
+
+
+async def evaluate_no_response_followups() -> dict:
+    if (await get_setting("FOLLOWUP_ENABLED", "true") or "true").lower() == "false":
+        return {"scheduled": 0, "disabled": True}
+    try:
+        rows = await get_crm_contacts()
+    except Exception as exc:
+        await log_error("followup", "no_response_scan_failed", str(exc), "warning")
+        return {"scheduled": 0, "error": str(exc)}
+    delay_hours = int(await get_setting("FOLLOWUP_NO_RESPONSE_TEMPLATE_DELAY_HOURS", "24") or 24)
+    max_wa = int(await get_setting("FOLLOWUP_MAX_WHATSAPP_FOLLOWUPS", "3") or 3)
+    scheduled = 0
+    now = datetime.now()
+    for lead in rows:
+        phone = lead.get("phone_number") or ""
+        if not phone or lead.get("stop_automation") or (lead.get("crm_status") or "") in CRM_TERMINAL_STATUSES:
+            continue
+        if lead.get("last_customer_reply_at"):
+            continue
+        last_sent = lead.get("last_whatsapp_sent_at") or ""
+        if not last_sent:
+            continue
+        try:
+            sent_at = datetime.fromisoformat(str(last_sent).replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            continue
+        count = int(lead.get("no_response_followup_count") or 0)
+        if count >= max_wa or now < sent_at + timedelta(hours=delay_hours):
+            continue
+        pending = [
+            a for a in await get_followup_actions(phone=phone, status="scheduled", limit=20)
+            if a.get("event_type") == "no_response_followup"
+        ]
+        if pending:
+            continue
+        action_id = await create_followup_action(
+            phone, "no_response_followup", "whatsapp_template", "whatsapp", now,
+            reason="welcome_sent_no_customer_reply", payload={"template_purpose": "no_response_followup_template"},
+        )
+        await update_lead_journey(phone, {
+            "journey_stage": "whatsapp_no_response",
+            "crm_status": "whatsapp_no_response",
+            "no_response_followup_count": count + 1,
+            "last_followup_reason": "welcome_sent_no_customer_reply",
+        })
+        await log_error("followup", "no_response_sequence_started", f"phone={phone}; action_id={action_id}; count={count + 1}", "info")
+        scheduled += 1
+    try:
+        booked = await get_all_appointments(status_filter="booked")
+    except Exception:
+        booked = []
+    for appt in booked:
+        phone = appt.get("phone") or appt.get("phone_number") or ""
+        if not phone:
+            continue
+        try:
+            appt_dt = datetime.fromisoformat(f"{appt.get('date')}T{str(appt.get('time') or '00:00')[:5]}:00")
+        except Exception:
+            continue
+        if appt_dt >= now:
+            continue
+        state = await get_lead_followup_state(phone) or {}
+        if state.get("journey_stage") == "demo_no_show":
+            continue
+        await update_appointment_status(appt.get("id"), "no_show")
+        await update_lead_journey(phone, {"journey_stage": "demo_no_show", "crm_status": "demo_no_show", "last_followup_reason": "demo_time_passed_no_response"})
+        action_id = await create_followup_action(phone, "demo_no_show", "whatsapp_template", "whatsapp", now, reason="reschedule_after_demo_no_show", payload={"template_purpose": "no_response_followup_template", "appointment_id": appt.get("id")})
+        await log_error("followup", "demo_no_show_detected", f"phone={phone}; appointment_id={appt.get('id')}; action_id={action_id}", "info")
+        scheduled += 1
+    return {"scheduled": scheduled}
+
+
+def _run_due_followup_actions_sync() -> None:
+    logger.info("Running due follow-up actions")
+    try:
+        asyncio.run(run_due_followup_actions())
+        asyncio.run(evaluate_no_response_followups())
+        logger.info("Due follow-up actions completed")
+    except Exception as exc:
+        logger.exception("Due follow-up actions failed: %s", exc)
+
+
 
 @app.on_event("startup")
 async def _startup():
@@ -253,7 +417,7 @@ async def _startup():
     logger.info("deployed_code_version=%s", version)
     try:
         await log_error("server", "deployed_code_version", version, "info")
-        await log_error("server", "voice_flow_version", "v2_deterministic_indian", "info")
+        await log_error("server", "voice_flow_version", VOICE_FLOW_RUNTIME, "info")
     except Exception:
         pass
     await _sanitize_saved_voice_prompt_setting()
@@ -274,6 +438,12 @@ async def _startup():
                 _run_due_appointment_reminders_sync,
                 trigger=IntervalTrigger(seconds=60),
                 id="appointment_reminder_runner",
+                replace_existing=True,
+            )
+            _scheduler.add_job(
+                _run_due_followup_actions_sync,
+                trigger=IntervalTrigger(seconds=60),
+                id="followup_brain_runner",
                 replace_existing=True,
             )
         except Exception as _e:
@@ -423,6 +593,20 @@ class CrmLeadUpdateRequest(BaseModel):
     crm_notes: Optional[str] = None
     next_followup_at: Optional[str] = None
     assigned_to: Optional[str] = None
+
+
+class ScheduleFollowupRequest(BaseModel):
+    channel: str = "call"
+    when_text: str = "after 30 minutes"
+    reason: str = "manual_followup"
+    action_type: Optional[str] = None
+    template_purpose: Optional[str] = None
+    message: Optional[str] = None
+
+
+class StopAutomationRequest(BaseModel):
+    reason: str = "manual_stop"
+    status: str = "do_not_contact"
 
 
 class CrmCallSelectedRequest(BaseModel):
@@ -2720,6 +2904,64 @@ async def api_get_crm_contact_detail(phone: str):
     if not detail.get("contact"):
         raise HTTPException(404, "CRM contact not found")
     return detail
+
+
+@app.get("/api/crm/contacts/{phone}/followup-state")
+async def api_get_followup_state(phone: str):
+    state = await get_lead_followup_state(phone)
+    if not state:
+        raise HTTPException(404, "CRM contact not found")
+    actions = await get_followup_actions(phone=phone, limit=20)
+    return {"contact": state, "actions": actions}
+
+
+@app.post("/api/crm/contacts/{phone}/schedule-followup")
+async def api_schedule_followup(phone: str, req: ScheduleFollowupRequest):
+    clean = normalize_phone(phone)
+    channel = (req.channel or "call").lower()
+    tz_name = await get_setting("FOLLOWUP_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata"
+    scheduled_at = parse_followup_time(req.when_text, timezone=tz_name)
+    action_type = req.action_type or ("call_only" if channel == "call" else "whatsapp_template")
+    event_type = "callback_requested" if channel == "call" else "message_followup_requested"
+    payload = {"template_purpose": req.template_purpose or "no_response_followup_template", "message": req.message or "", "when_text": req.when_text}
+    action_id = await create_followup_action(clean, event_type, action_type, channel, scheduled_at, reason=req.reason, payload=payload, source="dashboard")
+    await set_next_best_action(clean, "call_customer" if channel == "call" else "message_customer", channel, scheduled_at, req.reason)
+    await update_lead_journey(clean, {
+        "journey_stage": event_type,
+        "crm_status": event_type,
+        "preferred_channel": channel,
+        "preferred_callback_at": scheduled_at.isoformat() if channel == "call" else None,
+    })
+    return {"success": True, "action_id": action_id, "scheduled_at": scheduled_at.isoformat()}
+
+
+@app.post("/api/crm/contacts/{phone}/stop-automation")
+async def api_stop_automation(phone: str, req: StopAutomationRequest):
+    ok = await mark_lead_stop_automation(phone, req.reason, req.status)
+    return {"success": ok}
+
+
+@app.post("/api/crm/contacts/{phone}/resume-automation")
+async def api_resume_automation(phone: str):
+    ok = await update_lead_journey(phone, {"stop_automation": False, "stop_automation_reason": "", "journey_stage": "resumed"})
+    return {"success": ok}
+
+
+@app.get("/api/followups/due")
+async def api_get_due_followups(limit: int = 50):
+    return {"actions": await get_due_followup_actions(limit=limit)}
+
+
+@app.post("/api/followups/run-due")
+async def api_run_due_followups():
+    due_result = await run_due_followup_actions()
+    no_response_result = await evaluate_no_response_followups()
+    return {"due": due_result, "no_response": no_response_result}
+
+
+@app.get("/api/followups")
+async def api_get_followups(phone: Optional[str] = None, status: Optional[str] = None, limit: int = 100):
+    return {"actions": await get_followup_actions(phone=phone, status=status, limit=limit)}
 
 
 @app.post("/api/crm/call-selected")
