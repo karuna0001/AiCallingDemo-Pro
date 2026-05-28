@@ -305,10 +305,16 @@ async def run_due_followup_actions() -> dict:
                 template_purpose = payload.get("template_purpose") or ("reminder_template" if action_type == "demo_reminder" else "no_response_followup_template")
                 message = payload.get("message") or action.get("reason") or "Following up as requested."
                 template = await resolve_wa_template(template_purpose)
-                if template:
-                    wa_result = await send_whatsapp_template(phone, template, "en", [], event_type=action.get("event_type") or "followup", source_type="followup_actions", source_id=action_id, template_purpose=template_purpose)
-                else:
+                service_window_open = await is_whatsapp_service_window_open(phone)
+                if action_type in {"whatsapp_message", "message_customer"} and service_window_open:
                     wa_result = await send_whatsapp_text(phone, message)
+                    await log_error("followup", "followup_whatsapp_path", f"id={action_id}; phone={phone}; path=free_text_24h_window_open", "info")
+                elif template:
+                    wa_result = await send_whatsapp_template(phone, template, "en", [], event_type=action.get("event_type") or "followup", source_type="followup_actions", source_id=action_id, template_purpose=template_purpose)
+                    await log_error("followup", "followup_whatsapp_path", f"id={action_id}; phone={phone}; path=template; template_purpose={template_purpose}; service_window_open={str(service_window_open).lower()}", "info")
+                else:
+                    wa_result = {"success": False, "error": "outside_24h_window_template_missing" if not service_window_open else "template_missing", "reason": "template_missing"}
+                    await log_error("followup", "followup_whatsapp_path", f"id={action_id}; phone={phone}; path=skipped_template_missing; service_window_open={str(service_window_open).lower()}", "warning")
                 await increment_lead_attempts(phone, "whatsapp")
                 final_status = "completed" if wa_result.get("success") else ("skipped" if wa_result.get("reason") == "duplicate_suppressed_cooldown" else "failed")
                 await update_followup_action_status(action_id, final_status, wa_result, wa_result.get("error") or "")
@@ -436,7 +442,7 @@ async def _startup():
             )
             _scheduler.add_job(
                 _run_due_followup_actions_sync,
-                trigger=IntervalTrigger(seconds=90),
+                trigger=IntervalTrigger(seconds=60),
                 id="followup_brain_runner",
                 replace_existing=True,
             )
@@ -2948,7 +2954,9 @@ async def api_get_due_followups(limit: int = 50):
 
 @app.post("/api/followups/run-due")
 async def api_run_due_followups():
-    return await run_due_followup_actions()
+    due_result = await run_due_followup_actions()
+    no_response_result = await evaluate_no_response_followups()
+    return {"due": due_result, "no_response": no_response_result}
 
 
 @app.get("/api/followups")

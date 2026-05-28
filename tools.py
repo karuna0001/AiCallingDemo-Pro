@@ -5,6 +5,7 @@ import re
 import time
 from datetime import datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from livekit import agents, api
 from livekit.agents import llm
@@ -12,7 +13,8 @@ from livekit.agents import llm
 from db import (
     add_contact_memory, check_slot, compress_contact_memory, get_appointments_by_phone,
     get_calls_by_phone, get_contact_memory, get_next_available, insert_appointment,
-    log_call, log_error, get_setting, create_followup_action, update_lead_journey,
+    log_call, log_error, get_setting, get_appointment_settings,
+    create_followup_action, update_lead_journey,
     mark_lead_stop_automation, set_next_best_action, reschedule_appointment,
 )
 from followup import parse_followup_time
@@ -182,8 +184,27 @@ class AppointmentTools(llm.ToolContext):
         details = message or await get_setting("FOLLOWUP_DETAILS_MESSAGE", "")
         details = details or "Here are the details. Our team can also share pricing and a quick demo link on WhatsApp."
         try:
-            from whatsapp import send_whatsapp_text
-            await send_whatsapp_text(self.phone_number, details)
+            from whatsapp import is_whatsapp_service_window_open, resolve_wa_template, send_whatsapp_template, send_whatsapp_text
+            if await is_whatsapp_service_window_open(self.phone_number):
+                await send_whatsapp_text(self.phone_number, details)
+                await _log("followup_details_whatsapp_path", f"phone={self.phone_number}; path=free_text_24h_window_open")
+            else:
+                template_purpose = await get_setting("FOLLOWUP_DETAILS_TEMPLATE_PURPOSE", "no_response_followup_template") or "no_response_followup_template"
+                template = await resolve_wa_template(template_purpose)
+                if template:
+                    await send_whatsapp_template(
+                        self.phone_number,
+                        template,
+                        "en",
+                        [],
+                        event_type="details_sent",
+                        source_type="followup_tool",
+                        source_id=self.phone_number,
+                        template_purpose=template_purpose,
+                    )
+                    await _log("followup_details_whatsapp_path", f"phone={self.phone_number}; path=template_24h_window_closed; template_purpose={template_purpose}")
+                else:
+                    await _log("followup_details_whatsapp_path", f"phone={self.phone_number}; path=skipped_24h_window_closed_template_missing", "warning")
         except Exception as exc:
             await _log("followup_details_send_failed", str(exc), "warning")
         followup_at = datetime.now() + timedelta(hours=24)
@@ -212,10 +233,19 @@ class AppointmentTools(llm.ToolContext):
         except Exception as exc:
             await _log("appointment_confirmation_failed", str(exc), "warning")
         try:
-            appt_dt = datetime.fromisoformat(f"{date}T{time[:5]}:00")
+            settings = await get_appointment_settings()
+            tz_name = (
+                await get_setting("FOLLOWUP_TIMEZONE", "")
+                or await get_setting("APPOINTMENT_TIMEZONE", "")
+                or settings.get("timezone")
+                or "Asia/Kolkata"
+            )
+            tz = ZoneInfo(tz_name)
+            appt_dt = datetime.fromisoformat(f"{date}T{time[:5]}:00").replace(tzinfo=tz)
+            now_tz = datetime.now(tz)
             for label, delta in (("24h", timedelta(hours=24)), ("2h", timedelta(hours=2)), ("15m", timedelta(minutes=15))):
                 reminder_at = appt_dt - delta
-                if reminder_at > datetime.now():
+                if reminder_at > now_tz:
                     await create_followup_action(phone, "demo_reminder", "demo_reminder", "whatsapp", reminder_at, reason=f"demo_reminder_{label}", payload={"template_purpose": "reminder_template", "booking_id": booking_id, "date": date, "time": time})
                     await _log("demo_reminder_scheduled", f"phone={phone}; booking_id={booking_id}; reminder_at={reminder_at.isoformat()}; label={label}")
         except Exception as exc:

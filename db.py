@@ -1131,6 +1131,7 @@ CRM_ACTIVE_STATUSES = {
 # Statuses where no further outbound action is needed.
 CRM_TERMINAL_STATUSES = {
     "Converted", "Lost", "Invalid Number", "Duplicate", "Not Interested",
+    "Wrong Number", "Do Not Contact",
     "converted", "lost", "wrong_number", "do_not_contact", "not_interested",
 }
 # Statuses valid for inclusion in the "Due Today" bucket.
@@ -1471,7 +1472,17 @@ async def update_lead_journey(phone: str, fields: dict) -> bool:
         return len(_safe_list(result)) > 0
     except Exception as exc:
         await log_error("followup", "lead_journey_update_skipped", f"phone={phone}; error={exc}", "warning")
-        return False
+        ok_any = False
+        db = await _adb()
+        for key, value in payload.items():
+            if key == "updated_at":
+                continue
+            try:
+                result = await db.table("crm_contacts").update({key: value, "updated_at": payload["updated_at"]}).eq("phone_number", phone).execute()
+                ok_any = len(_safe_list(result)) > 0 or ok_any
+            except Exception as field_exc:
+                await log_error("followup", "lead_journey_field_update_skipped", f"phone={phone}; field={key}; error={field_exc}", "warning")
+        return ok_any
 
 
 async def create_followup_action(

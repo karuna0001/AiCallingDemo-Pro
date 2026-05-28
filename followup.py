@@ -34,8 +34,43 @@ def _combine(base: datetime, clock: dt_time) -> datetime:
     return base.replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
 
 
+TIME_CONTEXT_WORDS = (
+    "today", "tomorrow", "morning", "afternoon", "evening", "night",
+    "call", "message", "whatsapp", "meet", "meeting", "demo",
+)
+QUANTITY_WORDS = (
+    "cabinet", "cabinets", "lakh", "lakhs", "lac", "lacs", "rupee", "rupees",
+    "rs", "budget", "unit", "units", "piece", "pieces", "pcs", "sqft",
+    "square", "doors", "windows",
+)
+
+
+def _clock_match(text: str) -> Optional[re.Match]:
+    patterns = (
+        r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+        r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+        r"\b(\d{1,2}):(\d{2})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match
+
+    for match in re.finditer(r"\b(\d{1,2})(?::(\d{2}))?\b", text):
+        start, end = match.span()
+        before = text[max(0, start - 18):start]
+        after = text[end:end + 18]
+        nearby = f"{before} {after}"
+        next_word = re.match(r"\s*([a-z]+)", after)
+        if next_word and next_word.group(1) in QUANTITY_WORDS:
+            continue
+        if any(word in nearby for word in TIME_CONTEXT_WORDS):
+            return match
+    return None
+
+
 def _parse_clock(text: str) -> Optional[dt_time]:
-    match = re.search(r"\b(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", text)
+    match = _clock_match(text)
     if not match:
         return None
     hour = int(match.group(1))
@@ -126,3 +161,12 @@ def detect_followup_intent(text: str) -> str:
 
 def iso_utcish(value: datetime) -> str:
     return value.isoformat()
+
+
+FOLLOWUP_TIME_PARSER_SMOKE_EXAMPLES = [
+    ("call me after 30 minutes", "relative +30 minutes"),
+    ("message me tomorrow morning", "tomorrow 09:00"),
+    ("call tomorrow at 11 am", "tomorrow 11:00"),
+    ("I need 10 cabinets", "no clock parse; fallback applies"),
+    ("budget 5 lakh", "no clock parse; fallback applies"),
+]
