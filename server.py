@@ -90,6 +90,7 @@ from whatsapp import (
     get_or_create_conversation, update_conversation_last_message,
     soft_delete_whatsapp_message, soft_delete_whatsapp_conversation,
     parse_webhook_messages, handle_inbound_whatsapp_message,
+    get_whatsapp_message_activity,
     fetch_whatsapp_media,
     get_whatsapp_gemini_model,
     run_due_appointment_reminders,
@@ -1844,20 +1845,88 @@ async def api_wa_webhook_verify(
     raise HTTPException(403, "Verification failed")
 
 
+def _wa_mask_phone_for_log(phone: str) -> str:
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if len(digits) <= 4:
+        return digits
+    return f"***{digits[-4:]}"
+
+
+def _wa_detect_webhook_provider(payload, parsed_list: Optional[list] = None) -> str:
+    providers = sorted({
+        str(p.get("provider") or "").lower()
+        for p in (parsed_list or [])
+        if isinstance(p, dict) and p.get("provider")
+    })
+    if providers:
+        return ",".join(providers)
+    if isinstance(payload, dict) and (payload.get("object") == "whatsapp_business_account" or "entry" in payload):
+        return "meta"
+    if isinstance(payload, dict) and any(k in payload for k in ("event", "events", "channel_id", "data")):
+        return "vobiz"
+    return "unknown"
+
+
+def _wa_safe_webhook_summary(payload, parsed_list: Optional[list] = None) -> dict:
+    parsed_list = parsed_list or []
+    top_keys = list(payload.keys())[:12] if isinstance(payload, dict) else [type(payload).__name__]
+    message_types = sorted({str(p.get("message_type") or "unknown") for p in parsed_list if isinstance(p, dict)})
+    phones = sorted({_wa_mask_phone_for_log(p.get("phone") or "") for p in parsed_list if isinstance(p, dict) and p.get("phone")})
+    return {
+        "provider": _wa_detect_webhook_provider(payload, parsed_list),
+        "top_level_keys": top_keys,
+        "parsed_message_count": len(parsed_list),
+        "message_types": message_types,
+        "phones_found": phones,
+        "has_entry": bool(isinstance(payload, dict) and payload.get("entry")),
+        "has_events": bool(isinstance(payload, dict) and payload.get("events")),
+    }
+
+
 @app.post("/api/whatsapp/webhook")
 async def api_wa_webhook_receive(request: Request):
     try:
         payload = await request.json()
-    except Exception:
+    except Exception as exc:
+        await log_error("whatsapp_webhook", "whatsapp_webhook_received", f"provider=unknown; invalid_json=true; error={str(exc)[:200]}", "warning")
+        await log_error("whatsapp_webhook", "whatsapp_webhook_parsed_empty", "invalid_json=true", "warning")
         return {"status": "ok"}  # always return 200 to Meta
     try:
         parsed_list = parse_webhook_messages(payload)
+        summary = _wa_safe_webhook_summary(payload, parsed_list)
+        await log_error("whatsapp_webhook", "whatsapp_webhook_received", json.dumps(summary, separators=(",", ":"))[:1800], "info")
+        if not parsed_list:
+            await log_error("whatsapp_webhook", "whatsapp_webhook_parsed_empty", json.dumps(summary, separators=(",", ":"))[:1800], "warning")
         import asyncio as _asyncio
         for parsed in parsed_list:
             _asyncio.create_task(handle_inbound_whatsapp_message(parsed))
     except Exception as exc:
         logger.error("Webhook processing error: %s", exc)
+        await log_error("whatsapp_webhook", "whatsapp_webhook_processing_error", str(exc)[:500], "error")
     return {"status": "ok"}
+
+
+@app.get("/api/whatsapp/webhook/status")
+async def api_wa_webhook_status():
+    health = await get_wa_health()
+    raw_logs = await get_logs(limit=200)
+    interesting_sources = {
+        "whatsapp_webhook", "whatsapp_ai", "whatsapp_status", "whatsapp_inbox",
+        "whatsapp_text", "whatsapp_template", "whatsapp_automation", "whatsapp_media",
+    }
+    webhook_logs = [
+        row for row in (raw_logs or [])
+        if (row.get("source") in interesting_sources)
+        or ("whatsapp" in str(row.get("message") or "").lower())
+    ][:20]
+    activity = await get_whatsapp_message_activity()
+    return {
+        "webhook_route_active": True,
+        "whatsapp_health": health,
+        "logs": webhook_logs,
+        "last_inbound_whatsapp_message_at": activity.get("last_inbound_whatsapp_message_at"),
+        "last_outbound_ai_message_at": activity.get("last_outbound_ai_message_at"),
+    }
 
 
 # ── WhatsApp Inbox — Conversations ────────────────────────────────────────────
