@@ -10,22 +10,40 @@
 
 ## Inbound Customer Reply
 - Send `Hi` from a separate customer phone to the business WhatsApp number.
+- Open `GET /api/whatsapp/debug/phone/%2B919150151775` using the test customer number.
+- Confirm the response includes:
+  - `normalized_phone=+919150151775`
+  - a conversation record
+  - the latest inbound message with `direction=inbound`, `message_type=text`, `message_text=Hi`, and `provider_status=received`
+  - the latest outbound AI message with `direction=outbound` and `ai_generated=true`
 - Confirm dashboard WhatsApp Inbox shows the conversation.
 - Confirm the inbound message is saved in the chat before any AI reply.
+- Confirm the dashboard left conversation list updates with today's local time and latest text.
 - Confirm `/api/logs?source=whatsapp_inbox` shows `whatsapp_inbound_received` and `whatsapp_inbound_saved`.
+- Confirm `/api/logs?source=whatsapp_inbox` also shows `whatsapp_conversation_get_or_create_success`, `whatsapp_inbound_message_saved`, and `whatsapp_conversation_last_message_updated`.
 - Confirm `/api/logs?source=whatsapp_webhook` shows `whatsapp_webhook_received` with provider, top-level keys, parsed count, message types, and masked phone numbers.
 
 ## AI Reply
 - Confirm `/api/logs?source=whatsapp_ai` shows:
+  - `whatsapp_ai_decision_started`
+  - `whatsapp_ai_enabled_true`
+  - `whatsapp_ai_service_window_open`
   - `ai_enabled_status`
   - `service_window_status`
+  - `whatsapp_ai_generation_started`
+  - `whatsapp_ai_generation_success`
   - `ai_provider_selected`
   - `whatsapp_gemini_model`
+  - `whatsapp_ai_send_started`
+  - `whatsapp_ai_send_success`
+  - `whatsapp_ai_outbound_message_saved`
   - `whatsapp_text_send_started`
 - Confirm successful sends show `whatsapp_text_send_success`.
+- Confirm the customer phone receives the AI reply.
 - If Gemini is unavailable, confirm the fallback message is saved and sent only inside the 24-hour service window:
   `Thanks, I received your message. Our team will check and get back shortly.`
 - If provider send fails, confirm the outbound AI message is still saved with `provider_status=failed` and the send error in raw payload.
+- Re-send the same webhook payload or provider message ID and confirm `whatsapp_duplicate_inbound_skipped` appears and no duplicate AI reply is sent.
 
 ## Status Webhooks
 - Trigger or wait for read/delivered/failed status updates.
