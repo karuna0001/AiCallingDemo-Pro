@@ -179,12 +179,93 @@ ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS service_type text;
 ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS upload_batch_id text;
 ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS import_source text;
 ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS last_synced_at timestamptz;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS journey_stage text DEFAULT 'new_lead';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS next_best_action text DEFAULT '';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS next_action_at timestamptz;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS next_action_channel text DEFAULT '';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS last_customer_reply_at timestamptz;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS last_whatsapp_sent_at timestamptz;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS last_call_attempt_at timestamptz;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS call_attempt_count integer DEFAULT 0;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS whatsapp_followup_count integer DEFAULT 0;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS no_response_followup_count integer DEFAULT 0;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS demo_reminder_count integer DEFAULT 0;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS stop_automation boolean DEFAULT false;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS stop_automation_reason text DEFAULT '';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS last_followup_reason text DEFAULT '';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS last_intent text DEFAULT '';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS preferred_channel text DEFAULT '';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS preferred_callback_at timestamptz;
 
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_source ON crm_contacts(source);
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_business_name ON crm_contacts(business_name);
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_campaign_name ON crm_contacts(campaign_name);
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_city ON crm_contacts(city);
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_created_at ON crm_contacts(created_at);
+CREATE INDEX IF NOT EXISTS idx_crm_contacts_journey_stage ON crm_contacts(journey_stage);
+CREATE INDEX IF NOT EXISTS idx_crm_contacts_next_action ON crm_contacts(next_action_at);
+
+CREATE TABLE IF NOT EXISTS followup_actions (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    phone_number text NOT NULL,
+    lead_name text,
+    event_type text NOT NULL,
+    action_type text NOT NULL,
+    channel text NOT NULL,
+    scheduled_at timestamptz NOT NULL,
+    status text DEFAULT 'scheduled',
+    priority integer DEFAULT 5,
+    source text DEFAULT '',
+    source_id text DEFAULT '',
+    reason text DEFAULT '',
+    payload jsonb DEFAULT '{}'::jsonb,
+    result jsonb DEFAULT '{}'::jsonb,
+    error_message text DEFAULT '',
+    attempt_number integer DEFAULT 0,
+    max_attempts integer DEFAULT 3,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    completed_at timestamptz
+);
+ALTER TABLE followup_actions DISABLE ROW LEVEL SECURITY;
+CREATE INDEX IF NOT EXISTS idx_followup_actions_status_scheduled ON followup_actions(status, scheduled_at);
+CREATE INDEX IF NOT EXISTS idx_followup_actions_phone ON followup_actions(phone_number);
+CREATE INDEX IF NOT EXISTS idx_followup_actions_event_type ON followup_actions(event_type);
+CREATE INDEX IF NOT EXISTS idx_followup_actions_channel ON followup_actions(channel);
+
+INSERT INTO lead_statuses (name, color) VALUES
+('callback_requested', '#f59e0b'),
+('message_followup_requested', '#06b6d4'),
+('whatsapp_no_response', '#94a3b8'),
+('first_call_no_answer', '#f97316'),
+('first_call_busy', '#f97316'),
+('demo_booked', '#3b82f6'),
+('demo_reminder_due', '#6366f1'),
+('demo_no_response', '#a855f7'),
+('demo_no_show', '#dc2626'),
+('demo_reschedule_requested', '#8b5cf6'),
+('not_interested', '#dc2626'),
+('wrong_number', '#9ca3af'),
+('do_not_contact', '#111827'),
+('converted', '#22c55e'),
+('lost', '#6b7280')
+ON CONFLICT (name) DO NOTHING;
+
+INSERT INTO settings (key, value, updated_at) VALUES
+('FOLLOWUP_ENABLED', 'true', now()::text),
+('FOLLOWUP_TIMEZONE', 'Asia/Kolkata', now()::text),
+('FOLLOWUP_MAX_CALLS_PER_DAY', '2', now()::text),
+('FOLLOWUP_MAX_CALL_ATTEMPTS_TOTAL', '3', now()::text),
+('FOLLOWUP_MAX_WHATSAPP_FOLLOWUPS', '3', now()::text),
+('FOLLOWUP_WELCOME_NO_RESPONSE_CALL_DELAY_MINUTES', '30', now()::text),
+('FOLLOWUP_NO_RESPONSE_TEMPLATE_DELAY_HOURS', '24', now()::text),
+('FOLLOWUP_BUSY_RETRY_DELAY_HOURS', '2', now()::text),
+('FOLLOWUP_DEMO_REMINDER_24H', 'true', now()::text),
+('FOLLOWUP_DEMO_REMINDER_2H', 'true', now()::text),
+('FOLLOWUP_DEMO_REMINDER_15M', 'true', now()::text),
+('FOLLOWUP_STOP_ON_NOT_INTERESTED', 'true', now()::text),
+('FOLLOWUP_STOP_ON_WRONG_NUMBER', 'true', now()::text)
+ON CONFLICT (key) DO NOTHING;
 
 -- ── Phase 8: WhatsApp Chat Inbox ──────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS whatsapp_conversations (

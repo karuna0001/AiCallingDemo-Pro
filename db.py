@@ -78,6 +78,19 @@ DEFAULTS = {
     "TELEGRAM_BOT_TOKEN":            os.getenv("TELEGRAM_BOT_TOKEN", ""),
     "TELEGRAM_CHAT_ID":              os.getenv("TELEGRAM_CHAT_ID", ""),
     "TELEGRAM_NOTIFICATIONS_ENABLED": os.getenv("TELEGRAM_NOTIFICATIONS_ENABLED", "false"),
+    "FOLLOWUP_ENABLED": os.getenv("FOLLOWUP_ENABLED", "true"),
+    "FOLLOWUP_TIMEZONE": os.getenv("FOLLOWUP_TIMEZONE", "Asia/Kolkata"),
+    "FOLLOWUP_MAX_CALLS_PER_DAY": os.getenv("FOLLOWUP_MAX_CALLS_PER_DAY", "2"),
+    "FOLLOWUP_MAX_CALL_ATTEMPTS_TOTAL": os.getenv("FOLLOWUP_MAX_CALL_ATTEMPTS_TOTAL", "3"),
+    "FOLLOWUP_MAX_WHATSAPP_FOLLOWUPS": os.getenv("FOLLOWUP_MAX_WHATSAPP_FOLLOWUPS", "3"),
+    "FOLLOWUP_WELCOME_NO_RESPONSE_CALL_DELAY_MINUTES": os.getenv("FOLLOWUP_WELCOME_NO_RESPONSE_CALL_DELAY_MINUTES", "30"),
+    "FOLLOWUP_NO_RESPONSE_TEMPLATE_DELAY_HOURS": os.getenv("FOLLOWUP_NO_RESPONSE_TEMPLATE_DELAY_HOURS", "24"),
+    "FOLLOWUP_BUSY_RETRY_DELAY_HOURS": os.getenv("FOLLOWUP_BUSY_RETRY_DELAY_HOURS", "2"),
+    "FOLLOWUP_DEMO_REMINDER_24H": os.getenv("FOLLOWUP_DEMO_REMINDER_24H", "true"),
+    "FOLLOWUP_DEMO_REMINDER_2H": os.getenv("FOLLOWUP_DEMO_REMINDER_2H", "true"),
+    "FOLLOWUP_DEMO_REMINDER_15M": os.getenv("FOLLOWUP_DEMO_REMINDER_15M", "true"),
+    "FOLLOWUP_STOP_ON_NOT_INTERESTED": os.getenv("FOLLOWUP_STOP_ON_NOT_INTERESTED", "true"),
+    "FOLLOWUP_STOP_ON_WRONG_NUMBER": os.getenv("FOLLOWUP_STOP_ON_WRONG_NUMBER", "true"),
 }
 
 DEFAULT_LEAD_STATUSES = [
@@ -96,6 +109,21 @@ DEFAULT_LEAD_STATUSES = [
     ("Not Interested", "#dc2626"),
     ("Wrong Number", "#9ca3af"),
     ("No Response", "#94a3b8"),
+    ("callback_requested", "#f59e0b"),
+    ("message_followup_requested", "#06b6d4"),
+    ("whatsapp_no_response", "#94a3b8"),
+    ("first_call_no_answer", "#f97316"),
+    ("first_call_busy", "#f97316"),
+    ("demo_booked", "#3b82f6"),
+    ("demo_reminder_due", "#6366f1"),
+    ("demo_no_response", "#a855f7"),
+    ("demo_no_show", "#dc2626"),
+    ("demo_reschedule_requested", "#8b5cf6"),
+    ("not_interested", "#dc2626"),
+    ("wrong_number", "#9ca3af"),
+    ("do_not_contact", "#111827"),
+    ("converted", "#22c55e"),
+    ("lost", "#6b7280"),
 ]
 
 CRM_LEAD_FIELDS = [
@@ -1071,6 +1099,23 @@ def _crm_fallback_contact(row: dict) -> dict:
         "last_call_outcome": row.get("last_call_outcome") or row.get("last_outcome"),
         "last_call_at": row.get("last_call_at") or row.get("last_call"),
         "total_calls": row.get("total_calls") or 0,
+        "journey_stage": row.get("journey_stage") or "new_lead",
+        "next_best_action": row.get("next_best_action") or "",
+        "next_action_at": row.get("next_action_at"),
+        "next_action_channel": row.get("next_action_channel") or "",
+        "last_customer_reply_at": row.get("last_customer_reply_at"),
+        "last_whatsapp_sent_at": row.get("last_whatsapp_sent_at"),
+        "last_call_attempt_at": row.get("last_call_attempt_at"),
+        "call_attempt_count": row.get("call_attempt_count") or 0,
+        "whatsapp_followup_count": row.get("whatsapp_followup_count") or 0,
+        "no_response_followup_count": row.get("no_response_followup_count") or 0,
+        "demo_reminder_count": row.get("demo_reminder_count") or 0,
+        "stop_automation": bool(row.get("stop_automation") or False),
+        "stop_automation_reason": row.get("stop_automation_reason") or "",
+        "last_followup_reason": row.get("last_followup_reason") or "",
+        "last_intent": row.get("last_intent") or "",
+        "preferred_channel": row.get("preferred_channel") or "",
+        "preferred_callback_at": row.get("preferred_callback_at"),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }
@@ -1084,7 +1129,10 @@ CRM_ACTIVE_STATUSES = {
     "Quotation Sent", "Payment Pending",
 }
 # Statuses where no further outbound action is needed.
-CRM_TERMINAL_STATUSES = {"Converted", "Lost", "Invalid Number", "Duplicate", "Not Interested"}
+CRM_TERMINAL_STATUSES = {
+    "Converted", "Lost", "Invalid Number", "Duplicate", "Not Interested",
+    "converted", "lost", "wrong_number", "do_not_contact", "not_interested",
+}
 # Statuses valid for inclusion in the "Due Today" bucket.
 CRM_DUE_TODAY_STATUSES = {
     "New", "Pending Call", "Callback Requested", "Follow-up Scheduled",
@@ -1396,6 +1444,188 @@ async def update_crm_contact_followup(phone: str, next_followup_at: Optional[str
         logger.warning("update_crm_contact_followup: failed for %s: %s", phone, exc)
         return False
     return len(_safe_list(result)) > 0
+
+
+JOURNEY_FIELDS = {
+    "journey_stage", "next_best_action", "next_action_at", "next_action_channel",
+    "last_customer_reply_at", "last_whatsapp_sent_at", "last_call_attempt_at",
+    "call_attempt_count", "whatsapp_followup_count", "no_response_followup_count",
+    "demo_reminder_count", "stop_automation", "stop_automation_reason",
+    "last_followup_reason", "last_intent", "preferred_channel",
+    "preferred_callback_at", "crm_status", "next_followup_at",
+}
+
+
+async def update_lead_journey(phone: str, fields: dict) -> bool:
+    phone = normalize_phone(phone)
+    if not phone or not fields:
+        return False
+    await _ensure_crm_contact(phone)
+    payload = {k: v for k, v in (fields or {}).items() if k in JOURNEY_FIELDS}
+    if not payload:
+        return False
+    payload["updated_at"] = datetime.now().isoformat()
+    try:
+        db = await _adb()
+        result = await db.table("crm_contacts").update(payload).eq("phone_number", phone).execute()
+        return len(_safe_list(result)) > 0
+    except Exception as exc:
+        await log_error("followup", "lead_journey_update_skipped", f"phone={phone}; error={exc}", "warning")
+        return False
+
+
+async def create_followup_action(
+    phone: str,
+    event_type: str,
+    action_type: str,
+    channel: str,
+    scheduled_at,
+    reason: str = "",
+    payload: Optional[dict] = None,
+    priority: int = 5,
+    max_attempts: int = 3,
+    source: str = "",
+    source_id: str = "",
+) -> Optional[str]:
+    phone = normalize_phone(phone)
+    row = {
+        "id": str(uuid.uuid4()),
+        "phone_number": phone,
+        "event_type": event_type,
+        "action_type": action_type,
+        "channel": channel,
+        "scheduled_at": scheduled_at.isoformat() if hasattr(scheduled_at, "isoformat") else str(scheduled_at),
+        "status": "scheduled",
+        "priority": priority,
+        "source": source or "",
+        "source_id": source_id or "",
+        "reason": reason or "",
+        "payload": payload or {},
+        "result": {},
+        "attempt_number": 0,
+        "max_attempts": max_attempts,
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+    }
+    try:
+        db = await _adb()
+        result = await db.table("followup_actions").insert(row).execute()
+        created = _safe_row(result) or row
+        action_id = created.get("id") or row["id"]
+        await log_error("followup", "followup_action_created", f"id={action_id}; phone={phone}; event_type={event_type}; action_type={action_type}; channel={channel}; scheduled_at={row['scheduled_at']}; reason={reason}", "info")
+        return action_id
+    except Exception as exc:
+        await log_error("followup", "followup_action_create_failed", f"phone={phone}; error={exc}", "warning")
+        return None
+
+
+async def get_due_followup_actions(limit: int = 50) -> list:
+    try:
+        db = await _adb()
+        result = (
+            await db.table("followup_actions")
+            .select("*")
+            .eq("status", "scheduled")
+            .lte("scheduled_at", datetime.now().isoformat())
+            .order("priority", desc=False)
+            .order("scheduled_at", desc=False)
+            .limit(limit)
+            .execute()
+        )
+        return _safe_list(result)
+    except Exception as exc:
+        await log_error("followup", "followup_due_fetch_failed", str(exc), "warning")
+        return []
+
+
+async def get_followup_actions(phone: Optional[str] = None, status: Optional[str] = None, limit: int = 100) -> list:
+    try:
+        db = await _adb()
+        query = db.table("followup_actions").select("*").order("scheduled_at", desc=True).limit(limit)
+        if phone:
+            query = query.eq("phone_number", normalize_phone(phone))
+        if status:
+            query = query.eq("status", status)
+        result = await query.execute()
+        return _safe_list(result)
+    except Exception as exc:
+        await log_error("followup", "followup_actions_fetch_failed", str(exc), "warning")
+        return []
+
+
+async def update_followup_action_status(action_id: str, status: str, result: Optional[dict] = None, error_message: str = "") -> bool:
+    updates = {
+        "status": status,
+        "updated_at": datetime.now().isoformat(),
+        "result": result or {},
+        "error_message": error_message or "",
+    }
+    if status in {"completed", "skipped", "failed"}:
+        updates["completed_at"] = datetime.now().isoformat()
+    try:
+        db = await _adb()
+        res = await db.table("followup_actions").update(updates).eq("id", action_id).execute()
+        return len(_safe_list(res)) > 0
+    except Exception as exc:
+        await log_error("followup", "followup_action_status_update_failed", f"id={action_id}; error={exc}", "warning")
+        return False
+
+
+async def reschedule_followup_action(action_id: str, scheduled_at, reason: str = "") -> bool:
+    updates = {
+        "status": "scheduled",
+        "scheduled_at": scheduled_at.isoformat() if hasattr(scheduled_at, "isoformat") else str(scheduled_at),
+        "updated_at": datetime.now().isoformat(),
+        "error_message": reason or "",
+    }
+    try:
+        db = await _adb()
+        res = await db.table("followup_actions").update(updates).eq("id", action_id).execute()
+        return len(_safe_list(res)) > 0
+    except Exception as exc:
+        await log_error("followup", "followup_action_reschedule_failed", f"id={action_id}; error={exc}", "warning")
+        return False
+
+
+async def increment_lead_attempts(phone: str, channel: str) -> bool:
+    phone = normalize_phone(phone)
+    state = await get_lead_followup_state(phone) or {}
+    now = datetime.now().isoformat()
+    if (channel or "").lower() == "call":
+        return await update_lead_journey(phone, {
+            "call_attempt_count": int(state.get("call_attempt_count") or 0) + 1,
+            "last_call_attempt_at": now,
+        })
+    return await update_lead_journey(phone, {
+        "whatsapp_followup_count": int(state.get("whatsapp_followup_count") or 0) + 1,
+        "last_whatsapp_sent_at": now,
+    })
+
+
+async def mark_lead_stop_automation(phone: str, reason: str, status: str) -> bool:
+    await log_error("followup", f"automation_stopped_{reason}", f"phone={phone}; status={status}", "info")
+    return await update_lead_journey(phone, {
+        "stop_automation": True,
+        "stop_automation_reason": reason,
+        "journey_stage": status,
+        "crm_status": status,
+        "last_intent": reason,
+    })
+
+
+async def get_lead_followup_state(phone: str) -> Optional[dict]:
+    contact = await get_crm_contact_by_phone(phone)
+    return contact
+
+
+async def set_next_best_action(phone: str, action: str, channel: str, scheduled_at, reason: str = "") -> bool:
+    return await update_lead_journey(phone, {
+        "next_best_action": action,
+        "next_action_channel": channel,
+        "next_action_at": scheduled_at.isoformat() if hasattr(scheduled_at, "isoformat") else scheduled_at,
+        "next_followup_at": scheduled_at.isoformat() if hasattr(scheduled_at, "isoformat") else scheduled_at,
+        "last_followup_reason": reason,
+    })
 
 
 async def update_crm_contact_notes(phone: str, crm_notes: str) -> bool:

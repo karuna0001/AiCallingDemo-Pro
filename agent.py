@@ -1178,6 +1178,14 @@ async def entrypoint(ctx: agents.JobContext):
             "Do NOT say 'hello', do NOT say any other opening, and do NOT wait for the customer to speak first. "
             "Start the call with this exact greeting immediately. "
             "The person who answered is the lead. Speak directly to them. Never ask for another person.\n\n"
+            "FOLLOW-UP TOOL RULES:\n"
+            "If customer says call later, after 30 minutes, tomorrow, morning, evening, or busy, call schedule_callback.\n"
+            "If customer asks message me tomorrow or send WhatsApp later, call schedule_whatsapp_followup.\n"
+            "If customer says not interested, call mark_not_interested.\n"
+            "If customer says wrong number, call mark_wrong_number.\n"
+            "If customer asks for details, price, package, brochure, or catalog, answer from KB and call send_details_link.\n"
+            "If demo time is agreed, call book_demo_or_appointment. If they ask to change time, call reschedule_demo.\n"
+            "Do not just say okay to follow-up requests. Always save the follow-up action with the correct tool.\n\n"
         ) + _base_prompt
         system_prompt = system_prompt + "\n\n" + final_override
         system_prompt, _ = await _sanitize_competing_opening_questions(system_prompt)
