@@ -576,27 +576,27 @@ async def get_whatsapp_logs(phone: Optional[str] = None, limit: int = 50) -> lis
 async def get_whatsapp_message_activity() -> dict:
     """Return latest inbound customer and outbound AI message timestamps for diagnostics."""
     out = {"last_inbound_whatsapp_message_at": None, "last_outbound_ai_message_at": None}
+    async def latest_created_at(db, direction: str, ai_generated: Optional[bool] = None) -> Optional[str]:
+        query = db.table("whatsapp_messages").select("*").eq("direction", direction)
+        if ai_generated is not None:
+            query = query.eq("ai_generated", ai_generated)
+        try:
+            res = await query.order("created_at", desc=True).limit(1).execute()
+        except Exception:
+            query = db.table("whatsapp_messages").select("*").eq("direction", direction)
+            if ai_generated is not None:
+                query = query.eq("ai_generated", ai_generated)
+            res = await query.order("timestamp", desc=True).limit(1).execute()
+        rows = res.data or []
+        if not rows:
+            return None
+        row = rows[0]
+        return row.get("created_at") or row.get("updated_at") or row.get("timestamp")
+
     try:
         db = await _db()._adb()
-        inbound = await db.table("whatsapp_messages") \
-            .select("created_at") \
-            .eq("direction", "inbound") \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
-        rows = inbound.data or []
-        if rows:
-            out["last_inbound_whatsapp_message_at"] = rows[0].get("created_at")
-        outbound = await db.table("whatsapp_messages") \
-            .select("created_at") \
-            .eq("direction", "outbound") \
-            .eq("ai_generated", True) \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
-        rows = outbound.data or []
-        if rows:
-            out["last_outbound_ai_message_at"] = rows[0].get("created_at")
+        out["last_inbound_whatsapp_message_at"] = await latest_created_at(db, "inbound")
+        out["last_outbound_ai_message_at"] = await latest_created_at(db, "outbound", True)
     except Exception as exc:
         logger.debug("WA message activity fetch failed: %s", exc)
     return out
@@ -1739,6 +1739,7 @@ async def update_conversation_last_message(conv_id: str, text: str, increment_un
         upd: dict = {
             "last_message": text[:200],
             "last_message_at": datetime.now().isoformat(),
+            "status": "open",
             "updated_at": datetime.now().isoformat(),
         }
         if increment_unread:
@@ -1750,6 +1751,22 @@ async def update_conversation_last_message(conv_id: str, text: str, increment_un
         await db.table("whatsapp_conversations").update(upd).eq("id", conv_id).execute()
     except Exception as exc:
         logger.debug("update_conversation_last_message error: %s", exc)
+
+
+async def _provider_message_exists(provider_message_id: str) -> bool:
+    if not provider_message_id:
+        return False
+    try:
+        db = await _db()._adb()
+        res = await db.table("whatsapp_messages") \
+            .select("id") \
+            .eq("provider_message_id", provider_message_id) \
+            .limit(1) \
+            .execute()
+        return bool(res.data)
+    except Exception as exc:
+        await _db().log_error("whatsapp_inbox", "whatsapp_duplicate_check_failed", f"provider_message_id={provider_message_id}; error={str(exc)[:300]}", "warning")
+        return False
 
 
 async def patch_conversation(conv_id: str, updates: dict) -> dict:
@@ -3233,13 +3250,20 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
     raw = parsed.get("raw", {})
     await _log_whatsapp_ai_event(phone, "inbound_received", f"type={msg_type} message_id={provider_msg_id} text={text[:120]}")
     await _db().log_error("whatsapp_inbox", "whatsapp_inbound_received", f"phone={phone}; provider={parsed.get('provider') or ''}; type={msg_type}; message_id={provider_msg_id}; has_text={bool((text or '').strip())}", "info")
+    if provider_msg_id and await _provider_message_exists(provider_msg_id):
+        await _db().log_error("whatsapp_inbox", "whatsapp_duplicate_inbound_skipped", f"phone={phone}; provider_message_id={provider_msg_id}; type={msg_type}", "warning")
+        await _log_whatsapp_ai_reason(phone, "duplicate_message", f"provider_message_id={provider_msg_id}", "info")
+        return
 
     # Get/create conversation
+    await _db().log_error("whatsapp_inbox", "whatsapp_conversation_get_or_create_started", f"phone={phone}; contact_name={contact_name[:80]}", "info")
     conv = await get_or_create_conversation(phone, contact_name)
     if not conv:
         logger.error("Could not get/create conversation for %s", phone)
+        await _db().log_error("whatsapp_inbox", "whatsapp_conversation_get_or_create_failed", f"phone={phone}", "error")
         return
     conv_id = conv["id"]
+    await _db().log_error("whatsapp_inbox", "whatsapp_conversation_get_or_create_success", f"phone={phone}; conv_id={conv_id}; status={conv.get('status', '')}; ai_enabled={conv.get('ai_enabled', True)}", "info")
     await _log_whatsapp_ai_event(phone, "conversation_found_or_created", f"conversation_id={conv_id} status={conv.get('status', '')}")
 
     crm_contact = None
@@ -3258,38 +3282,50 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
     asyncio.create_task(link_conversation_to_crm(conv_id, phone, contact_name))
 
     # Save inbound message
-    inbound_saved = await save_wa_message(
-        conv_id=conv_id,
-        phone=phone,
-        direction="inbound",
-        message_type=msg_type,
-        message_text=text,
-        media_url=media_url,
-        media_id=media_id,
-        mime_type=mime_type,
-        file_name=file_name,
-        caption=caption,
-        provider_message_id=provider_msg_id,
-        raw_payload={
-            "raw": raw,
-            "media_id": media_id,
-            "media_url": media_url,
-            "mime_type": mime_type,
-            "file_name": file_name,
-            "caption": caption,
-            "image": raw.get("image") if isinstance(raw, dict) else {},
-            "document": raw.get("document") if isinstance(raw, dict) else {},
-            "audio": raw.get("audio") if isinstance(raw, dict) else {},
-        },
-    )
-    if inbound_saved:
-        await _db().log_error("whatsapp_inbox", "whatsapp_inbound_saved", f"phone={phone}; conversation_id={conv_id}; message_id={inbound_saved.get('id') or ''}; provider_message_id={provider_msg_id}", "info")
-        await _log_wa(phone, "inbound_message", "", "en", [], "received", provider_msg_id, None, "webhook", parsed.get("provider") or "")
-    else:
-        await _db().log_error("whatsapp_inbox", "whatsapp_inbound_save_failed", f"phone={phone}; conversation_id={conv_id}; provider_message_id={provider_msg_id}", "error")
+    inbound_saved = {}
+    await _db().log_error("whatsapp_inbox", "whatsapp_inbound_save_started", f"phone={phone}; conv_id={conv_id}; provider_message_id={provider_msg_id}", "info")
+    try:
+        inbound_saved = await save_wa_message(
+            conv_id=conv_id,
+            phone=phone,
+            direction="inbound",
+            message_type=msg_type,
+            message_text=text,
+            media_url=media_url,
+            media_id=media_id,
+            mime_type=mime_type,
+            file_name=file_name,
+            caption=caption,
+            provider_message_id=provider_msg_id,
+            provider_status="received",
+            raw_payload={
+                "raw": raw,
+                "media_id": media_id,
+                "media_url": media_url,
+                "mime_type": mime_type,
+                "file_name": file_name,
+                "caption": caption,
+                "image": raw.get("image") if isinstance(raw, dict) else {},
+                "document": raw.get("document") if isinstance(raw, dict) else {},
+                "audio": raw.get("audio") if isinstance(raw, dict) else {},
+            },
+        )
+        if inbound_saved:
+            await _db().log_error("whatsapp_inbox", "whatsapp_inbound_message_saved", f"phone={phone}; conv_id={conv_id}; message_db_id={inbound_saved.get('id') or ''}; provider_message_id={provider_msg_id}", "info")
+            await _db().log_error("whatsapp_inbox", "whatsapp_inbound_saved", f"phone={phone}; conversation_id={conv_id}; message_id={inbound_saved.get('id') or ''}; provider_message_id={provider_msg_id}", "info")
+            await _log_wa(phone, "inbound_message", "", "en", [], "received", provider_msg_id, None, "webhook", parsed.get("provider") or "")
+        else:
+            await _db().log_error("whatsapp_inbox", "whatsapp_inbound_message_save_failed", f"phone={phone}; conv_id={conv_id}; provider_message_id={provider_msg_id}; error=save_returned_empty", "error")
+    except Exception as exc:
+        inbound_saved = {}
+        await _db().log_error("whatsapp_inbox", "whatsapp_inbound_message_save_failed", f"phone={phone}; conv_id={conv_id}; provider_message_id={provider_msg_id}; error={str(exc)[:500]}", "error")
 
     # Update conversation last message
-    await update_conversation_last_message(conv_id, text or f"[{msg_type}]", increment_unread=True)
+    try:
+        await update_conversation_last_message(conv_id, text or f"[{msg_type}]", increment_unread=True)
+        await _db().log_error("whatsapp_inbox", "whatsapp_conversation_last_message_updated", f"phone={phone}; conv_id={conv_id}; last_message={(text or f'[{msg_type}]')[:120]}", "info")
+    except Exception as exc:
+        await _db().log_error("whatsapp_inbox", "whatsapp_conversation_last_message_update_failed", f"phone={phone}; conv_id={conv_id}; error={str(exc)[:500]}", "error")
 
     followup_intent = detect_followup_intent(text)
     try:
@@ -3346,17 +3382,21 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
         promoted = 0
 
     # AI auto-reply
+    await _db().log_error("whatsapp_ai", "whatsapp_ai_decision_started", f"phone={phone}; conv_id={conv_id}; msg_type={msg_type}", "info")
     ai_enabled = conv.get("ai_enabled", True)
     await _log_whatsapp_ai_event(phone, "ai_enabled_status", f"ai_enabled={ai_enabled} conversation_id={conv_id}")
     await _log_whatsapp_ai_event(phone, "takeover_status", f"takeover_enabled={bool(conv.get('assigned_to'))} assigned_to={conv.get('assigned_to', '')}")
     if not ai_enabled:
         reason = "takeover_enabled" if conv.get("assigned_to") else "ai_disabled"
+        await _db().log_error("whatsapp_ai", "whatsapp_ai_enabled_false", f"phone={phone}; conv_id={conv_id}; reason={reason}", "info")
         await _log_whatsapp_ai_reason(phone, reason, f"conversation_id={conv_id}", "info")
         return
+    await _db().log_error("whatsapp_ai", "whatsapp_ai_enabled_true", f"phone={phone}; conv_id={conv_id}", "info")
 
     # Only reply to text/button/interactive messages
     await _log_whatsapp_ai_event(phone, "message_type", f"type={msg_type}")
     if msg_type not in ("text", "button", "interactive"):
+        await _db().log_error("whatsapp_ai", "whatsapp_ai_reply_skipped", f"phone={phone}; conv_id={conv_id}; reason=unsupported_message_type; type={msg_type}", "info")
         lock = _conversation_lock(phone)
         if lock.locked():
             await _log_whatsapp_ai_reason(phone, "already_processing_same_conversation", f"conversation_id={conv_id}", "info")
@@ -3364,13 +3404,19 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
             latest_conv = await get_conversation_by_id(conv_id) or conv
             if not latest_conv.get("ai_enabled", True):
                 reason = "takeover_enabled" if latest_conv.get("assigned_to") else "ai_disabled"
+                await _db().log_error("whatsapp_ai", "whatsapp_ai_enabled_false", f"phone={phone}; conv_id={conv_id}; reason={reason}", "info")
                 await _log_whatsapp_ai_reason(phone, reason, f"conversation_id={conv_id}", "info")
                 return
             window_open = await is_whatsapp_service_window_open(phone)
+            if not window_open and not inbound_saved:
+                window_open = True
+                await _db().log_error("whatsapp_ai", "whatsapp_ai_service_window_open", f"phone={phone}; conv_id={conv_id}; source=current_webhook_save_failed", "warning")
             await _log_whatsapp_ai_event(phone, "service_window_status", f"open={window_open} conversation_id={conv_id}")
             if not window_open:
+                await _db().log_error("whatsapp_ai", "whatsapp_ai_service_window_closed", f"phone={phone}; conv_id={conv_id}; reason=service_window_closed", "info")
                 await _log_whatsapp_ai_reason(phone, "outside_24h_window", f"conversation_id={conv_id}", "info")
                 return
+            await _db().log_error("whatsapp_ai", "whatsapp_ai_service_window_open", f"phone={phone}; conv_id={conv_id}", "info")
             await _send_whatsapp_media_auto_reply(phone, conv_id, msg_type, inbound_saved)
         return
 
@@ -3394,17 +3440,25 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
         await _log_whatsapp_ai_event(phone, "takeover_status", f"latest_takeover_enabled={bool(latest_conv.get('assigned_to'))} assigned_to={latest_conv.get('assigned_to', '')}")
         if not latest_conv.get("ai_enabled", True):
             reason = "takeover_enabled" if latest_conv.get("assigned_to") else "ai_disabled"
+            await _db().log_error("whatsapp_ai", "whatsapp_ai_enabled_false", f"phone={phone}; conv_id={conv_id}; reason={reason}", "info")
             await _log_whatsapp_ai_reason(phone, reason, f"conversation_id={conv_id}", "info")
             return
+        await _db().log_error("whatsapp_ai", "whatsapp_ai_enabled_true", f"phone={phone}; conv_id={conv_id}; latest=true", "info")
 
         # Check 24h window
         window_open = await is_whatsapp_service_window_open(phone)
+        if not window_open and not inbound_saved:
+            window_open = True
+            await _db().log_error("whatsapp_ai", "whatsapp_ai_service_window_open", f"phone={phone}; conv_id={conv_id}; source=current_webhook_save_failed", "warning")
         await _log_whatsapp_ai_event(phone, "service_window_status", f"open={window_open} conversation_id={conv_id}")
         if not window_open:
+            await _db().log_error("whatsapp_ai", "whatsapp_ai_service_window_closed", f"phone={phone}; conv_id={conv_id}; reason=service_window_closed", "info")
             await _log_whatsapp_ai_reason(phone, "outside_24h_window", f"conversation_id={conv_id}", "info")
             return
+        await _db().log_error("whatsapp_ai", "whatsapp_ai_service_window_open", f"phone={phone}; conv_id={conv_id}", "info")
 
         if not (text or "").strip():
+            await _db().log_error("whatsapp_ai", "whatsapp_ai_reply_skipped", f"phone={phone}; conv_id={conv_id}; reason=no_text_message", "info")
             await _log_whatsapp_ai_reason(phone, "no_text_message", f"conversation_id={conv_id}", "info")
             return
 
@@ -3428,6 +3482,7 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
         await _log_whatsapp_ai_event(phone, "ai_provider_selected", "gemini")
         whatsapp_model = await get_whatsapp_gemini_model()
         await _log_whatsapp_ai_event(phone, "whatsapp_gemini_model", f"whatsapp_gemini_model={whatsapp_model}")
+        await _db().log_error("whatsapp_ai", "whatsapp_ai_generation_started", f"phone={phone}; conv_id={conv_id}; provider=gemini; model={whatsapp_model}; mode={conversation_mode}", "info")
         await _log_whatsapp_ai_event(phone, "ai_generation_started", f"history_messages={len(recent)} mode={conversation_mode}")
         latest_conv = dict(latest_conv or {})
         crm_name = _usable_whatsapp_name((crm_contact or {}).get("lead_name"), (crm_contact or {}).get("name"))
@@ -3450,20 +3505,25 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
                 await _log_whatsapp_ai_event(phone, "whatsapp_gemini_model", f"whatsapp_gemini_model={ai_result.get('model')}")
         if not reply_text:
             reason = ai_reason or "ai_generation_failed"
+            await _db().log_error("whatsapp_ai", "whatsapp_ai_generation_failed", f"phone={phone}; conv_id={conv_id}; reason={reason}; error={ai_error[:300]}", "error" if reason == "ai_generation_failed" else "warning")
             await _log_whatsapp_ai_event(phone, "ai_generation_failed", ai_error or reason, "error" if reason == "ai_generation_failed" else "warning")
             await _log_whatsapp_ai_reason(phone, reason, ai_error or f"conversation_id={conv_id}", "error" if reason == "ai_generation_failed" else "warning")
             reply_text = "Thanks, I received your message. Our team will check and get back shortly."
         else:
+            await _db().log_error("whatsapp_ai", "whatsapp_ai_generation_success", f"phone={phone}; conv_id={conv_id}; chars={len(reply_text)}", "info")
             await _log_whatsapp_ai_event(phone, "ai_generation_success", f"chars={len(reply_text)}")
 
+        await _db().log_error("whatsapp_ai", "whatsapp_ai_send_started", f"phone={phone}; conv_id={conv_id}; chars={len(reply_text)}", "info")
         await _log_whatsapp_ai_event(phone, "whatsapp_text_send_started", f"chars={len(reply_text)}")
         send_result = await send_whatsapp_text(phone, reply_text)
         provider_id = send_result.get("provider_message_id") or ""
         if send_result.get("success"):
+            await _db().log_error("whatsapp_ai", "whatsapp_ai_send_success", f"phone={phone}; conv_id={conv_id}; provider_message_id={provider_id}", "info")
             await _log_whatsapp_ai_event(phone, "whatsapp_text_send_success", f"provider_message_id={provider_id}")
         else:
+            await _db().log_error("whatsapp_ai", "whatsapp_ai_send_failed", f"phone={phone}; conv_id={conv_id}; reason={send_result.get('reason')}; error={(send_result.get('error') or '')[:300]}", "error")
             await _log_whatsapp_ai_event(phone, "whatsapp_text_send_failed", send_result.get("error") or "", "error")
-        await save_wa_message(
+        outbound_saved = await save_wa_message(
             conv_id=conv_id,
             phone=phone,
             direction="outbound",
@@ -3475,6 +3535,7 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
             raw_payload={"reply_to_message_id": inbound_saved.get("id") if inbound_saved else "", "send_result": send_result},
             ai_generated=True,
         )
+        await _db().log_error("whatsapp_ai", "whatsapp_ai_outbound_message_saved", f"phone={phone}; conv_id={conv_id}; message_db_id={(outbound_saved or {}).get('id') or ''}; provider_status={'sent' if send_result.get('success') else 'failed'}", "info" if outbound_saved else "error")
         await _log_whatsapp_ai_event(phone, "outbound_ai_message_saved", f"provider_status={'sent' if send_result.get('success') else 'failed'}")
         if send_result.get("success"):
             await update_conversation_last_message(conv_id, reply_text, increment_unread=False)

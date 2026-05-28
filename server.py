@@ -1931,6 +1931,39 @@ async def api_wa_webhook_status():
 
 # ── WhatsApp Inbox — Conversations ────────────────────────────────────────────
 
+@app.get("/api/whatsapp/debug/phone/{phone}")
+async def api_wa_debug_phone(phone: str):
+    try:
+        normalized = normalize_phone(unquote(phone))
+    except Exception:
+        normalized = unquote(phone)
+    convs = await get_conversations(search=normalized, limit=20)
+    conversation = next((c for c in convs if c.get("phone_number") == normalized), None)
+    if not conversation and convs:
+        conversation = convs[0]
+    messages = []
+    if conversation and conversation.get("id"):
+        messages = await get_messages(conversation["id"], limit=20)
+    wa_logs = await get_whatsapp_logs(phone=normalized, limit=20)
+    raw_error_logs = await get_logs(limit=500)
+    needles = {normalized, normalized.lstrip("+"), unquote(phone)}
+    error_logs = []
+    for row in raw_error_logs or []:
+        source = str(row.get("source") or "")
+        haystack = f"{row.get('source','')} {row.get('message','')} {row.get('detail','')}"
+        if source.startswith("whatsapp") and any(n and n in haystack for n in needles):
+            error_logs.append(row)
+        if len(error_logs) >= 20:
+            break
+    return {
+        "normalized_phone": normalized,
+        "conversation": conversation,
+        "messages": messages,
+        "whatsapp_logs": wa_logs,
+        "error_logs": error_logs,
+    }
+
+
 @app.get("/api/whatsapp/conversations")
 async def api_wa_conversations(
     status: Optional[str] = None,
