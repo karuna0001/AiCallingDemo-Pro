@@ -264,7 +264,8 @@ INSERT INTO settings (key, value, updated_at) VALUES
 ('FOLLOWUP_DEMO_REMINDER_2H', 'true', now()::text),
 ('FOLLOWUP_DEMO_REMINDER_15M', 'true', now()::text),
 ('FOLLOWUP_STOP_ON_NOT_INTERESTED', 'true', now()::text),
-('FOLLOWUP_STOP_ON_WRONG_NUMBER', 'true', now()::text)
+('FOLLOWUP_STOP_ON_WRONG_NUMBER', 'true', now()::text),
+('staff_appointment_notification_template', 'staff_appointment_notification', now()::text)
 ON CONFLICT (key) DO NOTHING;
 
 -- ── Phase 8: WhatsApp Chat Inbox ──────────────────────────────────────────────

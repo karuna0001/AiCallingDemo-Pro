@@ -46,6 +46,7 @@ from db import (
     clear_errors, create_agent_profile, create_campaign, delete_agent_profile,
     delete_campaign, get_agent_profile,
     get_all_agent_profiles, get_all_appointments, get_all_calls,
+    get_appointment_by_id,
     get_all_campaigns, get_all_settings, get_calls_by_phone, get_campaign,
     get_call_logs_for_export, get_contacts, get_crm_contact_detail, get_crm_contacts,
     get_crm_summary, get_lead_statuses, get_crm_contact_by_phone,
@@ -94,6 +95,7 @@ from whatsapp import (
     fetch_whatsapp_media,
     get_whatsapp_gemini_model,
     run_due_appointment_reminders,
+    send_staff_appointment_notification,
 )
 from followup import parse_followup_time
 
@@ -1311,6 +1313,18 @@ async def api_delete_appointment_staff(staff_id: str):
     if not (result.get("deleted") or result.get("deactivated")):
         raise HTTPException(404, "Staff member not found")
     return {"success": True, **result}
+
+
+@app.post("/api/appointments/{appointment_id}/notify-staff")
+async def api_notify_appointment_staff(appointment_id: str):
+    appointment = await get_appointment_by_id(appointment_id)
+    if not appointment:
+        raise HTTPException(404, "Appointment not found")
+    result = await send_staff_appointment_notification(appointment, source=appointment.get("source") or "WhatsApp")
+    if not result.get("success"):
+        reason = result.get("error") or result.get("reason") or "Staff notification failed"
+        raise HTTPException(400, reason)
+    return {"success": True, "result": result}
 
 
 @app.delete("/api/appointments/{appointment_id}")
