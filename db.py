@@ -223,8 +223,20 @@ SENSITIVE_KEYS = {
     "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "GOOGLE_API_KEY",
     "VOBIZ_PASSWORD", "TWILIO_AUTH_TOKEN", "SUPABASE_SERVICE_KEY",
     "AWS_SECRET_ACCESS_KEY", "S3_SECRET_ACCESS_KEY", "CALCOM_API_KEY",
-    "DEEPGRAM_API_KEY",
+    "DEEPGRAM_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY",
+    "GOOGLE_CALENDAR_SERVICE_ACCOUNT_JSON", "ADMIN_API_KEY",
+    "WEBHOOK_VERIFY_TOKEN", "WHATSAPP_ACCESS_TOKEN", "WHATSAPP_VERIFY_TOKEN",
+    "VOBIZ_AUTH_TOKEN", "VOBIZ_WEBHOOK_SECRET",
 }
+
+
+def _is_sensitive_setting(key: str) -> bool:
+    key_u = str(key or "").upper()
+    if key_u in SENSITIVE_KEYS:
+        return True
+    if any(token in key_u for token in ("SECRET", "TOKEN", "PASSWORD", "PRIVATE_KEY", "SERVICE_ACCOUNT")):
+        return True
+    return key_u.endswith("_API_KEY") or key_u.endswith("_SERVICE_KEY")
 
 
 class ConfigError(Exception):
@@ -328,7 +340,7 @@ async def get_all_settings() -> dict:
     for k in known_keys:
         env_val = os.getenv(k, "")
         out[k] = {
-            "value": "" if k in SENSITIVE_KEYS else env_val,
+            "value": "" if _is_sensitive_setting(k) else env_val,
             "configured": bool(env_val),
             "source": "env" if env_val else "none",
         }
@@ -340,7 +352,7 @@ async def get_all_settings() -> dict:
         if out.get(k, {}).get("source") == "env":
             continue  # env wins — never overwrite
         out[k] = {
-            "value": "" if k in SENSITIVE_KEYS else v,
+            "value": "" if _is_sensitive_setting(k) else v,
             "configured": bool(v),
             "source": "db" if v else "none",
         }

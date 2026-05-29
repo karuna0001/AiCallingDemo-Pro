@@ -491,12 +491,18 @@ def _csv_response(filename: str, rows: list[dict]) -> StreamingResponse:
 
 
 async def _report_data(date_from: Optional[str] = None, date_to: Optional[str] = None) -> dict:
-    calls = [r for r in await get_call_logs_for_export({}) if _date_in_range(r.get("timestamp") or "", date_from, date_to)]
-    contacts = [r for r in await get_crm_contacts() if _date_in_range(r.get("created_at") or r.get("updated_at") or "", date_from, date_to)]
-    appointments = [r for r in await get_all_appointments() if _date_in_range(r.get("date") or r.get("created_at") or "", date_from, date_to)]
-    wa_logs = [r for r in await get_whatsapp_logs(limit=5000) if _date_in_range(r.get("created_at") or "", date_from, date_to)]
+    async def safe(label: str, loader, default=None):
+        try:
+            return await loader()
+        except Exception as exc:
+            await log_error("reports", "report_source_unavailable", f"source={label}; error={str(exc)[:300]}", "warning")
+            return [] if default is None else default
+    calls = [r for r in await safe("call_logs", lambda: get_call_logs_for_export({})) if _date_in_range(r.get("timestamp") or "", date_from, date_to)]
+    contacts = [r for r in await safe("crm_contacts", get_crm_contacts) if _date_in_range(r.get("created_at") or r.get("updated_at") or "", date_from, date_to)]
+    appointments = [r for r in await safe("appointments", get_all_appointments) if _date_in_range(r.get("date") or r.get("created_at") or "", date_from, date_to)]
+    wa_logs = [r for r in await safe("whatsapp_logs", lambda: get_whatsapp_logs(limit=5000)) if _date_in_range(r.get("created_at") or "", date_from, date_to)]
     wa_messages = [r for r in await _table_rows("whatsapp_messages", "created_at", 5000) if _date_in_range(r.get("created_at") or r.get("timestamp") or "", date_from, date_to)]
-    followups = await get_followup_actions(limit=5000)
+    followups = await safe("followup_actions", lambda: get_followup_actions(limit=5000))
     return {"calls": calls, "contacts": contacts, "appointments": appointments, "whatsapp_logs": wa_logs, "whatsapp_messages": wa_messages, "followups": followups}
 
 
@@ -827,6 +833,10 @@ class BroadcastCampaignRequest(BaseModel):
     segment: Optional[dict[str, Any]] = None
     scheduled_at: Optional[str] = None
     dry_run_limit: Optional[int] = 100
+
+
+class BroadcastStartRequest(BaseModel):
+    confirm: Optional[str] = ""
 
 
 class HandoffRequest(BaseModel):
@@ -3982,13 +3992,24 @@ async def _campaign_recipient_exists(campaign_id: str, phone: str) -> bool:
 
 
 @app.post("/api/broadcast/campaigns/{campaign_id}/start")
-async def api_start_broadcast_campaign(campaign_id: str):
+async def api_start_broadcast_campaign(campaign_id: str, req: BroadcastStartRequest = BroadcastStartRequest()):
     campaign = await _broadcast_campaign(campaign_id)
     if not campaign:
         raise HTTPException(404, "Broadcast campaign not found")
     if (campaign.get("status") or "") == "paused":
         raise HTTPException(400, "Campaign is paused")
+    segment = campaign.get("segment") or {}
+    if isinstance(segment, str):
+        segment = _json_dict(segment)
+    confirm = str(req.confirm or "").strip()
+    if segment:
+        if confirm not in {"START_BROADCAST", "CONFIRM_BROADCAST"}:
+            raise HTTPException(400, {"message": "Broadcast start requires backend confirmation.", "required_confirm": "START_BROADCAST"})
+    elif confirm != "SEND_TO_ALL":
+        raise HTTPException(400, {"message": "This broadcast has no segment filter and would target all eligible contacts. Type SEND_TO_ALL to confirm.", "required_confirm": "SEND_TO_ALL"})
     contacts = await _broadcast_preview_contacts(campaign, limit=1000)
+    if not contacts:
+        raise HTTPException(400, "No eligible broadcast recipients after opt-out and segment filters.")
     max_per_run = int(await get_setting("BROADCAST_MAX_SEND_PER_RUN", "50") or 50)
     template_name = campaign.get("template_name") or await resolve_wa_template(campaign.get("template_purpose") or "")
     if not template_name:
@@ -4048,6 +4069,8 @@ async def api_start_broadcast_campaign(campaign_id: str):
 
 @app.post("/api/broadcast/campaigns/{campaign_id}/pause")
 async def api_pause_broadcast_campaign(campaign_id: str):
+    if not await _broadcast_campaign(campaign_id):
+        raise HTTPException(404, "Broadcast campaign not found")
     db = await _adb()
     await db.table("broadcast_campaigns").update({"status": "paused", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", campaign_id).execute()
     return {"success": True, "status": "paused"}
