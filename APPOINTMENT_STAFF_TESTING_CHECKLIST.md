@@ -24,6 +24,8 @@
   3. requirement or service
   4. appointment date/time in local timezone, falling back to Asia/Kolkata
   5. source
+- Confirm `/api/health` shows `appointment_timezone=Asia/Kolkata` unless intentionally changed.
+- Confirm the appointment dashboard date/time and staff notification date/time match the intended India/local appointment slot, not UTC.
 
 ## Resend Endpoint
 - Call `POST /api/appointments/{appointment_id}/notify-staff`.
