@@ -1676,31 +1676,84 @@ def _usable_whatsapp_name(*values: str) -> str:
     return ""
 
 
+def _safe_exception_detail(exc: Exception) -> str:
+    parts = [f"type={type(exc).__name__}", f"message={str(exc)[:500]}"]
+    for attr in ("code", "status_code", "status", "details", "hint"):
+        val = getattr(exc, attr, None)
+        if val:
+            parts.append(f"{attr}={str(val)[:300]}")
+    return "; ".join(parts)
+
+
+async def _restore_whatsapp_conversation(db, conv: dict, contact_name: str = "", *, log_event: str = "whatsapp_conversation_restored") -> dict:
+    now = datetime.now().isoformat()
+    updates = {
+        "is_deleted": False,
+        "deleted_at": None,
+        "deleted_by": None,
+        "status": "open",
+        "updated_at": now,
+    }
+    if conv.get("ai_enabled") is None:
+        updates["ai_enabled"] = True
+    if contact_name and (not conv.get("contact_name") or conv.get("contact_name") == conv.get("phone_number")):
+        updates["contact_name"] = contact_name
+    try:
+        await db.table("whatsapp_conversations").update(updates).eq("id", conv["id"]).execute()
+    except Exception as exc:
+        fallback_updates = dict(updates)
+        fallback_updates["deleted_at"] = ""
+        fallback_updates["deleted_by"] = ""
+        await db.table("whatsapp_conversations").update(fallback_updates).eq("id", conv["id"]).execute()
+        updates = fallback_updates
+        await _db().log_error("whatsapp_inbox", "whatsapp_conversation_restore_null_fallback", f"conv_id={conv.get('id')}; {_safe_exception_detail(exc)}", "warning")
+    conv.update(updates)
+    await _db().log_error("whatsapp_inbox", log_event, f"phone={conv.get('phone_number')}; conv_id={conv.get('id')}; is_deleted=false", "info")
+    return conv
+
+
+async def _fetch_whatsapp_conversation_by_phone_any(db, phone: str) -> Optional[dict]:
+    res = await db.table("whatsapp_conversations") \
+        .select("*") \
+        .eq("phone_number", phone) \
+        .order("created_at", desc=True) \
+        .limit(1) \
+        .execute()
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
+async def get_conversations_by_phone(phone: str, include_deleted: bool = False, limit: int = 20) -> list:
+    try:
+        try:
+            from db import normalize_phone
+            phone = normalize_phone(phone)
+        except Exception:
+            phone = phone or ""
+        db = await _db()._adb()
+        q = db.table("whatsapp_conversations").select("*").eq("phone_number", phone).order("created_at", desc=True).limit(limit)
+        if not include_deleted:
+            q = q.eq("is_deleted", False)
+        res = await q.execute()
+        return res.data or []
+    except Exception as exc:
+        await _db().log_error("whatsapp_inbox", "whatsapp_conversations_by_phone_fetch_failed", f"phone={phone}; {_safe_exception_detail(exc)}", "warning")
+        return []
+
+
 async def get_or_create_conversation(phone: str, contact_name: str = "") -> dict:
     """Return existing open/any conversation for phone, or create a new one."""
     try:
+        try:
+            from db import normalize_phone
+            phone = normalize_phone(phone)
+        except Exception:
+            phone = phone or ""
         db = await _db()._adb()
-        res = await db.table("whatsapp_conversations") \
-            .select("*") \
-            .eq("phone_number", phone) \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
-        rows = res.data or []
-        if rows:
-            conv = rows[0]
+        conv = await _fetch_whatsapp_conversation_by_phone_any(db, phone)
+        if conv:
             if conv.get("is_deleted"):
-                updates = {
-                    "is_deleted": False,
-                    "deleted_at": "",
-                    "deleted_by": "",
-                    "status": "open",
-                    "updated_at": datetime.now().isoformat(),
-                }
-                if contact_name and not conv.get("contact_name"):
-                    updates["contact_name"] = contact_name
-                await db.table("whatsapp_conversations").update(updates).eq("id", conv["id"]).execute()
-                conv.update(updates)
+                return await _restore_whatsapp_conversation(db, conv, contact_name)
             # Refresh contact_name if we now have one
             if contact_name and not conv.get("contact_name"):
                 await db.table("whatsapp_conversations") \
@@ -1726,10 +1779,29 @@ async def get_or_create_conversation(phone: str, contact_name: str = "") -> dict
             "created_at": now,
             "updated_at": now,
         }
-        await db.table("whatsapp_conversations").insert(row).execute()
+        try:
+            await db.table("whatsapp_conversations").insert(row).execute()
+        except Exception as insert_exc:
+            existing = await _fetch_whatsapp_conversation_by_phone_any(db, phone)
+            if existing:
+                restored = await _restore_whatsapp_conversation(
+                    db,
+                    existing,
+                    contact_name,
+                    log_event="whatsapp_conversation_restored_after_conflict",
+                )
+                await _db().log_error("whatsapp_inbox", "whatsapp_conversation_insert_conflict_recovered", f"phone={phone}; conv_id={restored.get('id')}; {_safe_exception_detail(insert_exc)}", "warning")
+                return restored
+            await _db().log_error("whatsapp_inbox", "whatsapp_conversation_insert_failed", f"phone={phone}; {_safe_exception_detail(insert_exc)}", "error")
+            raise
         return row
     except Exception as exc:
-        logger.error("get_or_create_conversation error: %s", exc)
+        detail = _safe_exception_detail(exc)
+        logger.error("get_or_create_conversation error: %s", detail)
+        try:
+            await _db().log_error("whatsapp_inbox", "whatsapp_conversation_get_or_create_failed", f"phone={phone}; {detail}", "error")
+        except Exception:
+            pass
         return {}
 
 
@@ -3260,7 +3332,7 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
     conv = await get_or_create_conversation(phone, contact_name)
     if not conv:
         logger.error("Could not get/create conversation for %s", phone)
-        await _db().log_error("whatsapp_inbox", "whatsapp_conversation_get_or_create_failed", f"phone={phone}", "error")
+        await _db().log_error("whatsapp_inbox", "whatsapp_conversation_get_or_create_failed", f"phone={phone}; reason=helper_returned_empty", "error")
         return
     conv_id = conv["id"]
     await _db().log_error("whatsapp_inbox", "whatsapp_conversation_get_or_create_success", f"phone={phone}; conv_id={conv_id}; status={conv.get('status', '')}; ai_enabled={conv.get('ai_enabled', True)}", "info")
