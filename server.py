@@ -821,6 +821,30 @@ class CrmMoveStageRequest(BaseModel):
     stage: str
 
 
+class BroadcastCampaignRequest(BaseModel):
+    name: str
+    template_purpose: str
+    segment: Optional[dict[str, Any]] = None
+    scheduled_at: Optional[str] = None
+    dry_run_limit: Optional[int] = 100
+
+
+class HandoffRequest(BaseModel):
+    reason: Optional[str] = "human_requested"
+    staff_id: Optional[str] = ""
+    urgent: Optional[bool] = True
+
+
+class KbPreviewAnswerRequest(BaseModel):
+    question: str
+
+
+class AppointmentActionRequest(BaseModel):
+    date: Optional[str] = ""
+    time: Optional[str] = ""
+    reason: Optional[str] = ""
+
+
 class WaConfirmRequest(BaseModel):
     phone: str
     lead_name: Optional[str] = None
@@ -1642,6 +1666,114 @@ async def api_patch_appointment_notes(appointment_id: str, req: NotesRequest):
     return {"success": True}
 
 
+@app.post("/api/appointments/{appointment_id}/reschedule")
+async def api_post_appointment_reschedule(appointment_id: str, req: AppointmentRescheduleRequest):
+    return await api_patch_appointment_reschedule(appointment_id, req)
+
+
+@app.post("/api/appointments/{appointment_id}/cancel")
+async def api_post_appointment_cancel(appointment_id: str, req: AppointmentActionRequest = AppointmentActionRequest()):
+    return await api_cancel_appointment(appointment_id)
+
+
+@app.post("/api/appointments/{appointment_id}/complete")
+async def api_post_appointment_complete(appointment_id: str, req: AppointmentActionRequest = AppointmentActionRequest()):
+    return await api_patch_appointment_status(appointment_id, AppointmentStatusRequest(status="completed"))
+
+
+@app.post("/api/appointments/{appointment_id}/no-show")
+async def api_post_appointment_no_show(appointment_id: str, req: AppointmentActionRequest = AppointmentActionRequest()):
+    ok = await update_appointment_status(appointment_id, "no_show")
+    if not ok:
+        raise HTTPException(404, "Appointment not found")
+    appointment = await get_appointment_by_id(appointment_id)
+    phone = (appointment or {}).get("phone") or ""
+    if phone:
+        await update_lead_journey(phone, {
+            "journey_stage": "demo_no_show",
+            "crm_status": "demo_no_show",
+            "next_best_action": "reschedule_demo",
+            "last_followup_reason": req.reason or "demo_no_show",
+        })
+    return {"success": True, "status": "no_show"}
+
+
+async def _send_appointment_reminder_now(appointment: dict) -> dict:
+    appointment_id = str(appointment.get("id") or "")
+    phone = appointment.get("phone") or ""
+    customer_params = [
+        appointment.get("name") or "there",
+        f"{appointment.get('date')} {str(appointment.get('time') or '')[:5]}",
+        appointment.get("service") or "demo",
+    ]
+    staff_params = [
+        appointment.get("name") or "Customer",
+        phone,
+        appointment.get("service") or "demo",
+        f"{appointment.get('date')} {str(appointment.get('time') or '')[:5]}",
+        appointment.get("source") or "CRM",
+    ]
+    updates = {"reminder_processed": True, "reminder_processed_at": datetime.now().isoformat()}
+    result = {"customer": None, "staff": None}
+    errors = []
+    try:
+        template = await resolve_wa_template("reminder_template")
+        if template and phone:
+            result["customer"] = await send_whatsapp_template(
+                phone, template, await get_setting("WHATSAPP_DEFAULT_LANGUAGE", "en"),
+                customer_params, event_type="appointment_reminder",
+                source_type="appointments", source_id=appointment_id,
+                template_purpose="reminder_template",
+            )
+            if result["customer"].get("success"):
+                updates["customer_reminder_sent"] = True
+                updates["customer_reminder_sent_at"] = datetime.now().isoformat()
+            else:
+                errors.append(result["customer"].get("reason") or result["customer"].get("error") or "customer_reminder_failed")
+        else:
+            errors.append("customer_reminder_template_missing")
+    except Exception as exc:
+        errors.append(f"customer_reminder_failed:{str(exc)[:160]}")
+    staff_phone = ""
+    if appointment.get("staff_id"):
+        for staff in await get_appointment_staff(include_inactive=True):
+            if str(staff.get("id")) == str(appointment.get("staff_id")):
+                staff_phone = staff.get("whatsapp_number") or ""
+                break
+    if staff_phone:
+        try:
+            staff_template = await resolve_wa_template("staff_appointment_reminder_template")
+            if staff_template:
+                result["staff"] = await send_whatsapp_template(
+                    staff_phone, staff_template, await get_setting("WHATSAPP_DEFAULT_LANGUAGE", "en"),
+                    staff_params, event_type="staff_appointment_reminder",
+                    source_type="appointments", source_id=appointment_id,
+                    template_purpose="staff_appointment_reminder_template",
+                )
+                if result["staff"].get("success"):
+                    updates["staff_reminder_sent"] = True
+                    updates["staff_reminder_sent_at"] = datetime.now().isoformat()
+                else:
+                    errors.append(result["staff"].get("reason") or result["staff"].get("error") or "staff_reminder_failed")
+            else:
+                errors.append("staff_appointment_reminder_template_missing")
+        except Exception as exc:
+            errors.append(f"staff_reminder_failed:{str(exc)[:160]}")
+    if errors:
+        updates["reminder_error"] = "; ".join(errors)[:1000]
+    db = await _adb()
+    await db.table("appointments").update(updates).eq("id", appointment_id).execute()
+    return {"success": not errors, "result": result, "errors": errors}
+
+
+@app.post("/api/appointments/{appointment_id}/send-reminder")
+async def api_post_appointment_send_reminder(appointment_id: str, req: AppointmentActionRequest = AppointmentActionRequest()):
+    appointment = await get_appointment_by_id(appointment_id)
+    if not appointment:
+        raise HTTPException(404, "Appointment not found")
+    return await _send_appointment_reminder_now(appointment)
+
+
 @app.get("/api/prompt")
 async def api_get_prompt():
     saved = await get_setting("system_prompt", "")
@@ -2059,6 +2191,40 @@ async def api_kb_load_sample():
     return {"status": "sample_loaded", "sections": list(_KB_SAMPLE.keys())}
 
 
+@app.get("/api/knowledge-base/export")
+async def api_kb_export():
+    kb = await get_knowledge_base()
+    return {"knowledge_base": kb, "sections": _KB_SECTIONS, "exported_at": datetime.now(timezone.utc).isoformat()}
+
+
+@app.post("/api/knowledge-base/import")
+async def api_kb_import(req: Request):
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+    data = body.get("knowledge_base") if isinstance(body, dict) and "knowledge_base" in body else body
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Knowledge base import must be a JSON object")
+    saved = await save_knowledge_base(data)
+    return {"status": "imported", "sections_saved": [k for k in data if k in _KB_SECTIONS], "knowledge_base": saved}
+
+
+@app.post("/api/knowledge-base/preview-answer")
+async def api_kb_preview_answer(req: KbPreviewAnswerRequest):
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(400, "question is required")
+    kb = await get_knowledge_base()
+    matches = (await api_search_knowledge_base(question)).get("results", [])
+    if matches:
+        answer = matches[0].get("answer") or matches[0].get("title") or ""
+    else:
+        context = build_knowledge_context(kb)
+        answer = context[:800] if context else "No matching knowledge base entry found yet."
+    return {"question": question, "answer": answer, "matches": matches[:5], "source": "knowledge_base_preview"}
+
+
 @app.get("/api/knowledge-base/{section}")
 async def api_get_kb_section(section: str):
     if section not in _KB_SECTIONS:
@@ -2131,7 +2297,7 @@ async def api_wa_webhook_verify(
     hub_challenge: Optional[str] = Query(None, alias="hub.challenge"),
 ):
     from db import get_setting as _gs
-    verify_token = await _gs("WHATSAPP_VERIFY_TOKEN", "")
+    verify_token = await _gs("WEBHOOK_VERIFY_TOKEN", "") or await _gs("WHATSAPP_VERIFY_TOKEN", "")
     if hub_mode == "subscribe" and verify_token and hub_verify_token == verify_token:
         from fastapi.responses import PlainTextResponse
         return PlainTextResponse(content=hub_challenge or "")
@@ -3704,6 +3870,273 @@ async def api_patch_contact_custom_fields(phone: str, req: CrmCustomFieldsReques
     fields.update(req.fields or {})
     ok = await update_lead_journey(clean, {"custom_fields_json": json.dumps(fields)})
     return {"success": bool(ok), "custom_fields": fields}
+
+
+TERMINAL_LEAD_SLUGS = {"not_interested", "wrong_number", "do_not_contact", "converted", "lost"}
+
+
+def _lead_opted_out(lead: dict) -> bool:
+    status = _status_slug(lead.get("crm_status") or lead.get("journey_stage") or "")
+    return bool(lead.get("stop_automation")) or status in TERMINAL_LEAD_SLUGS
+
+
+def _segment_match(lead: dict, segment: dict) -> bool:
+    if not segment:
+        return True
+    for key in ("crm_status", "source", "journey_stage", "assigned_to", "service_type"):
+        value = segment.get(key)
+        if value and str(lead.get(key) or "").lower() != str(value).lower():
+            return False
+    tag = segment.get("tag")
+    if tag and tag not in _json_list(lead.get("tags_json")):
+        return False
+    return True
+
+
+async def _broadcast_campaign(campaign_id: str) -> Optional[dict]:
+    try:
+        db = await _adb()
+        result = await db.table("broadcast_campaigns").select("*").eq("id", campaign_id).limit(1).execute()
+        rows = result.data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+async def _broadcast_preview_contacts(campaign: dict, limit: int = 200) -> list:
+    segment = campaign.get("segment") or campaign.get("segment_json") or {}
+    if isinstance(segment, str):
+        segment = _json_dict(segment)
+    contacts = await get_crm_contacts()
+    seen = set()
+    preview = []
+    for lead in contacts:
+        phone = lead.get("phone_number") or ""
+        if not phone or phone in seen:
+            continue
+        seen.add(phone)
+        if _lead_opted_out(lead):
+            continue
+        if not _segment_match(lead, segment):
+            continue
+        preview.append(lead)
+        if len(preview) >= limit:
+            break
+    return preview
+
+
+@app.get("/api/broadcast/campaigns")
+async def api_broadcast_campaigns():
+    try:
+        rows = await _table_rows("broadcast_campaigns", "created_at", 200)
+    except Exception:
+        rows = []
+    return {"campaigns": rows}
+
+
+@app.post("/api/broadcast/campaigns")
+async def api_create_broadcast_campaign(req: BroadcastCampaignRequest):
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(400, "Campaign name is required")
+    template = await resolve_wa_template(req.template_purpose)
+    if not template:
+        raise HTTPException(400, "Approved WhatsApp template purpose is not configured")
+    row = {
+        "id": str(uuid.uuid4()),
+        "name": name,
+        "template_purpose": req.template_purpose,
+        "template_name": template,
+        "segment": req.segment or {},
+        "status": "draft",
+        "scheduled_at": req.scheduled_at,
+        "sent_count": 0,
+        "failed_count": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        db = await _adb()
+        await db.table("broadcast_campaigns").insert(row).execute()
+    except Exception as exc:
+        raise HTTPException(500, f"Broadcast campaign create failed: {str(exc)[:200]}")
+    return {"success": True, "campaign": row}
+
+
+@app.post("/api/broadcast/campaigns/{campaign_id}/preview")
+async def api_preview_broadcast_campaign(campaign_id: str):
+    campaign = await _broadcast_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(404, "Broadcast campaign not found")
+    contacts = await _broadcast_preview_contacts(campaign, limit=200)
+    return {"campaign_id": campaign_id, "count": len(contacts), "recipients": contacts[:50]}
+
+
+async def _campaign_recipient_exists(campaign_id: str, phone: str) -> bool:
+    try:
+        db = await _adb()
+        result = await db.table("broadcast_recipients").select("id").eq("campaign_id", campaign_id).eq("phone_number", phone).limit(1).execute()
+        return bool(result.data)
+    except Exception:
+        return False
+
+
+@app.post("/api/broadcast/campaigns/{campaign_id}/start")
+async def api_start_broadcast_campaign(campaign_id: str):
+    campaign = await _broadcast_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(404, "Broadcast campaign not found")
+    if (campaign.get("status") or "") == "paused":
+        raise HTTPException(400, "Campaign is paused")
+    contacts = await _broadcast_preview_contacts(campaign, limit=1000)
+    max_per_run = int(await get_setting("BROADCAST_MAX_SEND_PER_RUN", "50") or 50)
+    template_name = campaign.get("template_name") or await resolve_wa_template(campaign.get("template_purpose") or "")
+    if not template_name:
+        raise HTTPException(400, "Broadcast template is not configured")
+    db = await _adb()
+    sent = failed = skipped = 0
+    await db.table("broadcast_campaigns").update({"status": "running", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", campaign_id).execute()
+    for lead in contacts[:max_per_run]:
+        phone = normalize_phone(lead.get("phone_number") or "")
+        if await _campaign_recipient_exists(campaign_id, phone):
+            skipped += 1
+            continue
+        recipient_id = str(uuid.uuid4())
+        params = [
+            lead.get("lead_name") or "there",
+            lead.get("service_type") or lead.get("requirement") or "our service",
+        ]
+        recipient = {
+            "id": recipient_id,
+            "campaign_id": campaign_id,
+            "phone_number": phone,
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            await db.table("broadcast_recipients").insert(recipient).execute()
+            result = await send_whatsapp_template(
+                phone, template_name, await get_setting("WHATSAPP_DEFAULT_LANGUAGE", "en"),
+                params, event_type="broadcast_campaign",
+                source_type="broadcast_campaigns", source_id=campaign_id,
+                template_purpose=campaign.get("template_purpose") or "",
+            )
+            status = "sent" if result.get("success") else "failed"
+            if status == "sent":
+                sent += 1
+            else:
+                failed += 1
+            await db.table("broadcast_recipients").update({
+                "status": status,
+                "provider_message_id": result.get("provider_message_id") or "",
+                "error_message": result.get("error") or result.get("reason") or "",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", recipient_id).execute()
+        except Exception as exc:
+            failed += 1
+            await db.table("broadcast_recipients").update({"status": "failed", "error_message": str(exc)[:500], "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", recipient_id).execute()
+    final_status = "completed" if sent + failed + skipped >= len(contacts) or len(contacts) <= max_per_run else "running"
+    await db.table("broadcast_campaigns").update({
+        "status": final_status,
+        "sent_count": int(campaign.get("sent_count") or 0) + sent,
+        "failed_count": int(campaign.get("failed_count") or 0) + failed,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", campaign_id).execute()
+    return {"success": True, "sent": sent, "failed": failed, "skipped": skipped, "limited_to": max_per_run, "status": final_status}
+
+
+@app.post("/api/broadcast/campaigns/{campaign_id}/pause")
+async def api_pause_broadcast_campaign(campaign_id: str):
+    db = await _adb()
+    await db.table("broadcast_campaigns").update({"status": "paused", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", campaign_id).execute()
+    return {"success": True, "status": "paused"}
+
+
+@app.get("/api/broadcast/campaigns/{campaign_id}/recipients")
+async def api_broadcast_recipients(campaign_id: str):
+    try:
+        db = await _adb()
+        result = await db.table("broadcast_recipients").select("*").eq("campaign_id", campaign_id).order("created_at", desc=True).limit(500).execute()
+        rows = result.data or []
+    except Exception:
+        rows = []
+    return {"recipients": rows}
+
+
+async def _select_handoff_staff(staff_id: str = "") -> Optional[dict]:
+    staff = await get_appointment_staff(include_inactive=False)
+    if staff_id:
+        for person in staff:
+            if str(person.get("id")) == str(staff_id):
+                return person
+    with_wa = [person for person in staff if person.get("whatsapp_number")]
+    pool = with_wa or staff
+    if not pool:
+        return None
+    return sorted(pool, key=lambda s: (int(s.get("round_robin_order") or 0), s.get("name") or ""))[0]
+
+
+async def _notify_handoff_staff(staff: dict, contact: dict, reason: str) -> dict:
+    phone = staff.get("whatsapp_number") or ""
+    if not phone:
+        await log_error("handoff", "staff_whatsapp_missing", f"staff_id={staff.get('id')}; contact={contact.get('phone_number')}", "warning")
+        return {"success": False, "reason": "staff_whatsapp_missing"}
+    template = await resolve_wa_template("staff_handoff_notification_template")
+    if not template:
+        await log_error("handoff", "staff_template_missing", "purpose=staff_handoff_notification_template", "warning")
+        return {"success": False, "reason": "staff_template_missing"}
+    params = [
+        contact.get("lead_name") or "Customer",
+        contact.get("phone_number") or "",
+        contact.get("service_type") or contact.get("requirement") or "Lead follow-up",
+        reason or "human_handoff",
+        contact.get("source") or "CRM",
+    ]
+    await log_error("handoff", "staff_notification_started", f"staff_id={staff.get('id')}; phone={contact.get('phone_number')}", "info")
+    result = await send_whatsapp_template(
+        phone, template, await get_setting("WHATSAPP_DEFAULT_LANGUAGE", "en"),
+        params, event_type="human_handoff",
+        source_type="crm_contacts", source_id=contact.get("phone_number") or "",
+        template_purpose="staff_handoff_notification_template",
+    )
+    await log_error("handoff", "staff_template_sent" if result.get("success") else "staff_template_failed", f"staff_id={staff.get('id')}; result={result.get('reason') or result.get('error') or result.get('status')}", "info" if result.get("success") else "warning")
+    return result
+
+
+@app.post("/api/crm/contacts/{phone}/handoff")
+async def api_create_handoff(phone: str, req: HandoffRequest):
+    clean = normalize_phone(phone)
+    contact = await get_crm_contact_by_phone(clean) or {}
+    if not contact:
+        raise HTTPException(404, "CRM contact not found")
+    staff = await _select_handoff_staff(req.staff_id or "")
+    assigned = (staff or {}).get("name") or ""
+    await update_lead_journey(clean, {
+        "handoff_required": True,
+        "handoff_reason": req.reason or "human_requested",
+        "handoff_assigned_to": assigned,
+        "handoff_at": datetime.now(timezone.utc).isoformat(),
+        "journey_stage": "human_handoff",
+        "next_best_action": "staff_followup",
+    })
+    await create_followup_action(clean, "human_handoff", "staff_followup", "whatsapp", datetime.now(timezone.utc), reason=req.reason or "human_requested", payload={"staff_id": (staff or {}).get("id")})
+    notify_result = await _notify_handoff_staff(staff, contact, req.reason or "human_requested") if staff else {"success": False, "reason": "no_active_staff"}
+    return {"success": True, "assigned_to": assigned, "staff_notification": notify_result}
+
+
+@app.post("/api/crm/contacts/{phone}/resolve-handoff")
+async def api_resolve_handoff(phone: str):
+    clean = normalize_phone(phone)
+    ok = await update_lead_journey(clean, {"handoff_required": False, "handoff_reason": "", "handoff_assigned_to": ""})
+    return {"success": bool(ok)}
+
+
+@app.get("/api/handoffs")
+async def api_handoffs():
+    contacts = await get_crm_contacts()
+    rows = [c for c in contacts if c.get("handoff_required")]
+    return {"handoffs": rows}
 
 
 @app.post("/api/crm/call-selected")

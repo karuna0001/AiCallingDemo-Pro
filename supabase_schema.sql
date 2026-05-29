@@ -253,6 +253,38 @@ CREATE INDEX IF NOT EXISTS idx_crm_contacts_created_at ON crm_contacts(created_a
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_journey_stage ON crm_contacts(journey_stage);
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_next_action ON crm_contacts(next_action_at);
 
+CREATE TABLE IF NOT EXISTS broadcast_campaigns (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name text NOT NULL,
+    template_purpose text NOT NULL DEFAULT '',
+    template_name text NOT NULL DEFAULT '',
+    segment jsonb NOT NULL DEFAULT '{}'::jsonb,
+    status text NOT NULL DEFAULT 'draft',
+    scheduled_at timestamptz,
+    sent_count integer NOT NULL DEFAULT 0,
+    failed_count integer NOT NULL DEFAULT 0,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE broadcast_campaigns DISABLE ROW LEVEL SECURITY;
+CREATE INDEX IF NOT EXISTS idx_broadcast_campaigns_status ON broadcast_campaigns(status);
+CREATE INDEX IF NOT EXISTS idx_broadcast_campaigns_scheduled ON broadcast_campaigns(scheduled_at);
+
+CREATE TABLE IF NOT EXISTS broadcast_recipients (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id uuid NOT NULL,
+    phone_number text NOT NULL,
+    status text NOT NULL DEFAULT 'pending',
+    provider_message_id text NOT NULL DEFAULT '',
+    error_message text NOT NULL DEFAULT '',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE broadcast_recipients DISABLE ROW LEVEL SECURITY;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_broadcast_recipients_unique ON broadcast_recipients(campaign_id, phone_number);
+CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_campaign ON broadcast_recipients(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_status ON broadcast_recipients(status);
+
 CREATE TABLE IF NOT EXISTS followup_actions (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     phone_number text NOT NULL,
@@ -319,6 +351,7 @@ INSERT INTO settings (key, value, updated_at) VALUES
 ('APPOINTMENT_TELEGRAM_REMINDER_ENABLED', '0', now()::text),
 ('staff_appointment_notification_template', 'staff_appointment_notification', now()::text),
 ('staff_appointment_reminder_template', 'staff_appointment_reminder', now()::text),
+('staff_handoff_notification_template', 'staff_appointment_alert', now()::text),
 ('GOOGLE_CALENDAR_ENABLED', 'false', now()::text),
 ('GOOGLE_MEET_ENABLED', 'false', now()::text),
 ('GOOGLE_CALENDAR_SERVICE_ACCOUNT_JSON', '', now()::text),
@@ -332,7 +365,8 @@ INSERT INTO settings (key, value, updated_at) VALUES
 ('COST_RECORDING_PER_MINUTE', '0', now()::text),
 ('COST_WHATSAPP_TEMPLATE', '0', now()::text),
 ('COST_WHATSAPP_FREE_TEXT', '0', now()::text),
-('COST_CURRENCY', 'INR', now()::text)
+('COST_CURRENCY', 'INR', now()::text),
+('BROADCAST_MAX_SEND_PER_RUN', '50', now()::text)
 ON CONFLICT (key) DO NOTHING;
 
 -- ── Phase 8: WhatsApp Chat Inbox ──────────────────────────────────────────────
