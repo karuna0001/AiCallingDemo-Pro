@@ -70,7 +70,11 @@
   `Meta restricted this template delivery for this recipient. Try after customer replies or use another approved template.`
 
 ## Inbox Date and Time Display
+- Confirm `/api/health` returns `app_timezone`, `appointment_timezone`, and `whatsapp_display_timezone`.
+- Confirm `WHATSAPP_DISPLAY_TIMEZONE` is `Asia/Kolkata` unless intentionally changed.
+- Send a WhatsApp message at the current India time.
 - Today conversation list items show local time, for example `4:32 PM`.
+- The conversation list time matches the India/local clock, not UTC.
 - Yesterday conversation list items show `Yesterday`.
 - Older conversation list items show local date, for example `28/05/2026`.
 - Chat messages are grouped by date dividers:
@@ -78,10 +82,12 @@
   - `Yesterday`
   - `28 May 2026`
 - Each chat bubble shows local time, for example `4:32 PM`.
+- The chat bubble time matches the India/local clock, not UTC.
 
 ## WhatsApp Logs UI
 - Open WhatsApp Logs.
 - Confirm timestamps show local readable format, for example `28 May 2026, 04:32 PM`.
+- Confirm the log time matches the India/local clock, not UTC.
 - Confirm status/error cells have tooltips and short readable error text.
 - Confirm raw provider message ID remains visible and available in the tooltip.
 

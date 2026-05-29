@@ -252,6 +252,9 @@ INSERT INTO lead_statuses (name, color) VALUES
 ON CONFLICT (name) DO NOTHING;
 
 INSERT INTO settings (key, value, updated_at) VALUES
+('APP_TIMEZONE', 'Asia/Kolkata', now()::text),
+('APPOINTMENT_TIMEZONE', 'Asia/Kolkata', now()::text),
+('WHATSAPP_DISPLAY_TIMEZONE', 'Asia/Kolkata', now()::text),
 ('FOLLOWUP_ENABLED', 'true', now()::text),
 ('FOLLOWUP_TIMEZONE', 'Asia/Kolkata', now()::text),
 ('FOLLOWUP_MAX_CALLS_PER_DAY', '2', now()::text),

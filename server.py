@@ -828,9 +828,26 @@ async def api_health():
     whatsapp_chat_prompt = await get_setting("AI_PROMPT_whatsapp_chat", "")
     active_prompt_types = ["voice_call", "whatsapp_chat"]
     prompt_mode = "simple"
+    def clean_timezone(value: str, fallback: str = "Asia/Kolkata") -> str:
+        value = (value or fallback).strip() or fallback
+        try:
+            ZoneInfo(value)
+            return value
+        except Exception:
+            return fallback
+
+    app_timezone_raw, _ = await setting_value_with_source("APP_TIMEZONE", "Asia/Kolkata")
+    app_timezone = clean_timezone(app_timezone_raw)
+    appointment_timezone_raw, _ = await setting_value_with_source("APPOINTMENT_TIMEZONE", app_timezone)
+    appointment_timezone = clean_timezone(appointment_timezone_raw, app_timezone)
+    whatsapp_display_timezone_raw, _ = await setting_value_with_source("WHATSAPP_DISPLAY_TIMEZONE", app_timezone)
+    whatsapp_display_timezone = clean_timezone(whatsapp_display_timezone_raw, app_timezone)
     supabase_configured, supabase_error = await supabase_status(supabase_url, supabase_key)
     response = {
         "status": "ok",
+        "app_timezone": app_timezone,
+        "appointment_timezone": appointment_timezone,
+        "whatsapp_display_timezone": whatsapp_display_timezone,
         "livekit_configured": bool(livekit_url and livekit_key and livekit_secret),
         "gemini_configured": bool(google_key),
         "supabase_configured": supabase_configured,

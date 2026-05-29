@@ -296,6 +296,11 @@ async def resolve_wa_template(purpose_or_name: str) -> str:
 
 async def get_wa_health() -> dict:
     cfg = await _wa_config()
+    try:
+        from db import get_setting
+        display_timezone = await get_setting("WHATSAPP_DISPLAY_TIMEZONE", await get_setting("APP_TIMEZONE", "Asia/Kolkata")) or "Asia/Kolkata"
+    except Exception:
+        display_timezone = "Asia/Kolkata"
     enabled = _is_truthy(cfg.get("WHATSAPP_ENABLED"))
     provider = (cfg.get("WHATSAPP_PROVIDER") or "meta").strip().lower()
     templates = [
@@ -317,6 +322,7 @@ async def get_wa_health() -> dict:
         return {
             "enabled": enabled,
             "provider": "vobiz",
+            "whatsapp_display_timezone": display_timezone,
             "vobiz_auth_id_configured": auth_id,
             "vobiz_auth_token_configured": auth_token,
             "vobiz_channel_id_configured": channel_id,
@@ -343,6 +349,7 @@ async def get_wa_health() -> dict:
     return {
         "enabled": enabled,
         "provider": "meta",
+        "whatsapp_display_timezone": display_timezone,
         "phone_number_id_configured": phone_id,
         "access_token_configured": token,
         "staff_appointment_notification_template_configured": bool(cfg.get("staff_appointment_notification_template", "").strip()),
