@@ -5,7 +5,7 @@ import base64
 import csv
 import hashlib
 import hmac
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from io import BytesIO, StringIO
 import json
 import logging
@@ -2652,6 +2652,86 @@ async def _outbound_window_error() -> dict:
     }
 
 
+def _parse_server_datetime(value) -> Optional[datetime]:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw.replace(" ", "T"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _format_datetime_display(value, tz_name: str = "Asia/Kolkata") -> str:
+    dt = _parse_server_datetime(value)
+    if not dt:
+        return ""
+    try:
+        local_dt = dt.astimezone(ZoneInfo(tz_name or "Asia/Kolkata"))
+    except Exception:
+        local_dt = dt.astimezone(ZoneInfo("Asia/Kolkata"))
+    today = datetime.now(local_dt.tzinfo).date()
+    time_text = local_dt.strftime("%I:%M %p").lstrip("0")
+    if local_dt.date() == today:
+        return f"Today, {time_text}"
+    return f"{local_dt.strftime('%d %b %Y')}, {time_text}"
+
+
+async def _display_timezone() -> str:
+    tz_name = (
+        await get_setting("FOLLOWUP_TIMEZONE", "")
+        or await get_setting("APP_TIMEZONE", "")
+        or "Asia/Kolkata"
+    )
+    try:
+        ZoneInfo(tz_name)
+        return tz_name
+    except Exception:
+        return "Asia/Kolkata"
+
+
+def _with_followup_display(row: dict, tz_name: str) -> dict:
+    out = dict(row or {})
+    for key in ("scheduled_at", "next_action_at", "preferred_callback_at", "created_at", "completed_at"):
+        if out.get(key):
+            out[f"{key}_display"] = _format_datetime_display(out.get(key), tz_name)
+    return out
+
+
+async def _snap_followup_call_time_to_window(scheduled_local: datetime) -> tuple[datetime, bool, str]:
+    enabled_raw = (await eff("OUTBOUND_CALLING_ENABLED") or "true").strip().lower()
+    if enabled_raw in ("0", "false", "no", "off"):
+        return scheduled_local, False, "outbound_calling_disabled"
+    tz_name, start_str, end_str, allowed_days = await _outbound_window()
+    try:
+        outbound_tz = ZoneInfo(tz_name)
+    except Exception:
+        outbound_tz = ZoneInfo("Asia/Kolkata")
+    candidate = scheduled_local.astimezone(outbound_tz) if scheduled_local.tzinfo else scheduled_local.replace(tzinfo=outbound_tz)
+    sh, sm = _parse_hhmm(start_str)
+    eh, em = _parse_hhmm(end_str)
+    for _ in range(8):
+        label = candidate.strftime("%a").lower()
+        start_dt = candidate.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_dt = candidate.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if label in allowed_days and start_dt <= candidate < end_dt:
+            final_local = candidate.astimezone(scheduled_local.tzinfo) if scheduled_local.tzinfo else candidate
+            return final_local, final_local != scheduled_local, "inside_outbound_window"
+        if label in allowed_days and candidate < start_dt:
+            final_local = start_dt.astimezone(scheduled_local.tzinfo) if scheduled_local.tzinfo else start_dt
+            return final_local, final_local != scheduled_local, "before_outbound_window"
+        candidate = (candidate + timedelta(days=1)).replace(hour=sh, minute=sm, second=0, microsecond=0)
+    final_local = candidate.astimezone(scheduled_local.tzinfo) if scheduled_local.tzinfo else candidate
+    return final_local, final_local != scheduled_local, "next_allowed_day"
+
+
 async def _wait_for_outbound_window(campaign_id: str, poll_seconds: int = 120) -> bool:
     """Block until the outbound calling window opens (or campaign is paused/stopped).
 
@@ -3040,6 +3120,9 @@ async def api_get_crm_contact_detail(phone: str):
     detail = await get_crm_contact_detail(phone)
     if not detail.get("contact"):
         raise HTTPException(404, "CRM contact not found")
+    tz_name = await _display_timezone()
+    detail["contact"] = _with_followup_display(detail.get("contact") or {}, tz_name)
+    detail["appointments"] = [_with_followup_display(row, tz_name) for row in (detail.get("appointments") or [])]
     return detail
 
 
@@ -3049,18 +3132,44 @@ async def api_get_followup_state(phone: str):
     if not state:
         raise HTTPException(404, "CRM contact not found")
     actions = await get_followup_actions(phone=phone, limit=20)
-    return {"contact": state, "actions": actions}
+    tz_name = await _display_timezone()
+    return {
+        "contact": _with_followup_display(state, tz_name),
+        "actions": [_with_followup_display(action, tz_name) for action in actions],
+    }
 
 
 @app.post("/api/crm/contacts/{phone}/schedule-followup")
 async def api_schedule_followup(phone: str, req: ScheduleFollowupRequest):
     clean = normalize_phone(phone)
     channel = (req.channel or "call").lower()
-    tz_name = await get_setting("FOLLOWUP_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata"
-    scheduled_at = parse_followup_time(req.when_text, timezone=tz_name)
+    tz_name = await _display_timezone()
+    now_local = datetime.now(ZoneInfo(tz_name))
+    parsed_scheduled_local = parse_followup_time(req.when_text, timezone=tz_name, now=now_local)
+    final_scheduled_local = parsed_scheduled_local
+    outbound_window_adjusted = False
+    outbound_window_reason = "not_applicable"
+    if channel == "call":
+        final_scheduled_local, outbound_window_adjusted, outbound_window_reason = await _snap_followup_call_time_to_window(parsed_scheduled_local)
+        if outbound_window_adjusted:
+            await log_error(
+                "followup",
+                "followup_outbound_window_adjusted",
+                (
+                    f"phone={clean}; source=dashboard; original_scheduled_local={parsed_scheduled_local.isoformat()}; "
+                    f"adjusted_scheduled_local={final_scheduled_local.isoformat()}; reason={outbound_window_reason}"
+                ),
+                "info",
+            )
+    scheduled_at = final_scheduled_local.astimezone(timezone.utc) if final_scheduled_local.tzinfo else final_scheduled_local.replace(tzinfo=ZoneInfo(tz_name)).astimezone(timezone.utc)
     action_type = req.action_type or ("call_only" if channel == "call" else "whatsapp_template")
     event_type = "callback_requested" if channel == "call" else "message_followup_requested"
-    payload = {"template_purpose": req.template_purpose or "no_response_followup_template", "message": req.message or "", "when_text": req.when_text}
+    payload = {
+        "template_purpose": req.template_purpose or "no_response_followup_template",
+        "message": req.message or "",
+        "when_text": req.when_text,
+        "scheduled_local": final_scheduled_local.isoformat(),
+    }
     action_id = await create_followup_action(clean, event_type, action_type, channel, scheduled_at, reason=req.reason, payload=payload, source="dashboard")
     await set_next_best_action(clean, "call_customer" if channel == "call" else "message_customer", channel, scheduled_at, req.reason)
     await update_lead_journey(clean, {
@@ -3069,7 +3178,24 @@ async def api_schedule_followup(phone: str, req: ScheduleFollowupRequest):
         "preferred_channel": channel,
         "preferred_callback_at": scheduled_at.isoformat() if channel == "call" else None,
     })
-    return {"success": True, "action_id": action_id, "scheduled_at": scheduled_at.isoformat()}
+    await log_error(
+        "followup",
+        "callback_scheduled" if channel == "call" else "whatsapp_followup_scheduled",
+        (
+            f"phone={clean}; source=dashboard; action_id={action_id}; channel={channel}; "
+            f"callback_time_text={req.when_text}; timezone_used={tz_name}; now_local={now_local.isoformat()}; "
+            f"parsed_scheduled_local={parsed_scheduled_local.isoformat()}; final_scheduled_local={final_scheduled_local.isoformat()}; "
+            f"final_scheduled_utc={scheduled_at.isoformat()}; outbound_window_adjusted={str(outbound_window_adjusted).lower()}; "
+            f"outbound_window_reason={outbound_window_reason}"
+        ),
+        "info",
+    )
+    return {
+        "success": True,
+        "action_id": action_id,
+        "scheduled_at": scheduled_at.isoformat(),
+        "scheduled_at_display": _format_datetime_display(scheduled_at.isoformat(), tz_name),
+    }
 
 
 @app.post("/api/crm/contacts/{phone}/stop-automation")
@@ -3086,7 +3212,9 @@ async def api_resume_automation(phone: str):
 
 @app.get("/api/followups/due")
 async def api_get_due_followups(limit: int = 50):
-    return {"actions": await get_due_followup_actions(limit=limit)}
+    tz_name = await _display_timezone()
+    actions = await get_due_followup_actions(limit=limit)
+    return {"actions": [_with_followup_display(action, tz_name) for action in actions]}
 
 
 @app.post("/api/followups/run-due")
@@ -3098,7 +3226,9 @@ async def api_run_due_followups():
 
 @app.get("/api/followups")
 async def api_get_followups(phone: Optional[str] = None, status: Optional[str] = None, limit: int = 100):
-    return {"actions": await get_followup_actions(phone=phone, status=status, limit=limit)}
+    tz_name = await _display_timezone()
+    actions = await get_followup_actions(phone=phone, status=status, limit=limit)
+    return {"actions": [_with_followup_display(action, tz_name) for action in actions]}
 
 
 @app.post("/api/crm/call-selected")

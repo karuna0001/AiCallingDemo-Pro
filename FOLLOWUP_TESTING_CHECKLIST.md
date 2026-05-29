@@ -35,10 +35,20 @@ Expected due-run logs:
 
 ## Time parser smoke examples
 - `call me after 30 minutes` -> now + 30 minutes.
+- `call me in 30 minutes` -> now + 30 minutes.
 - `message me tomorrow morning` -> tomorrow 09:00.
 - `call tomorrow at 11 am` -> tomorrow 11:00.
 - `I need 10 cabinets` -> does not parse `10` as 10:00; fallback applies.
 - `budget 5 lakh` -> does not parse `5` as 17:00; fallback applies.
+
+## Callback +30 minute timezone verification
+- Note the current India local time, for example `14:38 IST`.
+- Ask the AI or dashboard to schedule `in 30 minutes` / `call after 30 minutes`.
+- Expected parser result: local scheduled time is exactly current local time + 30 minutes, for example `15:08 IST`.
+- Expected `/api/followups` raw `scheduled_at`: UTC equivalent of the local time, for example `2026-05-29T09:38:00+00:00`.
+- Expected `/api/followups` display: `scheduled_at_display` shows local time, for example `Today, 3:08 PM`.
+- Expected CRM modal Follow-up Brain: `Next Action At` and `Preferred Callback At` show local configured timezone, not raw UTC.
+- Expected logs include `callback_time_text`, `timezone_used`, `now_local`, `parsed_scheduled_local`, `final_scheduled_local`, `final_scheduled_utc`, and `outbound_window_adjusted=false` when inside the calling window.
 
 ## 1. Customer says "call me after 30 minutes"
 Expected:

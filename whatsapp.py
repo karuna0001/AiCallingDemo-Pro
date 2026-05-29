@@ -16,7 +16,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -3553,15 +3553,23 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
         if followup_intent:
             await _db().log_error("followup", "customer_intent_detected", f"phone={phone}; intent={followup_intent}; text={text[:120]}", "info")
         tz_name = await get_setting("FOLLOWUP_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata"
+        try:
+            tzinfo = ZoneInfo(tz_name)
+        except Exception:
+            tz_name = "Asia/Kolkata"
+            tzinfo = ZoneInfo(tz_name)
         if followup_intent == "callback_request":
-            scheduled_at = parse_followup_time(text, timezone=tz_name)
-            action_id = await create_followup_action(phone, "callback_requested", "call_only", "call", scheduled_at, reason="whatsapp_callback_request", payload={"text": text}, source="whatsapp", source_id=provider_msg_id)
-            await update_lead_journey(phone, {"journey_stage": "callback_requested", "crm_status": "callback_requested", "preferred_channel": "call", "preferred_callback_at": scheduled_at.isoformat()})
-            await set_next_best_action(phone, "call_customer", "call", scheduled_at, "whatsapp_callback_request")
-            await _db().log_error("followup", "callback_scheduled", f"phone={phone}; action_id={action_id}; scheduled_at={scheduled_at.isoformat()}", "info")
+            now_local = datetime.now(tzinfo)
+            scheduled_local = parse_followup_time(text, timezone=tz_name, now=now_local)
+            scheduled_utc = scheduled_local.astimezone(timezone.utc)
+            action_id = await create_followup_action(phone, "callback_requested", "call_only", "call", scheduled_utc, reason="whatsapp_callback_request", payload={"text": text, "scheduled_local": scheduled_local.isoformat()}, source="whatsapp", source_id=provider_msg_id)
+            await update_lead_journey(phone, {"journey_stage": "callback_requested", "crm_status": "callback_requested", "preferred_channel": "call", "preferred_callback_at": scheduled_utc.isoformat()})
+            await set_next_best_action(phone, "call_customer", "call", scheduled_utc, "whatsapp_callback_request")
+            await _db().log_error("followup", "callback_scheduled", f"phone={phone}; source=whatsapp; action_id={action_id}; callback_time_text={text[:120]}; timezone_used={tz_name}; now_local={now_local.isoformat()}; parsed_scheduled_local={scheduled_local.isoformat()}; final_scheduled_local={scheduled_local.isoformat()}; final_scheduled_utc={scheduled_utc.isoformat()}; outbound_window_adjusted=false", "info")
         elif followup_intent == "message_later":
-            scheduled_at = parse_followup_time(text, timezone=tz_name)
-            action_id = await create_followup_action(phone, "message_followup_requested", "whatsapp_template", "whatsapp", scheduled_at, reason="whatsapp_message_later", payload={"template_purpose": "no_response_followup_template", "text": text}, source="whatsapp", source_id=provider_msg_id)
+            scheduled_local = parse_followup_time(text, timezone=tz_name)
+            scheduled_at = scheduled_local.astimezone(timezone.utc)
+            action_id = await create_followup_action(phone, "message_followup_requested", "whatsapp_template", "whatsapp", scheduled_at, reason="whatsapp_message_later", payload={"template_purpose": "no_response_followup_template", "text": text, "scheduled_local": scheduled_local.isoformat()}, source="whatsapp", source_id=provider_msg_id)
             await update_lead_journey(phone, {"journey_stage": "message_followup_requested", "crm_status": "message_followup_requested", "preferred_channel": "whatsapp"})
             await set_next_best_action(phone, "message_customer", "whatsapp", scheduled_at, "whatsapp_message_later")
             await _db().log_error("followup", "whatsapp_followup_scheduled", f"phone={phone}; action_id={action_id}; scheduled_at={scheduled_at.isoformat()}", "info")
