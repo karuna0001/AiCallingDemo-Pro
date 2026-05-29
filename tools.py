@@ -12,7 +12,7 @@ from livekit.agents import llm
 
 from db import (
     add_contact_memory, check_slot, compress_contact_memory, get_appointments_by_phone,
-    get_calls_by_phone, get_contact_memory, get_next_available, insert_appointment,
+    get_calls_by_phone, get_contact_memory, get_existing_active_appointment, get_next_available, insert_appointment,
     log_call, log_error, get_setting, get_appointment_settings,
     create_followup_action, update_lead_journey,
     mark_lead_stop_automation, set_next_best_action, reschedule_appointment,
@@ -28,6 +28,58 @@ async def _log(msg: str, detail: str = "", level: str = "info") -> None:
         await log_error("agent", msg, detail, level)
     except Exception:
         pass
+
+
+async def _appointment_candidate_slots(date_text: str, time_text: str) -> list[dict]:
+    settings = await get_appointment_settings()
+    tz_name = str(settings.get("timezone") or "Asia/Kolkata")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Asia/Kolkata")
+    now_local = datetime.now(tz).replace(tzinfo=None)
+    raw_date = (date_text or "").strip().lower()
+    raw_time = (time_text or "").strip().lower()
+    if not (raw_date or raw_time):
+        return []
+    if not raw_time and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_date):
+        return []
+    extract_source = raw_time or raw_date
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_date):
+        target_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+    elif "tomorrow" in f"{raw_date} {raw_time}":
+        target_date = (now_local + timedelta(days=1)).date()
+    else:
+        target_date = now_local.date()
+
+    global_pm = bool(re.search(r"\bpm\b", extract_source)) and not bool(re.search(r"\bam\b", extract_source))
+    context_pm = any(word in f"{raw_date} {raw_time}" for word in ("afternoon", "evening", "night"))
+    slots = []
+    seen = set()
+    for match in re.finditer(r"(?<!\d)(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?!\d)", extract_source):
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        meridiem = match.group(3)
+        if hour > 23 or minute > 59:
+            continue
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+        elif not meridiem:
+            if (context_pm or global_pm) and hour < 12:
+                hour += 12
+            elif target_date == now_local.date() and 1 <= hour <= 7:
+                afternoon_hour = hour + 12
+                if datetime.combine(target_date, datetime.min.time()).replace(hour=afternoon_hour, minute=minute) > now_local:
+                    hour = afternoon_hour
+        candidate = datetime.combine(target_date, datetime.min.time()).replace(hour=hour, minute=minute)
+        key = candidate.strftime("%Y-%m-%d %H:%M")
+        if key in seen:
+            continue
+        seen.add(key)
+        slots.append({"date": candidate.strftime("%Y-%m-%d"), "time": candidate.strftime("%H:%M")})
+    return slots
 
 
 class AppointmentTools(llm.ToolContext):
@@ -80,6 +132,26 @@ class AppointmentTools(llm.ToolContext):
     async def book_appointment(self, name: str, phone: str, date: str, time: str, service: str) -> str:
         """Book an appointment after verbal confirmation."""
         try:
+            candidates = await _appointment_candidate_slots(date, time)
+            if len(candidates) == 1 and (not re.fullmatch(r"\d{4}-\d{2}-\d{2}", (date or "").strip()) or not re.fullmatch(r"\d{1,2}:\d{2}", (time or "").strip()[:5])):
+                date, time = candidates[0]["date"], candidates[0]["time"]
+            elif len(candidates) > 1:
+                await _log("appointment_multi_slot_request_detected", f"date={date}; time={time}; slots={candidates}")
+                for slot in candidates:
+                    await _log("appointment_candidate_slot_checked", f"date={slot['date']} time={slot['time']}")
+                    if await check_slot(slot["date"], slot["time"]):
+                        await _log("appointment_candidate_slot_available", f"date={slot['date']} time={slot['time']}")
+                        date, time = slot["date"], slot["time"]
+                        break
+                    await _log("appointment_candidate_slot_unavailable", f"date={slot['date']} time={slot['time']}", "warning")
+                else:
+                    next_slot = await get_next_available(candidates[0]["date"], candidates[0]["time"])
+                    await _log("appointment_all_requested_slots_unavailable", f"slots={candidates}; next={next_slot}", "warning")
+                    return f"Those requested slots are not available. Next available slot is {next_slot}."
+            existing = await get_existing_active_appointment(phone, date, time)
+            if existing:
+                await _log("appointment_duplicate_prevented", f"phone={phone}; date={date}; time={time}; existing_id={existing.get('id')}", "warning")
+                return f"This appointment is already booked. Booking ID: {str(existing.get('id') or '')[:8].upper()}."
             booking_id = await insert_appointment(name, phone, date, time, service)
             return f"Confirmed! Booking ID: {booking_id}. See you on {date} at {time} for {service}."
         except Exception:
@@ -257,6 +329,30 @@ class AppointmentTools(llm.ToolContext):
         phone = self.phone_number or ""
         if not phone:
             return "I could not book that demo because the phone number is missing."
+        candidates = await _appointment_candidate_slots(date, time)
+        if len(candidates) == 1 and (not re.fullmatch(r"\d{4}-\d{2}-\d{2}", (date or "").strip()) or not re.fullmatch(r"\d{1,2}:\d{2}", (time or "").strip()[:5])):
+            date, time = candidates[0]["date"], candidates[0]["time"]
+        elif len(candidates) > 1:
+            await _log("appointment_multi_slot_request_detected", f"date={date}; time={time}; slots={candidates}")
+            selected = None
+            for slot in candidates:
+                await _log("appointment_candidate_slot_checked", f"date={slot['date']} time={slot['time']}")
+                if await check_slot(slot["date"], slot["time"]):
+                    selected = slot
+                    await _log("appointment_candidate_slot_available", f"date={slot['date']} time={slot['time']}")
+                    break
+                await _log("appointment_candidate_slot_unavailable", f"date={slot['date']} time={slot['time']}", "warning")
+            if not selected:
+                next_slot = await get_next_available(candidates[0]["date"], candidates[0]["time"])
+                await _log("appointment_all_requested_slots_unavailable", f"slots={candidates}; next={next_slot}", "warning")
+                return f"Those requested slots are not available. Next available slot is {next_slot}."
+            date, time = selected["date"], selected["time"]
+        existing = await get_existing_active_appointment(phone, date, time)
+        if existing:
+            booking_id = str(existing.get("id") or "")[:8].upper()
+            await _log("appointment_duplicate_prevented", f"phone={phone}; date={date}; time={time}; existing_id={existing.get('id')}", "warning")
+            await update_lead_journey(phone, {"journey_stage": "demo_booked", "crm_status": "demo_booked", "last_intent": "demo_request"})
+            return f"This demo is already booked for {date} at {time}. Booking ID: {booking_id}."
         booking_id = await insert_appointment(name or self.lead_name or "Lead", phone, date, time, service)
         try:
             from whatsapp import send_appointment_confirmation

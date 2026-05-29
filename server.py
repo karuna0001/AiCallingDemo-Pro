@@ -1344,6 +1344,57 @@ async def api_notify_appointment_staff(appointment_id: str):
     return {"success": True, "result": result}
 
 
+@app.get("/api/appointments/debug/{appointment_id}")
+async def api_appointment_debug(appointment_id: str):
+    appointment = await get_appointment_by_id(appointment_id)
+    if not appointment:
+        raise HTTPException(404, "Appointment not found")
+    settings = await get_appointment_settings()
+    tz_name = appointment.get("timezone") or settings.get("timezone") or "Asia/Kolkata"
+    try:
+        tz = ZoneInfo(str(tz_name))
+    except Exception:
+        tz = ZoneInfo("Asia/Kolkata")
+        tz_name = "Asia/Kolkata"
+    local_dt = None
+    is_past = None
+    try:
+        local_dt = datetime.strptime(f"{appointment.get('date')} {str(appointment.get('time') or '')[:5]}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+        is_past = local_dt <= datetime.now(tz)
+    except Exception:
+        pass
+    phone = appointment.get("phone") or ""
+    wa_logs = await get_whatsapp_logs(phone=phone, limit=20) if phone else []
+    raw_logs = await get_logs(limit=500)
+    needles = {appointment_id, str(appointment.get("id") or ""), phone, phone.lstrip("+") if phone else ""}
+    related_logs = []
+    for row in raw_logs or []:
+        haystack = f"{row.get('source','')} {row.get('message','')} {row.get('detail','')}"
+        if any(n and n in haystack for n in needles) or str(row.get("source") or "").startswith("appointment"):
+            related_logs.append(row)
+        if len(related_logs) >= 20:
+            break
+    return {
+        "appointment": appointment,
+        "timezone": tz_name,
+        "local_appointment_datetime": local_dt.isoformat() if local_dt else "",
+        "local_appointment_display": local_dt.strftime("%d %b %Y, %I:%M %p").replace(", 0", ", ") if local_dt else "",
+        "is_past": is_past,
+        "staff_notification_status": {
+            "staff_notified": appointment.get("staff_notified"),
+            "notification_error": appointment.get("notification_error") or "",
+        },
+        "reminder_status": {
+            "customer_reminder_sent": appointment.get("customer_reminder_sent"),
+            "staff_reminder_sent": appointment.get("staff_reminder_sent"),
+            "reminder_processed": appointment.get("reminder_processed"),
+            "reminder_error": appointment.get("reminder_error") or "",
+        },
+        "whatsapp_logs": wa_logs,
+        "error_logs": related_logs,
+    }
+
+
 @app.delete("/api/appointments/{appointment_id}")
 async def api_cancel_appointment(appointment_id: str):
     ok = await cancel_appointment(appointment_id)

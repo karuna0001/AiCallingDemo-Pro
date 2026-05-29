@@ -1184,7 +1184,7 @@ async def entrypoint(ctx: agents.JobContext):
             "If customer says not interested, call mark_not_interested.\n"
             "If customer says wrong number, call mark_wrong_number.\n"
             "If customer asks for details, price, package, brochure, or catalog, answer from KB and call send_details_link.\n"
-            "If demo time is agreed, call book_demo_or_appointment. If they ask to change time, call reschedule_demo.\n"
+            "If demo time is agreed, call book_demo_or_appointment. If they say multiple options like today 4 or 5 or 6, pass the same multi-time phrase so the tool can check 16:00, 17:00, and 18:00 in appointment timezone and book only one available slot. If they ask to change time, call reschedule_demo.\n"
             "Do not just say okay to follow-up requests. Always save the follow-up action with the correct tool.\n\n"
         ) + _base_prompt
         system_prompt = system_prompt + "\n\n" + final_override
