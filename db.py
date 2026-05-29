@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, timedelta, time as dt_time
 from typing import Optional
 from collections import defaultdict
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("db")
 
@@ -454,7 +455,7 @@ APPOINTMENT_SETTING_DEFAULTS = {
     "max_booking_days_ahead": 30,
     "customer_reminder_enabled": 1,
     "staff_reminder_enabled": 1,
-    "telegram_reminder_enabled": 1,
+    "telegram_reminder_enabled": 0,
     "reminder_before_minutes": 60,
 }
 
@@ -501,6 +502,19 @@ async def save_appointment_settings(settings: dict) -> dict:
 
 def _parse_hhmm(value: str) -> dt_time:
     return datetime.strptime((value or "00:00")[:5], "%H:%M").time()
+
+
+def _appointment_tz(settings: Optional[dict] = None) -> ZoneInfo:
+    tz_name = str((settings or {}).get("timezone") or "Asia/Kolkata").strip() or "Asia/Kolkata"
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("Asia/Kolkata")
+
+
+def _appointment_now_local(settings: Optional[dict] = None) -> datetime:
+    # Appointment date/time columns are local wall-clock values; DB timestamps remain raw/UTC elsewhere.
+    return datetime.now(_appointment_tz(settings)).replace(tzinfo=None)
 
 
 def _appointment_start(row: dict) -> Optional[datetime]:
@@ -630,17 +644,64 @@ async def _select_staff_round_robin(start: datetime) -> Optional[dict]:
     return candidates[0]
 
 
+_DUPLICATE_ALLOWED_STATUSES = {"cancelled", "lost", "no_show"}
+
+
+async def get_existing_active_appointment(phone: str, date: str, time: str) -> Optional[dict]:
+    """Return an existing active appointment for the same phone/date/time.
+
+    Soft business rule: cancelled/lost/no_show slots may be recreated; anything else
+    prevents duplicate appointment creation and staff reassignment.
+    """
+    phone_clean = ""
+    try:
+        phone_clean = normalize_phone(phone)
+    except Exception:
+        phone_clean = (phone or "").strip()
+    if not (phone_clean and date and time):
+        return None
+    db = await _adb()
+    rows = []
+    for candidate_phone in [phone_clean, (phone or "").strip()]:
+        if not candidate_phone:
+            continue
+        try:
+            result = await db.table("appointments").select("*").eq("phone", candidate_phone).eq("date", date).eq("time", time[:5]).order("created_at", desc=True).limit(5).execute()
+            rows.extend(result.data or [])
+        except Exception as exc:
+            logger.warning("get_existing_active_appointment failed: %s", exc)
+    seen = set()
+    for row in rows:
+        row_id = row.get("id")
+        if row_id in seen:
+            continue
+        seen.add(row_id)
+        status = str(row.get("status") or "booked").strip().lower()
+        if status not in _DUPLICATE_ALLOWED_STATUSES:
+            return row
+    return None
+
+
 async def insert_appointment(name: str, phone: str, date: str, time: str, service: str) -> str:
     settings = await get_appointment_settings()
     try:
         start = datetime.strptime(f"{date} {time[:5]}", "%Y-%m-%d %H:%M")
     except ValueError:
         raise ValueError("Invalid appointment date or time")
-    now = datetime.now()
+    now = _appointment_now_local(settings)
     if start < now + timedelta(minutes=settings["minimum_notice_minutes"]):
         raise ValueError("Appointment is too soon")
     if start.date() > (now + timedelta(days=settings["max_booking_days_ahead"])).date():
         raise ValueError("Appointment is too far ahead")
+    existing = await get_existing_active_appointment(phone, date, time)
+    if existing:
+        await log_error(
+            "appointments",
+            "appointment_duplicate_prevented",
+            f"phone={phone}; date={date}; time={time[:5]}; existing_id={existing.get('id')}; staff_id={existing.get('staff_id') or ''}",
+            "warning",
+        )
+        return str(existing.get("id") or "")[:8].upper()
     staff = await _select_staff_round_robin(start)
     if not staff and await get_appointment_staff(include_inactive=True):
         raise ValueError("No staff available for this slot")
@@ -679,7 +740,7 @@ async def check_slot(date: str, time: str) -> bool:
         start = datetime.strptime(f"{date} {time[:5]}", "%Y-%m-%d %H:%M")
     except ValueError:
         return False
-    now = datetime.now()
+    now = _appointment_now_local(settings)
     if start < now + timedelta(minutes=settings["minimum_notice_minutes"]):
         return False
     if start.date() > (now + timedelta(days=settings["max_booking_days_ahead"])).date():
@@ -697,7 +758,7 @@ async def get_next_available(date: str, time: str) -> str:
     try:
         dt = datetime.strptime(f"{date} {time[:5]}", "%Y-%m-%d %H:%M")
     except ValueError:
-        dt = datetime.now().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        dt = _appointment_now_local(settings).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     interval = max(settings["slot_interval_minutes"], 5)
     for _ in range((settings["max_booking_days_ahead"] + 1) * 24 * 12):
         dt += timedelta(minutes=interval)
@@ -786,11 +847,20 @@ async def reschedule_appointment(appointment_id: str, new_date: str, new_time: s
     except ValueError:
         raise ValueError("Invalid appointment date or time")
 
-    now = datetime.now()
+    now = _appointment_now_local(settings)
     if start < now + timedelta(minutes=settings["minimum_notice_minutes"]):
         raise ValueError("Appointment is too soon")
     if start.date() > (now + timedelta(days=settings["max_booking_days_ahead"])).date():
         raise ValueError("Appointment is too far ahead")
+    existing = await get_existing_active_appointment(old_data.get("phone", ""), new_date, new_time)
+    if existing and existing.get("id") != appointment_id:
+        await log_error(
+            "appointments",
+            "appointment_duplicate_prevented",
+            f"phone={old_data.get('phone','')}; date={new_date}; time={new_time[:5]}; existing_id={existing.get('id')}; reschedule_from={appointment_id}",
+            "warning",
+        )
+        raise ValueError("An active appointment already exists for this phone and slot")
 
     old_staff_id = old_data.get("staff_id")
     staff_to_assign = None
@@ -900,7 +970,8 @@ async def get_due_reminder_appointments(window_minutes: int) -> list:
     if window_minutes <= 0:
         return []
     db = await _adb()
-    now = datetime.now()
+    settings = await get_appointment_settings()
+    now = _appointment_now_local(settings)
     window_end = now + timedelta(minutes=window_minutes)
     today = now.strftime("%Y-%m-%d")
     end_date = window_end.strftime("%Y-%m-%d")
@@ -921,7 +992,7 @@ async def get_due_reminder_appointments(window_minutes: int) -> list:
         start = _appointment_start(row)
         if not start:
             continue
-        if start <= now or start > window_end:
+        if start > window_end:
             continue
         # If already processed by the reminder runner, skip.
         if bool(row.get("reminder_processed")):

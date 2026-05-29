@@ -47,6 +47,7 @@ WA_SETTINGS_KEYS = [
     "callback_confirmation_template",
     "appointment_confirmation_template",
     "staff_appointment_notification_template",
+    "staff_appointment_reminder_template",
     "reminder_template",
     "no_response_followup_template",
     "re_enquiry_followup_template",
@@ -58,6 +59,7 @@ WA_DEFAULTS = {
     "WHATSAPP_GRAPH_VERSION": "v20.0",
     "WHATSAPP_DEFAULT_LANGUAGE": "en",
     "staff_appointment_notification_template": "staff_appointment_notification",
+    "staff_appointment_reminder_template": "staff_appointment_reminder",
 }
 
 # ── Template purpose slot labels (for UI and health reporting) ───────────────
@@ -67,6 +69,7 @@ WA_TEMPLATE_PURPOSES = [
     ("callback_confirmation_template",    "Callback Confirmation"),
     ("appointment_confirmation_template", "Appointment Confirmation"),
     ("staff_appointment_notification_template", "Staff Appointment Notification"),
+    ("staff_appointment_reminder_template", "Staff Appointment Reminder"),
     ("reminder_template",                 "Reminder"),
     ("no_response_followup_template",     "No Response Follow-up"),
     ("re_enquiry_followup_template",      "Re-enquiry Follow-up"),
@@ -78,6 +81,7 @@ WA_TEMPLATE_PARAM_COUNTS = {
     "callback_confirmation_template": 4,
     "appointment_confirmation_template": 4,
     "staff_appointment_notification_template": 5,
+    "staff_appointment_reminder_template": 5,
     "reminder_template": 3,
     "no_response_followup_template": 2,
     "re_enquiry_followup_template": 2,
@@ -90,6 +94,7 @@ WA_TEMPLATE_COOLDOWNS = {
     "missed_call_followup": 2 * 60,
     "appointment_confirmation_template": 30 * 24 * 60,
     "staff_appointment_notification_template": 0,
+    "staff_appointment_reminder_template": 0,
 }
 
 # ── Backward-compat: old key → new purpose slot ───────────────────────────
@@ -102,6 +107,7 @@ _WA_LEGACY_KEY_MAP = {
     "WHATSAPP_CALLBACK_TEMPLATE":      "callback_confirmation_template",
     "WHATSAPP_APPOINTMENT_TEMPLATE":   "appointment_confirmation_template",
     "WHATSAPP_STAFF_APPOINTMENT_NOTIFICATION_TEMPLATE": "staff_appointment_notification_template",
+    "WHATSAPP_STAFF_APPOINTMENT_REMINDER_TEMPLATE": "staff_appointment_reminder_template",
     "WHATSAPP_SHOWROOM_VISIT_TEMPLATE":"appointment_confirmation_template",
     "WHATSAPP_RE_ENQUIRY_TEMPLATE":    "re_enquiry_followup_template",
     "WHATSAPP_FOLLOWUP_TEMPLATE":      "no_response_followup_template",
@@ -116,6 +122,7 @@ _WA_LEGACY_KEY_MAP = {
     "missed_call_followup":            "missed_call_template",
     "appointment_confirmation":        "appointment_confirmation_template",
     "staff_appointment_notification":  "staff_appointment_notification_template",
+    "staff_appointment_reminder":      "staff_appointment_reminder_template",
     "demo_reminder":                   "reminder_template",
     "callback_confirmation":           "callback_confirmation_template",
     "re_enquiry_followup":             "re_enquiry_followup_template",
@@ -330,6 +337,7 @@ async def get_wa_health() -> dict:
             "phone_number_id_configured": channel_id,
             "access_token_configured": auth_token,
             "staff_appointment_notification_template_configured": bool(cfg.get("staff_appointment_notification_template", "").strip()),
+            "staff_appointment_reminder_template_configured": bool(cfg.get("staff_appointment_reminder_template", "").strip()),
             "templates_configured": len(templates),
             "template_purposes": [
                 {"key": k, "label": lbl, "configured": bool(cfg.get(k, "").strip())}
@@ -353,6 +361,7 @@ async def get_wa_health() -> dict:
         "phone_number_id_configured": phone_id,
         "access_token_configured": token,
         "staff_appointment_notification_template_configured": bool(cfg.get("staff_appointment_notification_template", "").strip()),
+        "staff_appointment_reminder_template_configured": bool(cfg.get("staff_appointment_reminder_template", "").strip()),
         "templates_configured": len(templates),
         "template_purposes": [
             {"key": k, "label": lbl, "configured": bool(cfg.get(k, "").strip())}
@@ -1250,7 +1259,7 @@ def _build_template_params(purpose_or_name: str, contact: Optional[dict], contex
         return [name, service, date, time]
     if purpose == "appointment_confirmation_template":
         return [name, company, date, time]
-    if purpose == "staff_appointment_notification_template":
+    if purpose in ("staff_appointment_notification_template", "staff_appointment_reminder_template"):
         customer_phone = _first_value(
             context.get("customer_phone"), context.get("phone"), context.get("phone_number"),
             contact.get("customer_phone"), contact.get("phone"), contact.get("phone_number"),
@@ -2875,23 +2884,31 @@ def _conversation_appointment_state(conv: dict) -> dict:
         return {}
 
 
-def _parse_whatsapp_requested_datetime(text: str) -> Optional[dict]:
+def _appointment_local_now(tz_name: str = "Asia/Kolkata") -> datetime:
+    try:
+        tz = ZoneInfo(str(tz_name or "Asia/Kolkata"))
+    except Exception:
+        tz = ZoneInfo("Asia/Kolkata")
+    return datetime.now(tz).replace(tzinfo=None)
+
+
+def _appointment_local_dt(date_s: str, time_s: str, tz_name: str = "Asia/Kolkata") -> Optional[datetime]:
+    try:
+        return datetime.strptime(f"{date_s} {str(time_s or '')[:5]}", "%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+
+
+def _parse_whatsapp_requested_datetime(text: str, appointment_context: bool = False) -> Optional[dict]:
     lower = (text or "").lower().strip()
-    time_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", lower)
-    if not time_match:
+    has_time_context = appointment_context or bool(
+        re.search(r"\b(today|tomorrow|morning|afternoon|evening|night|demo|appointment|meeting|meet|book|schedule|call|message)\b", lower)
+        or re.search(r"\b\d{1,2}:\d{2}\b", lower)
+        or re.search(r"\b\d{1,2}\s*(am|pm)\b", lower)
+    )
+    if not has_time_context:
         return None
-    hour = int(time_match.group(1))
-    minute = int(time_match.group(2) or 0)
-    meridiem = time_match.group(3)
-    if hour > 23 or minute > 59:
-        return None
-    if meridiem == "pm" and hour < 12:
-        hour += 12
-    elif meridiem == "am" and hour == 12:
-        hour = 0
-    elif not meridiem and ("evening" in lower or "afternoon" in lower or "night" in lower) and hour < 12:
-        hour += 12
-    base = datetime.now()
+    base = _appointment_local_now()
     target_date = base.date()
     if "tomorrow" in lower:
         target_date = (base + timedelta(days=1)).date()
@@ -2906,20 +2923,56 @@ def _parse_whatsapp_requested_datetime(text: str) -> Optional[dict]:
                     days_ahead = 7
                 target_date = (base + timedelta(days=days_ahead)).date()
                 break
-    scheduled = datetime.combine(target_date, datetime.min.time()).replace(hour=hour, minute=minute)
-    if scheduled < base and "today" not in lower:
-        scheduled += timedelta(days=1)
+
+    candidates = []
+    seen = set()
+    global_pm = bool(re.search(r"\bpm\b", lower)) and not bool(re.search(r"\bam\b", lower))
+    context_pm = any(word in lower for word in ("afternoon", "evening", "night"))
+    for match in re.finditer(r"(?<!\d)(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?!\d)", lower):
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        meridiem = match.group(3)
+        if hour > 23 or minute > 59:
+            continue
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+        elif not meridiem:
+            if (context_pm or global_pm) and hour < 12:
+                hour += 12
+            elif target_date == base.date() and 1 <= hour <= 7:
+                afternoon_hour = hour + 12
+                if datetime.combine(target_date, datetime.min.time()).replace(hour=afternoon_hour, minute=minute) > base:
+                    hour = afternoon_hour
+        scheduled = datetime.combine(target_date, datetime.min.time()).replace(hour=hour, minute=minute)
+        if scheduled < base and "today" not in lower and "tomorrow" not in lower:
+            scheduled += timedelta(days=1)
+        key = scheduled.strftime("%Y-%m-%d %H:%M")
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append({
+            "requested_date": scheduled.strftime("%Y-%m-%d"),
+            "requested_time": scheduled.strftime("%H:%M"),
+            "parsed_scheduled_at": scheduled.isoformat(),
+        })
+    if not candidates:
+        return None
+    scheduled = datetime.fromisoformat(candidates[0]["parsed_scheduled_at"])
     return {
         "requested_date": scheduled.strftime("%Y-%m-%d"),
         "requested_time": scheduled.strftime("%H:%M"),
         "parsed_scheduled_at": scheduled.isoformat(),
+        "candidate_slots": candidates,
+        "multi_slot_request": len(candidates) > 1,
     }
 
 
 def _format_demo_slot(date_str: str, time_str: str) -> str:
     try:
         dt = datetime.strptime(f"{date_str} {time_str[:5]}", "%Y-%m-%d %H:%M")
-        day = "tomorrow" if dt.date() == (datetime.now() + timedelta(days=1)).date() else dt.strftime("%d %b %Y")
+        day = "tomorrow" if dt.date() == (_appointment_local_now() + timedelta(days=1)).date() else dt.strftime("%d %b %Y")
         return f"{day} at {dt.strftime('%I:%M %p').lstrip('0')}"
     except Exception:
         return f"{date_str} at {time_str}"
@@ -3240,7 +3293,8 @@ async def _handle_whatsapp_appointment_state(phone: str, conv_id: str, text: str
         await _send_and_save_whatsapp_ai_text(phone, conv_id, "No problem, I have not booked that demo slot.", inbound_saved, {"appointment_state": "cancelled"})
         return True
 
-    parsed_dt = _parse_whatsapp_requested_datetime(text)
+    appointment_context = bool(state) or _detect_inbound_intent(text) == "appointment"
+    parsed_dt = _parse_whatsapp_requested_datetime(text, appointment_context=appointment_context)
     if parsed_dt:
         await _log_whatsapp_ai_event(phone, "whatsapp_appointment_intent_detected", f"parsed_scheduled_at={parsed_dt['parsed_scheduled_at']}")
         try:
@@ -3249,6 +3303,40 @@ async def _handle_whatsapp_appointment_state(phone: str, conv_id: str, text: str
             duration = int(settings.get("demo_duration_minutes") or 30)
         except Exception:
             duration = 30
+        candidate_slots = parsed_dt.get("candidate_slots") or [parsed_dt]
+        if len(candidate_slots) > 1:
+            await _log_whatsapp_ai_event(phone, "appointment_multi_slot_request_detected", f"slots={candidate_slots}")
+        selected_slot = None
+        unavailable = []
+        try:
+            from db import check_slot
+            for slot in candidate_slots:
+                date_s = slot.get("requested_date", "")
+                time_s = slot.get("requested_time", "")
+                await _log_whatsapp_ai_event(phone, "appointment_candidate_slot_checked", f"date={date_s} time={time_s}")
+                available = await check_slot(date_s, time_s)
+                if available:
+                    selected_slot = slot
+                    await _log_whatsapp_ai_event(phone, "appointment_candidate_slot_available", f"date={date_s} time={time_s}")
+                    break
+                unavailable.append(slot)
+                await _log_whatsapp_ai_event(phone, "appointment_candidate_slot_unavailable", f"date={date_s} time={time_s}", "warning")
+        except Exception as exc:
+            await _log_whatsapp_ai_event(phone, "appointment_candidate_slot_check_failed", str(exc)[:500], "warning")
+            selected_slot = candidate_slots[0]
+        if not selected_slot:
+            first = candidate_slots[0]
+            slots = await _suggest_available_demo_slots(first.get("requested_date", ""), first.get("requested_time", ""), 3)
+            labels = [s["label"] for s in slots]
+            await _log_whatsapp_ai_event(phone, "appointment_all_requested_slots_unavailable", f"requested={unavailable}", "warning")
+            await _log_whatsapp_ai_event(phone, "appointment_alternatives_offered", f"suggestions={labels}", "info")
+            if labels:
+                reply = f"Those slots are already booked. Available slots are {', '.join(labels[:-1])}{' or ' if len(labels)>1 else ''}{labels[-1]}. Which one do you prefer?"
+            else:
+                reply = "Those slots are not available. Please share another preferred time for the demo."
+            await _send_and_save_whatsapp_ai_text(phone, conv_id, reply, inbound_saved, {"appointment_state": {"status": "alternatives_offered", "requested_slots": candidate_slots}})
+            return True
+        parsed_dt = selected_slot
         pending = {
             **parsed_dt,
             "appointment_type": "demo",
@@ -3270,7 +3358,17 @@ async def _handle_whatsapp_appointment_state(phone: str, conv_id: str, text: str
             return False
         await _log_whatsapp_ai_event(phone, "appointment_booking_started", f"date={date_s} time={time_s}")
         try:
-            from db import check_slot, get_appointments_by_phone, insert_appointment
+            from db import check_slot, get_appointments_by_phone, get_existing_active_appointment, insert_appointment
+            existing = await get_existing_active_appointment(phone, date_s, time_s)
+            if existing:
+                staff_name = existing.get("staff_name") or "our team"
+                booking_id = str(existing.get("id") or "")[:8].upper()
+                booked_state = {**state, "status": "booked", "booking_id": booking_id, "staff_name": staff_name, "duplicate_prevented": True, "booked_at": datetime.now().isoformat()}
+                await patch_conversation(conv_id, {"appointment_state": _json.dumps(booked_state)})
+                await _log_whatsapp_ai_event(phone, "appointment_duplicate_prevented", f"booking_id={booking_id} staff={staff_name}", "warning")
+                reply = f"This demo is already booked for {_format_demo_slot(date_s, time_s)} with {staff_name}. I will not create another booking."
+                await _send_and_save_whatsapp_ai_text(phone, conv_id, reply, inbound_saved, {"appointment_state": booked_state})
+                return True
             if not await check_slot(date_s, time_s):
                 slots = await _suggest_available_demo_slots(date_s, time_s, 3)
                 labels = [s["label"] for s in slots]
@@ -3845,30 +3943,45 @@ async def run_due_appointment_reminders() -> None:
 
             updates = {}
             errors = []
-            now_str = datetime.now().isoformat()
+            now_str = datetime.now(timezone.utc).isoformat()
+            tz_name = appt.get("timezone") or settings.get("timezone") or "Asia/Kolkata"
+            appt_dt = _appointment_local_dt(date_s, time_s, tz_name)
+            now_local = _appointment_local_now(tz_name)
+            if appt_dt and appt_dt <= now_local:
+                updates["reminder_processed"] = True
+                updates["reminder_processed_at"] = now_str
+                updates["reminder_error"] = "appointment_time_in_past"
+                await update_appointment_notifications(appt_id, updates)
+                await log_error("appointment_reminder", "reminder_skipped_past_appointment", f"appointment_id={appt_id}; date={date_s}; time={time_s}; timezone={tz_name}", "warning")
+                continue
 
             # 1. Customer Reminder
             if settings.get("customer_reminder_enabled") and not appt.get("customer_reminder_sent"):
-                template = await resolve_wa_template("appointment_reminder_template")
+                template_purpose = "reminder_template"
+                template = await resolve_wa_template(template_purpose)
                 if template:
                     language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
                     params = _build_template_params(
-                        "appointment_reminder_template",
+                        template_purpose,
                         {"lead_name": customer_name, "business_name": "our company"},
                         {"appointment_date": date_s, "appointment_time": time_s},
                     )
+                    await log_error("appointment_reminder", "reminder_template_send_started", f"phone={phone}; reminder_template_name={template}; params_count={len(params)}; template_purpose={template_purpose}", "info")
                     result = await send_whatsapp_template(
                         phone, template, language, params,
                         event_type="appointment_reminder",
                         source_type="whatsapp_ai",
                         source_id=appt_id or phone,
-                        template_purpose="appointment_reminder_template",
+                        template_purpose=template_purpose,
                     )
                     if result.get("success"):
                         updates["customer_reminder_sent"] = True
                         updates["customer_reminder_sent_at"] = now_str
                     else:
-                        errors.append(f"customer_template_failed: {result.get('error') or result.get('reason')}")
+                        err = result.get("error") or result.get("reason")
+                        errors.append(f"customer_template_failed: {err}")
+                        if "#100" in str(err) or "parameter" in str(err).lower():
+                            await log_error("appointment_reminder", "reminder_template_param_mismatch", f"phone={phone}; reminder_template_name={template}; params_count={len(params)}; template_purpose={template_purpose}; error={str(err)[:300]}", "error")
                         # Fallback to normal text
                         customer_text = f"Hi {customer_name}, this is a reminder for your upcoming appointment on {_format_demo_slot(date_s, time_s)} with {staff_name}. See you soon!"
                         fallback = await send_whatsapp_text(phone, customer_text)
@@ -3893,8 +4006,30 @@ async def run_due_appointment_reminders() -> None:
             # 2. Staff Reminder
             if settings.get("staff_reminder_enabled") and not appt.get("staff_reminder_sent"):
                 if staff_phone:
+                    staff_template_purpose = "staff_appointment_reminder_template"
+                    staff_template = await resolve_wa_template(staff_template_purpose)
                     staff_msg = f"Reminder: You have an upcoming appointment with {customer_name} on {_format_demo_slot(date_s, time_s)}."
-                    staff_result = await send_whatsapp_text(staff_phone, staff_msg)
+                    if staff_template:
+                        staff_params = _build_template_params(
+                            staff_template_purpose,
+                            {"lead_name": customer_name, "phone": phone, "service": appt.get("service") or "Appointment", "source": appt.get("source") or "WhatsApp"},
+                            {"appointment_datetime": _format_appointment_datetime_for_staff(appt), "appointment_date": date_s, "appointment_time": time_s},
+                        )
+                        await log_error("appointment_reminder", "staff_reminder_template_send_started", f"phone={staff_phone}; reminder_template_name={staff_template}; params_count={len(staff_params)}; template_purpose={staff_template_purpose}", "info")
+                        staff_result = await send_whatsapp_template(
+                            staff_phone,
+                            staff_template,
+                            await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en",
+                            staff_params,
+                            event_type="staff_appointment_reminder",
+                            source_type="appointment",
+                            source_id=appt_id or phone,
+                            template_purpose=staff_template_purpose,
+                        )
+                    elif await is_whatsapp_service_window_open(staff_phone):
+                        staff_result = await send_whatsapp_text(staff_phone, staff_msg)
+                    else:
+                        staff_result = {"success": False, "error": "staff_reminder_template_missing_service_window_closed", "reason": "template_missing"}
                     if staff_result.get("success"):
                         updates["staff_reminder_sent"] = True
                         updates["staff_reminder_sent_at"] = now_str
@@ -3904,21 +4039,6 @@ async def run_due_appointment_reminders() -> None:
                     errors.append("staff_whatsapp_missing")
             elif not settings.get("staff_reminder_enabled"):
                 errors.append("skipped_staff_disabled")
-
-            # 3. Telegram Reminder
-            if settings.get("telegram_reminder_enabled") and not appt.get("telegram_reminder_sent"):
-                tg_msg = f"Reminder: Upcoming appointment with {customer_name} on {_format_demo_slot(date_s, time_s)}. Assigned to: {staff_name}."
-                tg_result = await _send_telegram_appointment_notification(tg_msg)
-                if tg_result.get("success"):
-                    updates["telegram_reminder_sent"] = True
-                    updates["telegram_reminder_sent_at"] = now_str
-                else:
-                    if tg_result.get("reason") == "telegram_not_configured":
-                        errors.append("telegram_not_configured")
-                    else:
-                        errors.append(f"telegram_failed: {tg_result.get('error') or tg_result.get('reason')}")
-            elif not settings.get("telegram_reminder_enabled"):
-                errors.append("skipped_telegram_disabled")
 
             updates["reminder_processed"] = True
             updates["reminder_processed_at"] = now_str
