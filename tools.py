@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -88,10 +88,10 @@ class AppointmentTools(llm.ToolContext):
     async def _followup_timezone(self) -> str:
         return await get_setting("FOLLOWUP_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata"
 
-    async def _snap_call_time_to_window(self, scheduled_at: datetime) -> datetime:
+    async def _snap_call_time_to_window_result(self, scheduled_at: datetime) -> tuple[datetime, bool, str]:
         enabled = (await get_setting("OUTBOUND_CALLING_ENABLED", os.getenv("OUTBOUND_CALLING_ENABLED", "true")) or "true").lower() != "false"
         if not enabled:
-            return scheduled_at
+            return scheduled_at, False, "outbound_calling_disabled"
         start_s = await get_setting("OUTBOUND_START_TIME", os.getenv("OUTBOUND_START_TIME", "10:00")) or "10:00"
         end_s = await get_setting("OUTBOUND_END_TIME", os.getenv("OUTBOUND_END_TIME", "19:00")) or "19:00"
         days_raw = await get_setting("OUTBOUND_ALLOWED_DAYS", os.getenv("OUTBOUND_ALLOWED_DAYS", "mon,tue,wed,thu,fri,sat")) or "mon,tue,wed,thu,fri,sat"
@@ -105,11 +105,15 @@ class AppointmentTools(llm.ToolContext):
             start_dt = candidate.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
             end_dt = candidate.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
             if label in allowed and start_dt <= candidate <= end_dt:
-                return candidate
+                return candidate, candidate != scheduled_at, "inside_outbound_window"
             if label in allowed and candidate < start_dt:
-                return start_dt
+                return start_dt, start_dt != scheduled_at, "before_outbound_window"
             candidate = (candidate + timedelta(days=1)).replace(hour=start_h, minute=start_m, second=0, microsecond=0)
-        return candidate
+        return candidate, candidate != scheduled_at, "next_allowed_day"
+
+    async def _snap_call_time_to_window(self, scheduled_at: datetime) -> datetime:
+        adjusted_at, _, _ = await self._snap_call_time_to_window_result(scheduled_at)
+        return adjusted_at
 
     @llm.function_tool
     async def schedule_callback(self, callback_time_text: str, phone_number: Optional[str] = None, channel: str = "call", reason: str = "customer_requested_callback") -> str:
@@ -118,25 +122,52 @@ class AppointmentTools(llm.ToolContext):
         if not phone:
             return "I could not schedule that because the phone number is missing."
         tz = await self._followup_timezone()
-        scheduled_at = parse_followup_time(callback_time_text, timezone=tz)
+        try:
+            tzinfo = ZoneInfo(tz)
+        except Exception:
+            tz = "Asia/Kolkata"
+            tzinfo = ZoneInfo(tz)
+        now_local = datetime.now(tzinfo)
+        parsed_scheduled_at = parse_followup_time(callback_time_text, timezone=tz, now=now_local)
+        scheduled_at = parsed_scheduled_at
         channel = (channel or "call").lower()
+        outbound_window_adjusted = False
+        outbound_window_reason = "not_applicable"
         if channel == "call":
-            scheduled_at = await self._snap_call_time_to_window(scheduled_at)
+            scheduled_at, outbound_window_adjusted, outbound_window_reason = await self._snap_call_time_to_window_result(scheduled_at)
+            if outbound_window_adjusted:
+                await _log(
+                    "followup_outbound_window_adjusted",
+                    (
+                        f"phone={phone}; original_scheduled_local={parsed_scheduled_at.isoformat()}; "
+                        f"adjusted_scheduled_local={scheduled_at.isoformat()}; reason={outbound_window_reason}"
+                    ),
+                )
         action_type = "call_only" if channel == "call" else "whatsapp_message"
         action = "call_customer" if channel == "call" else "message_customer"
+        scheduled_utc = scheduled_at.astimezone(timezone.utc) if scheduled_at.tzinfo else scheduled_at.replace(tzinfo=ZoneInfo(tz)).astimezone(timezone.utc)
         action_id = await create_followup_action(
-            phone, "callback_requested", action_type, channel, scheduled_at,
-            reason=reason, payload={"callback_time_text": callback_time_text}, priority=2,
+            phone, "callback_requested", action_type, channel, scheduled_utc,
+            reason=reason, payload={"callback_time_text": callback_time_text, "scheduled_local": scheduled_at.isoformat()}, priority=2,
         )
         await update_lead_journey(phone, {
             "journey_stage": "callback_requested",
             "crm_status": "callback_requested",
-            "preferred_callback_at": scheduled_at.isoformat(),
+            "preferred_callback_at": scheduled_utc.isoformat(),
             "preferred_channel": channel,
             "last_intent": "callback_request",
         })
-        await set_next_best_action(phone, action, channel, scheduled_at, reason)
-        await _log("callback_scheduled", f"phone={phone}; action_id={action_id}; scheduled_at={scheduled_at.isoformat()}; channel={channel}")
+        await set_next_best_action(phone, action, channel, scheduled_utc, reason)
+        await _log(
+            "callback_scheduled",
+            (
+                f"phone={phone}; source=voice_tool; action_id={action_id}; channel={channel}; "
+                f"callback_time_text={callback_time_text}; timezone_used={tz}; now_local={now_local.isoformat()}; "
+                f"parsed_scheduled_local={parsed_scheduled_at.isoformat()}; final_scheduled_local={scheduled_at.isoformat()}; "
+                f"final_scheduled_utc={scheduled_utc.isoformat()}; outbound_window_adjusted={str(outbound_window_adjusted).lower()}; "
+                f"outbound_window_reason={outbound_window_reason}"
+            ),
+        )
         return f"Sure, I have saved a {channel} follow-up for {scheduled_at.strftime('%d %b %I:%M %p')}."
 
     @llm.function_tool

@@ -94,7 +94,7 @@ def parse_followup_time(text: str, timezone: str = "Asia/Kolkata", now: Optional
     if not raw:
         return _combine(current + timedelta(days=1), dt_time(10, 0))
 
-    rel = re.search(r"\bafter\s+(\d+)\s*(minute|minutes|min|mins|hour|hours|hr|hrs)\b", raw)
+    rel = re.search(r"\b(?:after|in|within)\s+(\d+)\s*(minute|minutes|min|mins|hour|hours|hr|hrs)\b", raw)
     if rel:
         qty = int(rel.group(1))
         unit = rel.group(2)
@@ -148,9 +148,9 @@ def detect_followup_intent(text: str) -> str:
         return "details_request"
     if any(p in lower for p in ("book demo", "demo", "meeting", "google meet", "appointment")):
         return "demo_request"
-    if "message" in lower and any(p in lower for p in ("tomorrow", "later", "after", "morning", "evening")):
+    if "message" in lower and (any(p in lower for p in ("tomorrow", "later", "after", "morning", "evening")) or re.search(r"\bin\s+\d+\s*(minute|minutes|min|mins|hour|hours|hr|hrs)\b", lower)):
         return "message_later"
-    if "call" in lower and any(p in lower for p in ("later", "after", "tomorrow", "morning", "evening", "busy")):
+    if "call" in lower and (any(p in lower for p in ("later", "after", "tomorrow", "morning", "evening", "busy")) or re.search(r"\bin\s+\d+\s*(minute|minutes|min|mins|hour|hours|hr|hrs)\b", lower)):
         return "callback_request"
     if "busy" in lower or lower == "later":
         return "busy"
@@ -165,6 +165,7 @@ def iso_utcish(value: datetime) -> str:
 
 FOLLOWUP_TIME_PARSER_SMOKE_EXAMPLES = [
     ("call me after 30 minutes", "relative +30 minutes"),
+    ("call me in 30 minutes", "relative +30 minutes"),
     ("message me tomorrow morning", "tomorrow 09:00"),
     ("call tomorrow at 11 am", "tomorrow 11:00"),
     ("I need 10 cabinets", "no clock parse; fallback applies"),
