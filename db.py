@@ -95,6 +95,20 @@ DEFAULTS = {
     "FOLLOWUP_DEMO_REMINDER_15M": os.getenv("FOLLOWUP_DEMO_REMINDER_15M", "true"),
     "FOLLOWUP_STOP_ON_NOT_INTERESTED": os.getenv("FOLLOWUP_STOP_ON_NOT_INTERESTED", "true"),
     "FOLLOWUP_STOP_ON_WRONG_NUMBER": os.getenv("FOLLOWUP_STOP_ON_WRONG_NUMBER", "true"),
+    "GOOGLE_CALENDAR_ENABLED": os.getenv("GOOGLE_CALENDAR_ENABLED", "false"),
+    "GOOGLE_MEET_ENABLED": os.getenv("GOOGLE_MEET_ENABLED", "false"),
+    "GOOGLE_CALENDAR_SERVICE_ACCOUNT_JSON": os.getenv("GOOGLE_CALENDAR_SERVICE_ACCOUNT_JSON", ""),
+    "GOOGLE_CALENDAR_DEFAULT_TIMEZONE": os.getenv("GOOGLE_CALENDAR_DEFAULT_TIMEZONE", os.getenv("APP_TIMEZONE", "Asia/Kolkata")),
+    "GOOGLE_CALENDAR_FALLBACK_TO_INTERNAL": os.getenv("GOOGLE_CALENDAR_FALLBACK_TO_INTERNAL", "true"),
+    "AUTH_ENABLED": os.getenv("AUTH_ENABLED", "false"),
+    "ADMIN_API_KEY": os.getenv("ADMIN_API_KEY", ""),
+    "WEBHOOK_VERIFY_TOKEN": os.getenv("WEBHOOK_VERIFY_TOKEN", ""),
+    "COST_GEMINI_VOICE_PER_MINUTE": os.getenv("COST_GEMINI_VOICE_PER_MINUTE", "0"),
+    "COST_SIP_PER_MINUTE": os.getenv("COST_SIP_PER_MINUTE", "0"),
+    "COST_RECORDING_PER_MINUTE": os.getenv("COST_RECORDING_PER_MINUTE", "0"),
+    "COST_WHATSAPP_TEMPLATE": os.getenv("COST_WHATSAPP_TEMPLATE", "0"),
+    "COST_WHATSAPP_FREE_TEXT": os.getenv("COST_WHATSAPP_FREE_TEXT", "0"),
+    "COST_CURRENCY": os.getenv("COST_CURRENCY", "INR"),
 }
 
 DEFAULT_LEAD_STATUSES = [
@@ -209,8 +223,20 @@ SENSITIVE_KEYS = {
     "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "GOOGLE_API_KEY",
     "VOBIZ_PASSWORD", "TWILIO_AUTH_TOKEN", "SUPABASE_SERVICE_KEY",
     "AWS_SECRET_ACCESS_KEY", "S3_SECRET_ACCESS_KEY", "CALCOM_API_KEY",
-    "DEEPGRAM_API_KEY",
+    "DEEPGRAM_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY",
+    "GOOGLE_CALENDAR_SERVICE_ACCOUNT_JSON", "ADMIN_API_KEY",
+    "WEBHOOK_VERIFY_TOKEN", "WHATSAPP_ACCESS_TOKEN", "WHATSAPP_VERIFY_TOKEN",
+    "VOBIZ_AUTH_TOKEN", "VOBIZ_WEBHOOK_SECRET",
 }
+
+
+def _is_sensitive_setting(key: str) -> bool:
+    key_u = str(key or "").upper()
+    if key_u in SENSITIVE_KEYS:
+        return True
+    if any(token in key_u for token in ("SECRET", "TOKEN", "PASSWORD", "PRIVATE_KEY", "SERVICE_ACCOUNT")):
+        return True
+    return key_u.endswith("_API_KEY") or key_u.endswith("_SERVICE_KEY")
 
 
 class ConfigError(Exception):
@@ -304,12 +330,17 @@ async def get_all_settings() -> dict:
         "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_ENDPOINT_URL", "S3_REGION", "S3_BUCKET",
         "CALCOM_API_KEY", "CALCOM_EVENT_TYPE_ID", "CALCOM_TIMEZONE", "ENABLED_TOOLS",
         "RECORDING_AUTO_DELETE_ENABLED", "RECORDING_RETENTION_DAYS", "RECORDING_CLEANUP_TIME",
+        "GOOGLE_CALENDAR_ENABLED", "GOOGLE_MEET_ENABLED", "GOOGLE_CALENDAR_SERVICE_ACCOUNT_JSON",
+        "GOOGLE_CALENDAR_DEFAULT_TIMEZONE", "GOOGLE_CALENDAR_FALLBACK_TO_INTERNAL",
+        "AUTH_ENABLED", "ADMIN_API_KEY", "WEBHOOK_VERIFY_TOKEN",
+        "COST_GEMINI_VOICE_PER_MINUTE", "COST_SIP_PER_MINUTE", "COST_RECORDING_PER_MINUTE",
+        "COST_WHATSAPP_TEMPLATE", "COST_WHATSAPP_FREE_TEXT", "COST_CURRENCY",
     ]
     out = {}
     for k in known_keys:
         env_val = os.getenv(k, "")
         out[k] = {
-            "value": "" if k in SENSITIVE_KEYS else env_val,
+            "value": "" if _is_sensitive_setting(k) else env_val,
             "configured": bool(env_val),
             "source": "env" if env_val else "none",
         }
@@ -321,7 +352,7 @@ async def get_all_settings() -> dict:
         if out.get(k, {}).get("source") == "env":
             continue  # env wins — never overwrite
         out[k] = {
-            "value": "" if k in SENSITIVE_KEYS else v,
+            "value": "" if _is_sensitive_setting(k) else v,
             "configured": bool(v),
             "source": "db" if v else "none",
         }
@@ -517,6 +548,111 @@ def _appointment_now_local(settings: Optional[dict] = None) -> datetime:
     return datetime.now(_appointment_tz(settings)).replace(tzinfo=None)
 
 
+def _truthy(value) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+async def _calendar_settings() -> dict:
+    return {
+        "enabled": _truthy(await get_setting("GOOGLE_CALENDAR_ENABLED", "false")),
+        "meet_enabled": _truthy(await get_setting("GOOGLE_MEET_ENABLED", "false")),
+        "service_account_json": await get_setting("GOOGLE_CALENDAR_SERVICE_ACCOUNT_JSON", ""),
+        "timezone": await get_setting("GOOGLE_CALENDAR_DEFAULT_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata",
+        "fallback_internal": _truthy(await get_setting("GOOGLE_CALENDAR_FALLBACK_TO_INTERNAL", "true")),
+    }
+
+
+def _google_service_account_info(raw_json: str) -> Optional[dict]:
+    raw_json = (raw_json or "").strip()
+    if not raw_json:
+        return None
+    try:
+        parsed = _json_mod.loads(raw_json)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+async def _google_calendar_service(settings: dict):
+    info = _google_service_account_info(settings.get("service_account_json") or "")
+    if not info:
+        return None
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        scopes = ["https://www.googleapis.com/auth/calendar"]
+        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+        return build("calendar", "v3", credentials=creds, cache_discovery=False)
+    except Exception as exc:
+        await log_error("calendar", "google_calendar_check_failed", f"service_build_failed={str(exc)[:500]}", "warning")
+        return None
+
+
+async def _google_calendar_busy(staff: dict, start: datetime, end: datetime, settings: dict) -> Optional[bool]:
+    calendar_id = (staff.get("google_calendar_id") or staff.get("calendar_email") or "").strip()
+    if not (settings.get("enabled") and staff.get("google_calendar_connected") and calendar_id):
+        return None
+    await log_error("calendar", "google_calendar_check_started", f"staff_id={staff.get('id')}; calendar_id={calendar_id}; start={start.isoformat()}; end={end.isoformat()}", "info")
+    service = await _google_calendar_service(settings)
+    if service is None:
+        await log_error("calendar", "google_calendar_check_failed", f"staff_id={staff.get('id')}; reason=service_unavailable", "warning")
+        return None
+    tz = _appointment_tz({"timezone": staff.get("timezone") or settings.get("timezone") or "Asia/Kolkata"})
+    start_aware = start.replace(tzinfo=tz)
+    end_aware = end.replace(tzinfo=tz)
+    try:
+        body = {
+            "timeMin": start_aware.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z"),
+            "timeMax": end_aware.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z"),
+            "items": [{"id": calendar_id}],
+        }
+        result = await __import__("asyncio").to_thread(service.freebusy().query(body=body).execute)
+        busy = bool(((result.get("calendars") or {}).get(calendar_id) or {}).get("busy") or [])
+        await log_error("calendar", "google_calendar_check_success", f"staff_id={staff.get('id')}; calendar_id={calendar_id}; busy={str(busy).lower()}", "info")
+        return busy
+    except Exception as exc:
+        await log_error("calendar", "google_calendar_check_failed", f"staff_id={staff.get('id')}; calendar_id={calendar_id}; error={str(exc)[:500]}", "warning")
+        try:
+            db = await _adb()
+            await db.table("appointment_staff").update({"calendar_sync_error": str(exc)[:500], "last_calendar_sync_at": datetime.now().isoformat()}).eq("id", staff.get("id")).execute()
+        except Exception:
+            pass
+        return None
+
+
+async def _create_google_meet_link(staff: dict, row: dict, start: datetime, settings: dict) -> str:
+    calendar_settings = await _calendar_settings()
+    calendar_id = (staff.get("google_calendar_id") or staff.get("calendar_email") or "").strip()
+    if not (calendar_settings.get("meet_enabled") and staff and staff.get("google_meet_enabled") and staff.get("google_calendar_connected") and calendar_id):
+        return ""
+    await log_error("calendar", "google_meet_create_started", f"appointment_id={row.get('id')}; staff_id={staff.get('id')}; calendar_id={calendar_id}", "info")
+    service = await _google_calendar_service(calendar_settings)
+    if service is None:
+        await log_error("calendar", "google_meet_create_failed", f"appointment_id={row.get('id')}; reason=service_unavailable", "warning")
+        return ""
+    tz = _appointment_tz(settings)
+    duration = int(row.get("duration_minutes") or settings.get("demo_duration_minutes") or 30)
+    start_aware = start.replace(tzinfo=tz)
+    end_aware = (start + timedelta(minutes=duration)).replace(tzinfo=tz)
+    body = {
+        "summary": f"{row.get('service') or 'Demo'} - {row.get('name') or 'Customer'}",
+        "description": f"Phone: {row.get('phone') or ''}",
+        "start": {"dateTime": start_aware.isoformat(), "timeZone": settings.get("timezone") or "Asia/Kolkata"},
+        "end": {"dateTime": end_aware.isoformat(), "timeZone": settings.get("timezone") or "Asia/Kolkata"},
+        "conferenceData": {"createRequest": {"requestId": row.get("id") or str(uuid.uuid4())}},
+    }
+    try:
+        event = await __import__("asyncio").to_thread(
+            service.events().insert(calendarId=calendar_id, body=body, conferenceDataVersion=1).execute
+        )
+        link = event.get("hangoutLink") or ((event.get("conferenceData") or {}).get("entryPoints") or [{}])[0].get("uri") or ""
+        await log_error("calendar", "google_meet_create_success", f"appointment_id={row.get('id')}; has_link={str(bool(link)).lower()}", "info")
+        return link
+    except Exception as exc:
+        await log_error("calendar", "google_meet_create_failed", f"appointment_id={row.get('id')}; error={str(exc)[:500]}", "warning")
+        return ""
+
+
 def _appointment_start(row: dict) -> Optional[datetime]:
     try:
         return datetime.strptime(f"{row.get('date')} {(row.get('time') or '')[:5]}", "%Y-%m-%d %H:%M")
@@ -570,7 +706,12 @@ async def upsert_appointment_staff(data: dict, staff_id: Optional[str] = None) -
         "name": str(data.get("name") or "").strip(),
         "email": str(data.get("email") or "").strip(),
         "whatsapp_number": str(data.get("whatsapp_number") or "").strip(),
+        "role": str(data.get("role") or "sales").strip() or "sales",
         "calendar_email": str(data.get("calendar_email") or "").strip(),
+        "google_calendar_id": str(data.get("google_calendar_id") or data.get("calendar_email") or "").strip(),
+        "google_calendar_connected": bool(data.get("google_calendar_connected", False)),
+        "google_meet_enabled": bool(data.get("google_meet_enabled", False)),
+        "notes": str(data.get("notes") or "").strip(),
         "working_days": _json_mod.dumps(data.get("working_days") or ["mon", "tue", "wed", "thu", "fri", "sat"]),
         "start_time": str(data.get("start_time") or "09:00")[:5],
         "end_time": str(data.get("end_time") or "18:00")[:5],
@@ -595,20 +736,37 @@ async def deactivate_appointment_staff(staff_id: str) -> bool:
     return len(result.data or []) > 0
 
 
-async def delete_appointment_staff(staff_id: str) -> dict:
+async def activate_appointment_staff(staff_id: str) -> bool:
     db = await _adb()
-    appts = await db.table("appointments").select("id").eq("staff_id", staff_id).limit(1).execute()
-    if appts.data:
-        ok = await deactivate_appointment_staff(staff_id)
-        return {"deleted": False, "deactivated": ok}
-    result = await db.table("appointment_staff").delete().eq("id", staff_id).execute()
-    return {"deleted": len(result.data or []) > 0, "deactivated": False}
+    result = await db.table("appointment_staff").update({"active": True, "updated_at": datetime.now().isoformat()}).eq("id", staff_id).execute()
+    return len(result.data or []) > 0
+
+
+async def delete_appointment_staff(staff_id: str) -> dict:
+    ok = await deactivate_appointment_staff(staff_id)
+    return {"deleted": False, "deactivated": ok}
 
 
 async def _appointment_conflicts(staff_id: str, start: datetime, settings: dict) -> bool:
     db = await _adb()
+    staff_row = None
+    try:
+        staff_row = _safe_row(await db.table("appointment_staff").select("*").eq("id", staff_id).maybe_single().execute())
+    except Exception:
+        staff_row = None
+    calendar_settings = await _calendar_settings()
+    end = start + timedelta(minutes=settings["demo_duration_minutes"] + settings["buffer_minutes"])
+    if staff_row and calendar_settings.get("enabled") and staff_row.get("google_calendar_connected"):
+        busy = await _google_calendar_busy(staff_row, start, end, {**calendar_settings, **settings})
+        if busy is True:
+            return True
+        if busy is None:
+            if calendar_settings.get("fallback_internal"):
+                await log_error("calendar", "google_calendar_fallback_internal", f"staff_id={staff_id}; start={start.isoformat()}", "info")
+            else:
+                return True
     rows = (await db.table("appointments").select("*").eq("staff_id", staff_id).eq("status", "booked").execute()).data or []
-    new_end = start + timedelta(minutes=settings["demo_duration_minutes"] + settings["buffer_minutes"])
+    new_end = end
     for row in rows:
         existing_start = _appointment_start(row)
         if not existing_start:
@@ -724,6 +882,11 @@ async def insert_appointment(name: str, phone: str, date: str, time: str, servic
         "timezone": settings["timezone"],
         "created_at": datetime.now().isoformat(),
     }
+    if staff:
+        meet_link = await _create_google_meet_link(staff, row, start, settings)
+        if meet_link:
+            row["meet_link"] = meet_link
+            row["google_meet_link"] = meet_link
     try:
         await db.table("appointments").insert(row).execute()
     except Exception:
@@ -1546,6 +1709,8 @@ JOURNEY_FIELDS = {
     "demo_reminder_count", "stop_automation", "stop_automation_reason",
     "last_followup_reason", "last_intent", "preferred_channel",
     "preferred_callback_at", "crm_status", "next_followup_at",
+    "tags_json", "custom_fields_json", "handoff_required",
+    "handoff_reason", "handoff_assigned_to", "handoff_at",
 }
 
 

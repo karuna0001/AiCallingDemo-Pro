@@ -48,6 +48,7 @@ WA_SETTINGS_KEYS = [
     "appointment_confirmation_template",
     "staff_appointment_notification_template",
     "staff_appointment_reminder_template",
+    "staff_handoff_notification_template",
     "reminder_template",
     "no_response_followup_template",
     "re_enquiry_followup_template",
@@ -60,6 +61,7 @@ WA_DEFAULTS = {
     "WHATSAPP_DEFAULT_LANGUAGE": "en",
     "staff_appointment_notification_template": "staff_appointment_notification",
     "staff_appointment_reminder_template": "staff_appointment_reminder",
+    "staff_handoff_notification_template": "staff_appointment_alert",
 }
 
 # ── Template purpose slot labels (for UI and health reporting) ───────────────
@@ -70,6 +72,7 @@ WA_TEMPLATE_PURPOSES = [
     ("appointment_confirmation_template", "Appointment Confirmation"),
     ("staff_appointment_notification_template", "Staff Appointment Notification"),
     ("staff_appointment_reminder_template", "Staff Appointment Reminder"),
+    ("staff_handoff_notification_template", "Staff Handoff Alert"),
     ("reminder_template",                 "Reminder"),
     ("no_response_followup_template",     "No Response Follow-up"),
     ("re_enquiry_followup_template",      "Re-enquiry Follow-up"),
@@ -82,6 +85,7 @@ WA_TEMPLATE_PARAM_COUNTS = {
     "appointment_confirmation_template": 4,
     "staff_appointment_notification_template": 5,
     "staff_appointment_reminder_template": 5,
+    "staff_handoff_notification_template": 5,
     "reminder_template": 3,
     "no_response_followup_template": 2,
     "re_enquiry_followup_template": 2,
@@ -95,6 +99,7 @@ WA_TEMPLATE_COOLDOWNS = {
     "appointment_confirmation_template": 30 * 24 * 60,
     "staff_appointment_notification_template": 0,
     "staff_appointment_reminder_template": 0,
+    "staff_handoff_notification_template": 0,
 }
 
 # ── Backward-compat: old key → new purpose slot ───────────────────────────
@@ -108,6 +113,7 @@ _WA_LEGACY_KEY_MAP = {
     "WHATSAPP_APPOINTMENT_TEMPLATE":   "appointment_confirmation_template",
     "WHATSAPP_STAFF_APPOINTMENT_NOTIFICATION_TEMPLATE": "staff_appointment_notification_template",
     "WHATSAPP_STAFF_APPOINTMENT_REMINDER_TEMPLATE": "staff_appointment_reminder_template",
+    "WHATSAPP_STAFF_HANDOFF_NOTIFICATION_TEMPLATE": "staff_handoff_notification_template",
     "WHATSAPP_SHOWROOM_VISIT_TEMPLATE":"appointment_confirmation_template",
     "WHATSAPP_RE_ENQUIRY_TEMPLATE":    "re_enquiry_followup_template",
     "WHATSAPP_FOLLOWUP_TEMPLATE":      "no_response_followup_template",
@@ -123,6 +129,7 @@ _WA_LEGACY_KEY_MAP = {
     "appointment_confirmation":        "appointment_confirmation_template",
     "staff_appointment_notification":  "staff_appointment_notification_template",
     "staff_appointment_reminder":      "staff_appointment_reminder_template",
+    "staff_appointment_alert":         "staff_handoff_notification_template",
     "demo_reminder":                   "reminder_template",
     "callback_confirmation":           "callback_confirmation_template",
     "re_enquiry_followup":             "re_enquiry_followup_template",

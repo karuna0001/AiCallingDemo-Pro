@@ -40,7 +40,7 @@ ssl.create_default_context = _certifi_ssl
 from db import (
     ConfigError, CRM_TERMINAL_STATUSES, DuplicateContactError,
     cancel_appointment, clear_all_test_data, clear_appointments,
-    delete_appointment_staff, get_appointment_settings, get_appointment_staff,
+    activate_appointment_staff, deactivate_appointment_staff, delete_appointment_staff, get_appointment_settings, get_appointment_staff,
     update_appointment_status, update_appointment_notes, reschedule_appointment,
     clear_call_logs, clear_campaigns, clear_contact_memory, clear_error_logs,
     clear_errors, create_agent_profile, create_campaign, delete_agent_profile,
@@ -52,7 +52,7 @@ from db import (
     get_crm_summary, get_lead_statuses, get_crm_contact_by_phone,
     get_logs, get_recording_storage_stats, get_recordings_for_cleanup,
     get_setting, get_stats, init_db, log_error, mark_recording_deleted,
-    normalize_phone, _tz_today, upsert_crm_lead,
+    normalize_phone, _adb, _tz_today, upsert_crm_lead,
     save_appointment_settings, save_settings, set_default_agent_profile, set_setting,
     add_lead_status, delete_lead_status, update_agent_profile, update_call_notes,
     upsert_appointment_staff,
@@ -179,6 +179,16 @@ def _admin_config_error() -> Optional[str]:
     return None
 
 
+async def _auth_enabled() -> bool:
+    raw = os.getenv("AUTH_ENABLED", "")
+    if not raw:
+        try:
+            raw = await get_setting("AUTH_ENABLED", "false")
+        except Exception:
+            raw = "false"
+    return str(raw or "false").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
 def _b64encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
@@ -221,9 +231,14 @@ def _request_is_https(request: Request) -> bool:
 
 @app.middleware("http")
 async def _admin_auth_middleware(request: Request, call_next):
-    if request.url.path.startswith("/api/") and (request.method, request.url.path) not in PUBLIC_API_ROUTES:
-        if not _read_session(request):
-            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    if await _auth_enabled():
+        if request.url.path.startswith("/api/") and (request.method, request.url.path) not in PUBLIC_API_ROUTES:
+            api_key = request.headers.get("x-api-key") or request.query_params.get("api_key") or ""
+            expected = await get_setting("ADMIN_API_KEY", "")
+            if expected and hmac.compare_digest(api_key, expected):
+                return await call_next(request)
+            if not _read_session(request):
+                return JSONResponse(status_code=401, content={"error": "Unauthorized"})
     return await call_next(request)
 
 
@@ -411,6 +426,101 @@ def _run_due_followup_actions_sync() -> None:
         logger.info("Due follow-up actions completed")
     except Exception as exc:
         logger.exception("Due follow-up actions failed: %s", exc)
+
+
+def _date_in_range(value: str, date_from: Optional[str], date_to: Optional[str]) -> bool:
+    day = (value or "")[:10]
+    if not day:
+        return False
+    if date_from and day < date_from:
+        return False
+    if date_to and day > date_to:
+        return False
+    return True
+
+
+def _sum_duration_minutes(rows: list[dict]) -> float:
+    return round(sum(float(r.get("duration_seconds") or 0) for r in rows) / 60.0, 2)
+
+
+def _json_list(value) -> list:
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []
+
+
+def _json_dict(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _table_rows(table_name: str, order_by: str = "created_at", limit: int = 5000) -> list[dict]:
+    try:
+        db = await _adb()
+        return (await db.table(table_name).select("*").order(order_by, desc=True).limit(limit).execute()).data or []
+    except Exception as exc:
+        await log_error("reports", "table_fetch_failed", f"table={table_name}; error={str(exc)[:300]}", "warning")
+        return []
+
+
+def _csv_response(filename: str, rows: list[dict]) -> StreamingResponse:
+    out = StringIO()
+    if rows:
+        headers = sorted({k for row in rows for k in row.keys()})
+        writer = csv.DictWriter(out, fieldnames=headers)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in headers})
+    else:
+        out.write("empty\n")
+    out.seek(0)
+    return StreamingResponse(iter([out.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+async def _report_data(date_from: Optional[str] = None, date_to: Optional[str] = None) -> dict:
+    async def safe(label: str, loader, default=None):
+        try:
+            return await loader()
+        except Exception as exc:
+            await log_error("reports", "report_source_unavailable", f"source={label}; error={str(exc)[:300]}", "warning")
+            return [] if default is None else default
+    calls = [r for r in await safe("call_logs", lambda: get_call_logs_for_export({})) if _date_in_range(r.get("timestamp") or "", date_from, date_to)]
+    contacts = [r for r in await safe("crm_contacts", get_crm_contacts) if _date_in_range(r.get("created_at") or r.get("updated_at") or "", date_from, date_to)]
+    appointments = [r for r in await safe("appointments", get_all_appointments) if _date_in_range(r.get("date") or r.get("created_at") or "", date_from, date_to)]
+    wa_logs = [r for r in await safe("whatsapp_logs", lambda: get_whatsapp_logs(limit=5000)) if _date_in_range(r.get("created_at") or "", date_from, date_to)]
+    wa_messages = [r for r in await _table_rows("whatsapp_messages", "created_at", 5000) if _date_in_range(r.get("created_at") or r.get("timestamp") or "", date_from, date_to)]
+    followups = await safe("followup_actions", lambda: get_followup_actions(limit=5000))
+    return {"calls": calls, "contacts": contacts, "appointments": appointments, "whatsapp_logs": wa_logs, "whatsapp_messages": wa_messages, "followups": followups}
+
+
+def _status_slug(status: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (status or "").strip().lower()).strip("_") or "new_lead"
+
+
+KANBAN_COLUMNS = [
+    ("new_lead", "New Lead", {"new", "new_lead"}),
+    ("contacted", "Contacted", {"contacted", "callback_requested", "message_followup_requested"}),
+    ("interested", "Interested", {"hot_lead", "interested", "quote_given"}),
+    ("callback_requested", "Callback Requested", {"callback_requested"}),
+    ("demo_booked", "Demo Booked", {"demo_booked", "appointment_booked", "booked"}),
+    ("demo_done", "Demo Done", {"demo_done", "completed"}),
+    ("converted", "Converted", {"converted", "closed_won"}),
+    ("not_interested", "Not Interested", {"not_interested", "not_interested"}),
+    ("lost", "Lost", {"lost", "closed_lost", "wrong_number", "do_not_contact"}),
+]
 
 
 
@@ -691,13 +801,58 @@ class AppointmentStaffRequest(BaseModel):
     name: str
     email: Optional[str] = ""
     whatsapp_number: Optional[str] = ""
+    role: Optional[str] = "sales"
     calendar_email: Optional[str] = ""
+    google_calendar_id: Optional[str] = ""
+    google_calendar_connected: Optional[bool] = False
+    google_meet_enabled: Optional[bool] = False
+    notes: Optional[str] = ""
     working_days: Optional[list] = None
     start_time: Optional[str] = "09:00"
     end_time: Optional[str] = "18:00"
     timezone: Optional[str] = "Asia/Kolkata"
     active: Optional[bool] = True
     round_robin_order: Optional[int] = 0
+
+
+class CrmTagRequest(BaseModel):
+    tag: str
+
+
+class CrmCustomFieldsRequest(BaseModel):
+    fields: dict[str, Any] = {}
+
+
+class CrmMoveStageRequest(BaseModel):
+    stage: str
+
+
+class BroadcastCampaignRequest(BaseModel):
+    name: str
+    template_purpose: str
+    segment: Optional[dict[str, Any]] = None
+    scheduled_at: Optional[str] = None
+    dry_run_limit: Optional[int] = 100
+
+
+class BroadcastStartRequest(BaseModel):
+    confirm: Optional[str] = ""
+
+
+class HandoffRequest(BaseModel):
+    reason: Optional[str] = "human_requested"
+    staff_id: Optional[str] = ""
+    urgent: Optional[bool] = True
+
+
+class KbPreviewAnswerRequest(BaseModel):
+    question: str
+
+
+class AppointmentActionRequest(BaseModel):
+    date: Optional[str] = ""
+    time: Optional[str] = ""
+    reason: Optional[str] = ""
 
 
 class WaConfirmRequest(BaseModel):
@@ -733,6 +888,8 @@ async def api_auth_login(req: AuthRequest, request: Request):
 
 @app.get("/api/auth/me")
 async def api_auth_me(request: Request):
+    if not await _auth_enabled():
+        return {"authenticated": True, "username": "local", "configured": True, "auth_enabled": False}
     config_error = _admin_config_error()
     username = _read_session(request)
     payload = {"authenticated": bool(username), "username": username if username else None}
@@ -749,6 +906,21 @@ async def api_auth_logout(request: Request):
     response = JSONResponse(content={"success": True})
     response.delete_cookie(SESSION_COOKIE_NAME, path="/", samesite="lax", secure=_request_is_https(request))
     return response
+
+
+@app.get("/api/security/health")
+async def api_security_health():
+    auth_enabled = await _auth_enabled()
+    api_key_configured = bool(await get_setting("ADMIN_API_KEY", ""))
+    webhook_token_configured = bool(await get_setting("WEBHOOK_VERIFY_TOKEN", await get_setting("WHATSAPP_VERIFY_TOKEN", "")))
+    return {
+        "auth_enabled": auth_enabled,
+        "admin_session_configured": not bool(_admin_config_error()),
+        "admin_api_key_configured": api_key_configured,
+        "webhook_verify_token_configured": webhook_token_configured,
+        "health_secret_leak_check": "ok",
+        "meta_webhook_signature_verification": "placeholder",
+    }
 
 
 @app.get("/api/health")
@@ -842,12 +1014,18 @@ async def api_health():
     appointment_timezone = clean_timezone(appointment_timezone_raw, app_timezone)
     whatsapp_display_timezone_raw, _ = await setting_value_with_source("WHATSAPP_DISPLAY_TIMEZONE", app_timezone)
     whatsapp_display_timezone = clean_timezone(whatsapp_display_timezone_raw, app_timezone)
+    google_calendar_enabled = (await get_setting("GOOGLE_CALENDAR_ENABLED", "false") or "false").lower() in {"1", "true", "yes", "on"}
+    google_meet_enabled = (await get_setting("GOOGLE_MEET_ENABLED", "false") or "false").lower() in {"1", "true", "yes", "on"}
+    google_calendar_fallback = (await get_setting("GOOGLE_CALENDAR_FALLBACK_TO_INTERNAL", "true") or "true").lower() in {"1", "true", "yes", "on"}
     supabase_configured, supabase_error = await supabase_status(supabase_url, supabase_key)
     response = {
         "status": "ok",
         "app_timezone": app_timezone,
         "appointment_timezone": appointment_timezone,
         "whatsapp_display_timezone": whatsapp_display_timezone,
+        "google_calendar_enabled": google_calendar_enabled,
+        "google_meet_enabled": google_meet_enabled,
+        "google_calendar_fallback_to_internal": google_calendar_fallback,
         "livekit_configured": bool(livekit_url and livekit_key and livekit_secret),
         "gemini_configured": bool(google_key),
         "supabase_configured": supabase_configured,
@@ -872,6 +1050,7 @@ async def api_health():
         "fixed_greeting_reason": fixed_greeting_reason,
         "recording_auto_delete_enabled": recording_auto_delete,
         "recording_retention_days": recording_retention_days,
+        "auth_enabled": await _auth_enabled(),
     }
     if supabase_error:
         response["supabase_error"] = supabase_error
@@ -1306,6 +1485,11 @@ async def api_get_appointment_staff(include_inactive: bool = True):
     return {"staff": await get_appointment_staff(include_inactive=include_inactive)}
 
 
+@app.get("/api/appointment-staff")
+async def api_get_appointment_staff_alias(include_inactive: bool = True):
+    return await api_get_appointment_staff(include_inactive=include_inactive)
+
+
 @app.post("/api/appointments/staff")
 async def api_create_appointment_staff(req: AppointmentStaffRequest):
     try:
@@ -1313,6 +1497,11 @@ async def api_create_appointment_staff(req: AppointmentStaffRequest):
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"success": True, "staff": staff}
+
+
+@app.post("/api/appointment-staff")
+async def api_create_appointment_staff_alias(req: AppointmentStaffRequest):
+    return await api_create_appointment_staff(req)
 
 
 @app.put("/api/appointments/staff/{staff_id}")
@@ -1324,12 +1513,68 @@ async def api_update_appointment_staff(staff_id: str, req: AppointmentStaffReque
     return {"success": True, "staff": staff}
 
 
+@app.patch("/api/appointment-staff/{staff_id}")
+async def api_patch_appointment_staff_alias(staff_id: str, req: AppointmentStaffRequest):
+    return await api_update_appointment_staff(staff_id, req)
+
+
 @app.delete("/api/appointments/staff/{staff_id}")
 async def api_delete_appointment_staff(staff_id: str):
     result = await delete_appointment_staff(staff_id)
     if not (result.get("deleted") or result.get("deactivated")):
         raise HTTPException(404, "Staff member not found")
     return {"success": True, **result}
+
+
+@app.delete("/api/appointment-staff/{staff_id}")
+async def api_delete_appointment_staff_alias(staff_id: str):
+    return await api_delete_appointment_staff(staff_id)
+
+
+@app.post("/api/appointment-staff/{staff_id}/activate")
+async def api_activate_appointment_staff(staff_id: str):
+    ok = await activate_appointment_staff(staff_id)
+    if not ok:
+        raise HTTPException(404, "Staff member not found")
+    return {"success": True, "active": True}
+
+
+@app.post("/api/appointment-staff/{staff_id}/deactivate")
+async def api_deactivate_appointment_staff(staff_id: str):
+    ok = await deactivate_appointment_staff(staff_id)
+    if not ok:
+        raise HTTPException(404, "Staff member not found")
+    return {"success": True, "active": False}
+
+
+@app.get("/api/calendar/health")
+async def api_calendar_health():
+    enabled = (await get_setting("GOOGLE_CALENDAR_ENABLED", "false") or "false").lower() in {"1", "true", "yes", "on"}
+    meet_enabled = (await get_setting("GOOGLE_MEET_ENABLED", "false") or "false").lower() in {"1", "true", "yes", "on"}
+    service_json = await get_setting("GOOGLE_CALENDAR_SERVICE_ACCOUNT_JSON", "")
+    fallback = (await get_setting("GOOGLE_CALENDAR_FALLBACK_TO_INTERNAL", "true") or "true").lower() in {"1", "true", "yes", "on"}
+    timezone_name = await get_setting("GOOGLE_CALENDAR_DEFAULT_TIMEZONE", "Asia/Kolkata")
+    staff = await get_appointment_staff(include_inactive=True)
+    return {
+        "google_calendar_enabled": enabled,
+        "google_meet_enabled": meet_enabled,
+        "service_account_configured": bool(service_json),
+        "timezone": timezone_name,
+        "fallback_to_internal": fallback,
+        "staff_calendar_status": [
+            {
+                "id": s.get("id"),
+                "name": s.get("name"),
+                "active": s.get("active"),
+                "google_calendar_id": s.get("google_calendar_id") or s.get("calendar_email") or "",
+                "google_calendar_connected": bool(s.get("google_calendar_connected")),
+                "google_meet_enabled": bool(s.get("google_meet_enabled")),
+                "calendar_sync_error": s.get("calendar_sync_error") or "",
+                "last_calendar_sync_at": s.get("last_calendar_sync_at") or "",
+            }
+            for s in staff
+        ],
+    }
 
 
 @app.post("/api/appointments/{appointment_id}/notify-staff")
@@ -1429,6 +1674,114 @@ async def api_patch_appointment_notes(appointment_id: str, req: NotesRequest):
     if not ok:
         raise HTTPException(404, "Appointment not found")
     return {"success": True}
+
+
+@app.post("/api/appointments/{appointment_id}/reschedule")
+async def api_post_appointment_reschedule(appointment_id: str, req: AppointmentRescheduleRequest):
+    return await api_patch_appointment_reschedule(appointment_id, req)
+
+
+@app.post("/api/appointments/{appointment_id}/cancel")
+async def api_post_appointment_cancel(appointment_id: str, req: AppointmentActionRequest = AppointmentActionRequest()):
+    return await api_cancel_appointment(appointment_id)
+
+
+@app.post("/api/appointments/{appointment_id}/complete")
+async def api_post_appointment_complete(appointment_id: str, req: AppointmentActionRequest = AppointmentActionRequest()):
+    return await api_patch_appointment_status(appointment_id, AppointmentStatusRequest(status="completed"))
+
+
+@app.post("/api/appointments/{appointment_id}/no-show")
+async def api_post_appointment_no_show(appointment_id: str, req: AppointmentActionRequest = AppointmentActionRequest()):
+    ok = await update_appointment_status(appointment_id, "no_show")
+    if not ok:
+        raise HTTPException(404, "Appointment not found")
+    appointment = await get_appointment_by_id(appointment_id)
+    phone = (appointment or {}).get("phone") or ""
+    if phone:
+        await update_lead_journey(phone, {
+            "journey_stage": "demo_no_show",
+            "crm_status": "demo_no_show",
+            "next_best_action": "reschedule_demo",
+            "last_followup_reason": req.reason or "demo_no_show",
+        })
+    return {"success": True, "status": "no_show"}
+
+
+async def _send_appointment_reminder_now(appointment: dict) -> dict:
+    appointment_id = str(appointment.get("id") or "")
+    phone = appointment.get("phone") or ""
+    customer_params = [
+        appointment.get("name") or "there",
+        f"{appointment.get('date')} {str(appointment.get('time') or '')[:5]}",
+        appointment.get("service") or "demo",
+    ]
+    staff_params = [
+        appointment.get("name") or "Customer",
+        phone,
+        appointment.get("service") or "demo",
+        f"{appointment.get('date')} {str(appointment.get('time') or '')[:5]}",
+        appointment.get("source") or "CRM",
+    ]
+    updates = {"reminder_processed": True, "reminder_processed_at": datetime.now().isoformat()}
+    result = {"customer": None, "staff": None}
+    errors = []
+    try:
+        template = await resolve_wa_template("reminder_template")
+        if template and phone:
+            result["customer"] = await send_whatsapp_template(
+                phone, template, await get_setting("WHATSAPP_DEFAULT_LANGUAGE", "en"),
+                customer_params, event_type="appointment_reminder",
+                source_type="appointments", source_id=appointment_id,
+                template_purpose="reminder_template",
+            )
+            if result["customer"].get("success"):
+                updates["customer_reminder_sent"] = True
+                updates["customer_reminder_sent_at"] = datetime.now().isoformat()
+            else:
+                errors.append(result["customer"].get("reason") or result["customer"].get("error") or "customer_reminder_failed")
+        else:
+            errors.append("customer_reminder_template_missing")
+    except Exception as exc:
+        errors.append(f"customer_reminder_failed:{str(exc)[:160]}")
+    staff_phone = ""
+    if appointment.get("staff_id"):
+        for staff in await get_appointment_staff(include_inactive=True):
+            if str(staff.get("id")) == str(appointment.get("staff_id")):
+                staff_phone = staff.get("whatsapp_number") or ""
+                break
+    if staff_phone:
+        try:
+            staff_template = await resolve_wa_template("staff_appointment_reminder_template")
+            if staff_template:
+                result["staff"] = await send_whatsapp_template(
+                    staff_phone, staff_template, await get_setting("WHATSAPP_DEFAULT_LANGUAGE", "en"),
+                    staff_params, event_type="staff_appointment_reminder",
+                    source_type="appointments", source_id=appointment_id,
+                    template_purpose="staff_appointment_reminder_template",
+                )
+                if result["staff"].get("success"):
+                    updates["staff_reminder_sent"] = True
+                    updates["staff_reminder_sent_at"] = datetime.now().isoformat()
+                else:
+                    errors.append(result["staff"].get("reason") or result["staff"].get("error") or "staff_reminder_failed")
+            else:
+                errors.append("staff_appointment_reminder_template_missing")
+        except Exception as exc:
+            errors.append(f"staff_reminder_failed:{str(exc)[:160]}")
+    if errors:
+        updates["reminder_error"] = "; ".join(errors)[:1000]
+    db = await _adb()
+    await db.table("appointments").update(updates).eq("id", appointment_id).execute()
+    return {"success": not errors, "result": result, "errors": errors}
+
+
+@app.post("/api/appointments/{appointment_id}/send-reminder")
+async def api_post_appointment_send_reminder(appointment_id: str, req: AppointmentActionRequest = AppointmentActionRequest()):
+    appointment = await get_appointment_by_id(appointment_id)
+    if not appointment:
+        raise HTTPException(404, "Appointment not found")
+    return await _send_appointment_reminder_now(appointment)
 
 
 @app.get("/api/prompt")
@@ -1848,6 +2201,40 @@ async def api_kb_load_sample():
     return {"status": "sample_loaded", "sections": list(_KB_SAMPLE.keys())}
 
 
+@app.get("/api/knowledge-base/export")
+async def api_kb_export():
+    kb = await get_knowledge_base()
+    return {"knowledge_base": kb, "sections": _KB_SECTIONS, "exported_at": datetime.now(timezone.utc).isoformat()}
+
+
+@app.post("/api/knowledge-base/import")
+async def api_kb_import(req: Request):
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+    data = body.get("knowledge_base") if isinstance(body, dict) and "knowledge_base" in body else body
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Knowledge base import must be a JSON object")
+    saved = await save_knowledge_base(data)
+    return {"status": "imported", "sections_saved": [k for k in data if k in _KB_SECTIONS], "knowledge_base": saved}
+
+
+@app.post("/api/knowledge-base/preview-answer")
+async def api_kb_preview_answer(req: KbPreviewAnswerRequest):
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(400, "question is required")
+    kb = await get_knowledge_base()
+    matches = (await api_search_knowledge_base(question)).get("results", [])
+    if matches:
+        answer = matches[0].get("answer") or matches[0].get("title") or ""
+    else:
+        context = build_knowledge_context(kb)
+        answer = context[:800] if context else "No matching knowledge base entry found yet."
+    return {"question": question, "answer": answer, "matches": matches[:5], "source": "knowledge_base_preview"}
+
+
 @app.get("/api/knowledge-base/{section}")
 async def api_get_kb_section(section: str):
     if section not in _KB_SECTIONS:
@@ -1920,7 +2307,7 @@ async def api_wa_webhook_verify(
     hub_challenge: Optional[str] = Query(None, alias="hub.challenge"),
 ):
     from db import get_setting as _gs
-    verify_token = await _gs("WHATSAPP_VERIFY_TOKEN", "")
+    verify_token = await _gs("WEBHOOK_VERIFY_TOKEN", "") or await _gs("WHATSAPP_VERIFY_TOKEN", "")
     if hub_mode == "subscribe" and verify_token and hub_verify_token == verify_token:
         from fastapi.responses import PlainTextResponse
         return PlainTextResponse(content=hub_challenge or "")
@@ -3280,6 +3667,499 @@ async def api_get_followups(phone: Optional[str] = None, status: Optional[str] =
     tz_name = await _display_timezone()
     actions = await get_followup_actions(phone=phone, status=status, limit=limit)
     return {"actions": [_with_followup_display(action, tz_name) for action in actions]}
+
+
+@app.get("/api/dashboard/summary")
+async def api_dashboard_summary():
+    tz_name = await _display_timezone()
+    today = datetime.now(ZoneInfo(tz_name)).date().isoformat()
+    data = await _report_data(today, today)
+    all_contacts = await get_crm_contacts()
+    due_followups = await get_due_followup_actions(limit=500)
+    return {
+        "today_calls": len(data["calls"]),
+        "answered_calls": sum(1 for r in data["calls"] if (r.get("outcome") or "").lower() in {"answered", "booked", "completed", "interested"}),
+        "no_answer_calls": sum(1 for r in data["calls"] if (r.get("outcome") or "").lower() in {"no_answer", "no answer"}),
+        "busy_calls": sum(1 for r in data["calls"] if (r.get("outcome") or "").lower() == "busy"),
+        "failed_calls": sum(1 for r in data["calls"] if "fail" in (r.get("outcome") or "").lower()),
+        "today_whatsapp_inbound": sum(1 for r in data["whatsapp_messages"] if (r.get("direction") or "").lower() == "inbound"),
+        "today_whatsapp_outbound": sum(1 for r in data["whatsapp_messages"] if (r.get("direction") or "").lower() == "outbound"),
+        "today_leads": len(data["contacts"]),
+        "appointments_today": len(data["appointments"]),
+        "pending_followups": sum(1 for r in await get_followup_actions(status="scheduled", limit=1000)),
+        "due_calls": sum(1 for r in due_followups if (r.get("channel") or "").lower() == "call"),
+        "due_today": sum(1 for r in all_contacts if (r.get("next_followup_at") or "").startswith(today)),
+        "converted_leads": sum(1 for r in all_contacts if _status_slug(r.get("crm_status") or "") in {"converted", "closed_won"}),
+        "no_response_leads": sum(1 for r in all_contacts if "no_response" in _status_slug(r.get("crm_status") or r.get("journey_stage") or "")),
+    }
+
+
+@app.get("/api/reports/summary")
+async def api_reports_summary(date_from: Optional[str] = None, date_to: Optional[str] = None):
+    data = await _report_data(date_from, date_to)
+    source_counts = {}
+    for lead in data["contacts"]:
+        source = lead.get("source") or "unknown"
+        source_counts[source] = source_counts.get(source, 0) + 1
+    staff_counts = {}
+    for appt in data["appointments"]:
+        staff = appt.get("staff_name") or appt.get("staff_id") or "unassigned"
+        staff_counts[staff] = staff_counts.get(staff, 0) + 1
+    return {
+        "calls_total": len(data["calls"]),
+        "answered": sum(1 for r in data["calls"] if (r.get("outcome") or "").lower() in {"answered", "booked", "completed", "interested"}),
+        "no_answer": sum(1 for r in data["calls"] if (r.get("outcome") or "").lower() in {"no_answer", "no answer"}),
+        "busy": sum(1 for r in data["calls"] if (r.get("outcome") or "").lower() == "busy"),
+        "failed": sum(1 for r in data["calls"] if "fail" in (r.get("outcome") or "").lower()),
+        "total_duration_minutes": _sum_duration_minutes(data["calls"]),
+        "whatsapp_sent": sum(1 for r in data["whatsapp_logs"] if (r.get("status") or "").lower() == "sent"),
+        "whatsapp_delivered": sum(1 for r in data["whatsapp_logs"] if (r.get("status") or "").lower() == "delivered"),
+        "whatsapp_read": sum(1 for r in data["whatsapp_logs"] if (r.get("status") or "").lower() == "read"),
+        "whatsapp_failed": sum(1 for r in data["whatsapp_logs"] if (r.get("status") or "").lower() == "failed"),
+        "inbound_whatsapp_count": sum(1 for r in data["whatsapp_messages"] if (r.get("direction") or "").lower() == "inbound"),
+        "appointments_booked": sum(1 for r in data["appointments"] if (r.get("status") or "").lower() == "booked"),
+        "demo_no_show": sum(1 for r in data["appointments"] if (r.get("status") or "").lower() == "no_show"),
+        "converted_leads": sum(1 for r in data["contacts"] if _status_slug(r.get("crm_status") or "") in {"converted", "closed_won"}),
+        "lost_leads": sum(1 for r in data["contacts"] if _status_slug(r.get("crm_status") or "") in {"lost", "closed_lost"}),
+        "source_wise_leads": source_counts,
+        "staff_wise_appointments": staff_counts,
+    }
+
+
+@app.get("/api/reports/calls")
+async def api_reports_calls(date_from: Optional[str] = None, date_to: Optional[str] = None, outcome: Optional[str] = None, export: Optional[str] = None):
+    rows = [r for r in (await _report_data(date_from, date_to))["calls"] if not outcome or (r.get("outcome") or "") == outcome]
+    return _csv_response("calls_report.csv", rows) if export == "csv" else {"rows": rows}
+
+
+@app.get("/api/reports/whatsapp")
+async def api_reports_whatsapp(date_from: Optional[str] = None, date_to: Optional[str] = None, status: Optional[str] = None, export: Optional[str] = None):
+    rows = [r for r in (await _report_data(date_from, date_to))["whatsapp_logs"] if not status or (r.get("status") or "") == status]
+    return _csv_response("whatsapp_report.csv", rows) if export == "csv" else {"rows": rows}
+
+
+@app.get("/api/reports/appointments")
+async def api_reports_appointments(date_from: Optional[str] = None, date_to: Optional[str] = None, status: Optional[str] = None, export: Optional[str] = None):
+    rows = [r for r in (await _report_data(date_from, date_to))["appointments"] if not status or (r.get("status") or "") == status]
+    return _csv_response("appointments_report.csv", rows) if export == "csv" else {"rows": rows}
+
+
+@app.get("/api/reports/leads")
+async def api_reports_leads(date_from: Optional[str] = None, date_to: Optional[str] = None, status: Optional[str] = None, source: Optional[str] = None, export: Optional[str] = None):
+    rows = [
+        r for r in (await _report_data(date_from, date_to))["contacts"]
+        if (not status or (r.get("crm_status") or "") == status) and (not source or (r.get("source") or "") == source)
+    ]
+    return _csv_response("leads_report.csv", rows) if export == "csv" else {"rows": rows}
+
+
+@app.get("/api/costs/summary")
+async def api_costs_summary(date_from: Optional[str] = None, date_to: Optional[str] = None):
+    data = await _report_data(date_from, date_to)
+    def num(key: str) -> float:
+        try:
+            return float(awaitable_values.get(key, "0"))
+        except Exception:
+            return 0.0
+    awaitable_values = {
+        "voice": await get_setting("COST_GEMINI_VOICE_PER_MINUTE", "0"),
+        "sip": await get_setting("COST_SIP_PER_MINUTE", "0"),
+        "recording": await get_setting("COST_RECORDING_PER_MINUTE", "0"),
+        "template": await get_setting("COST_WHATSAPP_TEMPLATE", "0"),
+        "free_text": await get_setting("COST_WHATSAPP_FREE_TEXT", "0"),
+    }
+    voice_minutes = _sum_duration_minutes(data["calls"])
+    template_count = sum(1 for r in data["whatsapp_messages"] if (r.get("message_type") or "").lower() == "template") or len(data["whatsapp_logs"])
+    free_text_count = sum(1 for r in data["whatsapp_messages"] if (r.get("message_type") or "").lower() == "text" and (r.get("direction") or "").lower() == "outbound")
+    gemini_cost = voice_minutes * num("voice")
+    sip_cost = voice_minutes * num("sip")
+    recording_cost = voice_minutes * num("recording")
+    template_cost = template_count * num("template")
+    free_text_cost = free_text_count * num("free_text")
+    total = gemini_cost + sip_cost + recording_cost + template_cost + free_text_cost
+    lead_count = max(len(data["contacts"]), 1)
+    appt_count = max(len(data["appointments"]), 1)
+    return {
+        "currency": await get_setting("COST_CURRENCY", "INR"),
+        "voice_minutes": voice_minutes,
+        "estimated_gemini_voice_cost": round(gemini_cost, 2),
+        "sip_call_cost": round(sip_cost, 2),
+        "recording_cost": round(recording_cost, 2),
+        "whatsapp_template_count": template_count,
+        "whatsapp_template_cost": round(template_cost, 2),
+        "whatsapp_free_text_count": free_text_count,
+        "whatsapp_free_text_cost": round(free_text_cost, 2),
+        "total_estimated_cost": round(total, 2),
+        "estimated_cost_per_lead": round(total / lead_count, 2),
+        "estimated_cost_per_appointment": round(total / appt_count, 2),
+        "estimate_only": True,
+    }
+
+
+@app.get("/api/crm/kanban")
+async def api_crm_kanban():
+    contacts = await get_crm_contacts()
+    columns = [{"id": cid, "label": label, "leads": []} for cid, label, _ in KANBAN_COLUMNS]
+    by_id = {c["id"]: c for c in columns}
+    for lead in contacts:
+        slug = _status_slug(lead.get("journey_stage") or lead.get("crm_status") or "new")
+        target = "new_lead"
+        for cid, _, aliases in KANBAN_COLUMNS:
+            if slug in aliases:
+                target = cid
+                break
+        by_id[target]["leads"].append(lead)
+    return {"columns": columns}
+
+
+@app.post("/api/crm/contacts/{phone}/move-stage")
+async def api_crm_move_stage(phone: str, req: CrmMoveStageRequest):
+    if not req.stage:
+        raise HTTPException(400, "stage is required")
+    ok = await update_lead_journey(phone, {"journey_stage": req.stage, "crm_status": req.stage})
+    if not ok:
+        ok = await update_crm_contact_status(phone, req.stage)
+    return {"success": bool(ok), "stage": req.stage}
+
+
+@app.get("/api/crm/tags")
+async def api_crm_tags():
+    try:
+        rows = await _table_rows("crm_tags", "created_at", 500)
+        names = [r.get("name") for r in rows if r.get("name")]
+    except Exception:
+        names = []
+    contacts = await get_crm_contacts()
+    for contact in contacts:
+        for tag in _json_list(contact.get("tags_json")):
+            if tag not in names:
+                names.append(tag)
+    return {"tags": sorted(set(names))}
+
+
+@app.post("/api/crm/tags")
+async def api_create_crm_tag(req: CrmTagRequest):
+    tag = (req.tag or "").strip()
+    if not tag:
+        raise HTTPException(400, "tag is required")
+    try:
+        db = await _adb()
+        await db.table("crm_tags").upsert({"name": tag, "created_at": datetime.now().isoformat()}, on_conflict="name").execute()
+    except Exception:
+        pass
+    return {"success": True, "tag": tag}
+
+
+@app.post("/api/crm/contacts/{phone}/tags")
+async def api_add_contact_tag(phone: str, req: CrmTagRequest):
+    clean = normalize_phone(phone)
+    contact = await get_crm_contact_by_phone(clean) or {}
+    tags = _json_list(contact.get("tags_json"))
+    tag = (req.tag or "").strip()
+    if tag and tag not in tags:
+        tags.append(tag)
+    await update_lead_journey(clean, {"tags_json": json.dumps(tags)})
+    await api_create_crm_tag(req)
+    return {"success": True, "tags": tags}
+
+
+@app.delete("/api/crm/contacts/{phone}/tags/{tag}")
+async def api_delete_contact_tag(phone: str, tag: str):
+    clean = normalize_phone(phone)
+    contact = await get_crm_contact_by_phone(clean) or {}
+    tags = [t for t in _json_list(contact.get("tags_json")) if t != tag]
+    await update_lead_journey(clean, {"tags_json": json.dumps(tags)})
+    return {"success": True, "tags": tags}
+
+
+@app.patch("/api/crm/contacts/{phone}/custom-fields")
+async def api_patch_contact_custom_fields(phone: str, req: CrmCustomFieldsRequest):
+    clean = normalize_phone(phone)
+    contact = await get_crm_contact_by_phone(clean) or {}
+    fields = _json_dict(contact.get("custom_fields_json"))
+    fields.update(req.fields or {})
+    ok = await update_lead_journey(clean, {"custom_fields_json": json.dumps(fields)})
+    return {"success": bool(ok), "custom_fields": fields}
+
+
+TERMINAL_LEAD_SLUGS = {"not_interested", "wrong_number", "do_not_contact", "converted", "lost"}
+
+
+def _lead_opted_out(lead: dict) -> bool:
+    status = _status_slug(lead.get("crm_status") or lead.get("journey_stage") or "")
+    return bool(lead.get("stop_automation")) or status in TERMINAL_LEAD_SLUGS
+
+
+def _segment_match(lead: dict, segment: dict) -> bool:
+    if not segment:
+        return True
+    for key in ("crm_status", "source", "journey_stage", "assigned_to", "service_type"):
+        value = segment.get(key)
+        if value and str(lead.get(key) or "").lower() != str(value).lower():
+            return False
+    tag = segment.get("tag")
+    if tag and tag not in _json_list(lead.get("tags_json")):
+        return False
+    return True
+
+
+async def _broadcast_campaign(campaign_id: str) -> Optional[dict]:
+    try:
+        db = await _adb()
+        result = await db.table("broadcast_campaigns").select("*").eq("id", campaign_id).limit(1).execute()
+        rows = result.data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+async def _broadcast_preview_contacts(campaign: dict, limit: int = 200) -> list:
+    segment = campaign.get("segment") or campaign.get("segment_json") or {}
+    if isinstance(segment, str):
+        segment = _json_dict(segment)
+    contacts = await get_crm_contacts()
+    seen = set()
+    preview = []
+    for lead in contacts:
+        phone = lead.get("phone_number") or ""
+        if not phone or phone in seen:
+            continue
+        seen.add(phone)
+        if _lead_opted_out(lead):
+            continue
+        if not _segment_match(lead, segment):
+            continue
+        preview.append(lead)
+        if len(preview) >= limit:
+            break
+    return preview
+
+
+@app.get("/api/broadcast/campaigns")
+async def api_broadcast_campaigns():
+    try:
+        rows = await _table_rows("broadcast_campaigns", "created_at", 200)
+    except Exception:
+        rows = []
+    return {"campaigns": rows}
+
+
+@app.post("/api/broadcast/campaigns")
+async def api_create_broadcast_campaign(req: BroadcastCampaignRequest):
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(400, "Campaign name is required")
+    template = await resolve_wa_template(req.template_purpose)
+    if not template:
+        raise HTTPException(400, "Approved WhatsApp template purpose is not configured")
+    row = {
+        "id": str(uuid.uuid4()),
+        "name": name,
+        "template_purpose": req.template_purpose,
+        "template_name": template,
+        "segment": req.segment or {},
+        "status": "draft",
+        "scheduled_at": req.scheduled_at,
+        "sent_count": 0,
+        "failed_count": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        db = await _adb()
+        await db.table("broadcast_campaigns").insert(row).execute()
+    except Exception as exc:
+        raise HTTPException(500, f"Broadcast campaign create failed: {str(exc)[:200]}")
+    return {"success": True, "campaign": row}
+
+
+@app.post("/api/broadcast/campaigns/{campaign_id}/preview")
+async def api_preview_broadcast_campaign(campaign_id: str):
+    campaign = await _broadcast_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(404, "Broadcast campaign not found")
+    contacts = await _broadcast_preview_contacts(campaign, limit=200)
+    return {"campaign_id": campaign_id, "count": len(contacts), "recipients": contacts[:50]}
+
+
+async def _campaign_recipient_exists(campaign_id: str, phone: str) -> bool:
+    try:
+        db = await _adb()
+        result = await db.table("broadcast_recipients").select("id").eq("campaign_id", campaign_id).eq("phone_number", phone).limit(1).execute()
+        return bool(result.data)
+    except Exception:
+        return False
+
+
+@app.post("/api/broadcast/campaigns/{campaign_id}/start")
+async def api_start_broadcast_campaign(campaign_id: str, req: BroadcastStartRequest = BroadcastStartRequest()):
+    campaign = await _broadcast_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(404, "Broadcast campaign not found")
+    if (campaign.get("status") or "") == "paused":
+        raise HTTPException(400, "Campaign is paused")
+    segment = campaign.get("segment") or {}
+    if isinstance(segment, str):
+        segment = _json_dict(segment)
+    confirm = str(req.confirm or "").strip()
+    if segment:
+        if confirm not in {"START_BROADCAST", "CONFIRM_BROADCAST"}:
+            raise HTTPException(400, {"message": "Broadcast start requires backend confirmation.", "required_confirm": "START_BROADCAST"})
+    elif confirm != "SEND_TO_ALL":
+        raise HTTPException(400, {"message": "This broadcast has no segment filter and would target all eligible contacts. Type SEND_TO_ALL to confirm.", "required_confirm": "SEND_TO_ALL"})
+    contacts = await _broadcast_preview_contacts(campaign, limit=1000)
+    if not contacts:
+        raise HTTPException(400, "No eligible broadcast recipients after opt-out and segment filters.")
+    max_per_run = int(await get_setting("BROADCAST_MAX_SEND_PER_RUN", "50") or 50)
+    template_name = campaign.get("template_name") or await resolve_wa_template(campaign.get("template_purpose") or "")
+    if not template_name:
+        raise HTTPException(400, "Broadcast template is not configured")
+    db = await _adb()
+    sent = failed = skipped = 0
+    await db.table("broadcast_campaigns").update({"status": "running", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", campaign_id).execute()
+    for lead in contacts[:max_per_run]:
+        phone = normalize_phone(lead.get("phone_number") or "")
+        if await _campaign_recipient_exists(campaign_id, phone):
+            skipped += 1
+            continue
+        recipient_id = str(uuid.uuid4())
+        params = [
+            lead.get("lead_name") or "there",
+            lead.get("service_type") or lead.get("requirement") or "our service",
+        ]
+        recipient = {
+            "id": recipient_id,
+            "campaign_id": campaign_id,
+            "phone_number": phone,
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            await db.table("broadcast_recipients").insert(recipient).execute()
+            result = await send_whatsapp_template(
+                phone, template_name, await get_setting("WHATSAPP_DEFAULT_LANGUAGE", "en"),
+                params, event_type="broadcast_campaign",
+                source_type="broadcast_campaigns", source_id=campaign_id,
+                template_purpose=campaign.get("template_purpose") or "",
+            )
+            status = "sent" if result.get("success") else "failed"
+            if status == "sent":
+                sent += 1
+            else:
+                failed += 1
+            await db.table("broadcast_recipients").update({
+                "status": status,
+                "provider_message_id": result.get("provider_message_id") or "",
+                "error_message": result.get("error") or result.get("reason") or "",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", recipient_id).execute()
+        except Exception as exc:
+            failed += 1
+            await db.table("broadcast_recipients").update({"status": "failed", "error_message": str(exc)[:500], "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", recipient_id).execute()
+    final_status = "completed" if sent + failed + skipped >= len(contacts) or len(contacts) <= max_per_run else "running"
+    await db.table("broadcast_campaigns").update({
+        "status": final_status,
+        "sent_count": int(campaign.get("sent_count") or 0) + sent,
+        "failed_count": int(campaign.get("failed_count") or 0) + failed,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", campaign_id).execute()
+    return {"success": True, "sent": sent, "failed": failed, "skipped": skipped, "limited_to": max_per_run, "status": final_status}
+
+
+@app.post("/api/broadcast/campaigns/{campaign_id}/pause")
+async def api_pause_broadcast_campaign(campaign_id: str):
+    if not await _broadcast_campaign(campaign_id):
+        raise HTTPException(404, "Broadcast campaign not found")
+    db = await _adb()
+    await db.table("broadcast_campaigns").update({"status": "paused", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", campaign_id).execute()
+    return {"success": True, "status": "paused"}
+
+
+@app.get("/api/broadcast/campaigns/{campaign_id}/recipients")
+async def api_broadcast_recipients(campaign_id: str):
+    try:
+        db = await _adb()
+        result = await db.table("broadcast_recipients").select("*").eq("campaign_id", campaign_id).order("created_at", desc=True).limit(500).execute()
+        rows = result.data or []
+    except Exception:
+        rows = []
+    return {"recipients": rows}
+
+
+async def _select_handoff_staff(staff_id: str = "") -> Optional[dict]:
+    staff = await get_appointment_staff(include_inactive=False)
+    if staff_id:
+        for person in staff:
+            if str(person.get("id")) == str(staff_id):
+                return person
+    with_wa = [person for person in staff if person.get("whatsapp_number")]
+    pool = with_wa or staff
+    if not pool:
+        return None
+    return sorted(pool, key=lambda s: (int(s.get("round_robin_order") or 0), s.get("name") or ""))[0]
+
+
+async def _notify_handoff_staff(staff: dict, contact: dict, reason: str) -> dict:
+    phone = staff.get("whatsapp_number") or ""
+    if not phone:
+        await log_error("handoff", "staff_whatsapp_missing", f"staff_id={staff.get('id')}; contact={contact.get('phone_number')}", "warning")
+        return {"success": False, "reason": "staff_whatsapp_missing"}
+    template = await resolve_wa_template("staff_handoff_notification_template")
+    if not template:
+        await log_error("handoff", "staff_template_missing", "purpose=staff_handoff_notification_template", "warning")
+        return {"success": False, "reason": "staff_template_missing"}
+    params = [
+        contact.get("lead_name") or "Customer",
+        contact.get("phone_number") or "",
+        contact.get("service_type") or contact.get("requirement") or "Lead follow-up",
+        reason or "human_handoff",
+        contact.get("source") or "CRM",
+    ]
+    await log_error("handoff", "staff_notification_started", f"staff_id={staff.get('id')}; phone={contact.get('phone_number')}", "info")
+    result = await send_whatsapp_template(
+        phone, template, await get_setting("WHATSAPP_DEFAULT_LANGUAGE", "en"),
+        params, event_type="human_handoff",
+        source_type="crm_contacts", source_id=contact.get("phone_number") or "",
+        template_purpose="staff_handoff_notification_template",
+    )
+    await log_error("handoff", "staff_template_sent" if result.get("success") else "staff_template_failed", f"staff_id={staff.get('id')}; result={result.get('reason') or result.get('error') or result.get('status')}", "info" if result.get("success") else "warning")
+    return result
+
+
+@app.post("/api/crm/contacts/{phone}/handoff")
+async def api_create_handoff(phone: str, req: HandoffRequest):
+    clean = normalize_phone(phone)
+    contact = await get_crm_contact_by_phone(clean) or {}
+    if not contact:
+        raise HTTPException(404, "CRM contact not found")
+    staff = await _select_handoff_staff(req.staff_id or "")
+    assigned = (staff or {}).get("name") or ""
+    await update_lead_journey(clean, {
+        "handoff_required": True,
+        "handoff_reason": req.reason or "human_requested",
+        "handoff_assigned_to": assigned,
+        "handoff_at": datetime.now(timezone.utc).isoformat(),
+        "journey_stage": "human_handoff",
+        "next_best_action": "staff_followup",
+    })
+    await create_followup_action(clean, "human_handoff", "staff_followup", "whatsapp", datetime.now(timezone.utc), reason=req.reason or "human_requested", payload={"staff_id": (staff or {}).get("id")})
+    notify_result = await _notify_handoff_staff(staff, contact, req.reason or "human_requested") if staff else {"success": False, "reason": "no_active_staff"}
+    return {"success": True, "assigned_to": assigned, "staff_notification": notify_result}
+
+
+@app.post("/api/crm/contacts/{phone}/resolve-handoff")
+async def api_resolve_handoff(phone: str):
+    clean = normalize_phone(phone)
+    ok = await update_lead_journey(clean, {"handoff_required": False, "handoff_reason": "", "handoff_assigned_to": ""})
+    return {"success": bool(ok)}
+
+
+@app.get("/api/handoffs")
+async def api_handoffs():
+    contacts = await get_crm_contacts()
+    rows = [c for c in contacts if c.get("handoff_required")]
+    return {"handoffs": rows}
 
 
 @app.post("/api/crm/call-selected")

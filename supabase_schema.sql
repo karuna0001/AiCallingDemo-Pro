@@ -92,6 +92,9 @@ ALTER TABLE appointments ADD COLUMN IF NOT EXISTS telegram_reminder_sent_at TEXT
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_error TEXT NOT NULL DEFAULT '';
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_processed BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_processed_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS meet_link TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS google_meet_link TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS calendar_event_id TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_appointments_staff ON appointments(staff_id);
 CREATE INDEX IF NOT EXISTS idx_appointments_date_time ON appointments(date, time);
 CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);
@@ -101,7 +104,14 @@ CREATE TABLE IF NOT EXISTS appointment_staff (
     name TEXT NOT NULL,
     email TEXT NOT NULL DEFAULT '',
     whatsapp_number TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT 'sales',
     calendar_email TEXT NOT NULL DEFAULT '',
+    google_calendar_id TEXT NOT NULL DEFAULT '',
+    google_calendar_connected BOOLEAN NOT NULL DEFAULT false,
+    google_meet_enabled BOOLEAN NOT NULL DEFAULT false,
+    calendar_sync_error TEXT NOT NULL DEFAULT '',
+    last_calendar_sync_at TEXT,
+    notes TEXT NOT NULL DEFAULT '',
     working_days TEXT NOT NULL DEFAULT '["mon","tue","wed","thu","fri","sat"]',
     start_time TEXT NOT NULL DEFAULT '09:00',
     end_time TEXT NOT NULL DEFAULT '18:00',
@@ -112,6 +122,13 @@ CREATE TABLE IF NOT EXISTS appointment_staff (
     updated_at TEXT NOT NULL
 );
 ALTER TABLE appointment_staff DISABLE ROW LEVEL SECURITY;
+ALTER TABLE appointment_staff ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'sales';
+ALTER TABLE appointment_staff ADD COLUMN IF NOT EXISTS google_calendar_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointment_staff ADD COLUMN IF NOT EXISTS google_calendar_connected BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE appointment_staff ADD COLUMN IF NOT EXISTS google_meet_enabled BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE appointment_staff ADD COLUMN IF NOT EXISTS calendar_sync_error TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointment_staff ADD COLUMN IF NOT EXISTS last_calendar_sync_at TEXT;
+ALTER TABLE appointment_staff ADD COLUMN IF NOT EXISTS notes TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_appointment_staff_active ON appointment_staff(active);
 CREATE INDEX IF NOT EXISTS idx_appointment_staff_order ON appointment_staff(round_robin_order);
 
@@ -196,6 +213,37 @@ ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS last_followup_reason text DEFA
 ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS last_intent text DEFAULT '';
 ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS preferred_channel text DEFAULT '';
 ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS preferred_callback_at timestamptz;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS tags_json text NOT NULL DEFAULT '[]';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS custom_fields_json text NOT NULL DEFAULT '{}';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS handoff_required boolean NOT NULL DEFAULT false;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS handoff_reason text NOT NULL DEFAULT '';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS handoff_assigned_to text NOT NULL DEFAULT '';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS handoff_at timestamptz;
+CREATE INDEX IF NOT EXISTS idx_crm_contacts_handoff ON crm_contacts(handoff_required);
+
+CREATE TABLE IF NOT EXISTS crm_tags (
+    name text PRIMARY KEY,
+    color text DEFAULT '#6366f1',
+    created_at timestamptz DEFAULT now()
+);
+ALTER TABLE crm_tags DISABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS crm_custom_fields (
+    key text PRIMARY KEY,
+    label text NOT NULL,
+    field_type text NOT NULL DEFAULT 'text',
+    created_at timestamptz DEFAULT now()
+);
+ALTER TABLE crm_custom_fields DISABLE ROW LEVEL SECURITY;
+
+INSERT INTO crm_custom_fields (key, label, field_type) VALUES
+('budget', 'Budget', 'text'),
+('requirement_type', 'Requirement Type', 'text'),
+('priority', 'Priority', 'text'),
+('location', 'Location', 'text'),
+('campaign', 'Campaign', 'text'),
+('product_service_interest', 'Product/Service Interest', 'text')
+ON CONFLICT (key) DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_source ON crm_contacts(source);
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_business_name ON crm_contacts(business_name);
@@ -204,6 +252,38 @@ CREATE INDEX IF NOT EXISTS idx_crm_contacts_city ON crm_contacts(city);
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_created_at ON crm_contacts(created_at);
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_journey_stage ON crm_contacts(journey_stage);
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_next_action ON crm_contacts(next_action_at);
+
+CREATE TABLE IF NOT EXISTS broadcast_campaigns (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name text NOT NULL,
+    template_purpose text NOT NULL DEFAULT '',
+    template_name text NOT NULL DEFAULT '',
+    segment jsonb NOT NULL DEFAULT '{}'::jsonb,
+    status text NOT NULL DEFAULT 'draft',
+    scheduled_at timestamptz,
+    sent_count integer NOT NULL DEFAULT 0,
+    failed_count integer NOT NULL DEFAULT 0,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE broadcast_campaigns DISABLE ROW LEVEL SECURITY;
+CREATE INDEX IF NOT EXISTS idx_broadcast_campaigns_status ON broadcast_campaigns(status);
+CREATE INDEX IF NOT EXISTS idx_broadcast_campaigns_scheduled ON broadcast_campaigns(scheduled_at);
+
+CREATE TABLE IF NOT EXISTS broadcast_recipients (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id uuid NOT NULL,
+    phone_number text NOT NULL,
+    status text NOT NULL DEFAULT 'pending',
+    provider_message_id text NOT NULL DEFAULT '',
+    error_message text NOT NULL DEFAULT '',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE broadcast_recipients DISABLE ROW LEVEL SECURITY;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_broadcast_recipients_unique ON broadcast_recipients(campaign_id, phone_number);
+CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_campaign ON broadcast_recipients(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_status ON broadcast_recipients(status);
 
 CREATE TABLE IF NOT EXISTS followup_actions (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -270,7 +350,23 @@ INSERT INTO settings (key, value, updated_at) VALUES
 ('FOLLOWUP_STOP_ON_WRONG_NUMBER', 'true', now()::text),
 ('APPOINTMENT_TELEGRAM_REMINDER_ENABLED', '0', now()::text),
 ('staff_appointment_notification_template', 'staff_appointment_notification', now()::text),
-('staff_appointment_reminder_template', 'staff_appointment_reminder', now()::text)
+('staff_appointment_reminder_template', 'staff_appointment_reminder', now()::text),
+('staff_handoff_notification_template', 'staff_appointment_alert', now()::text),
+('GOOGLE_CALENDAR_ENABLED', 'false', now()::text),
+('GOOGLE_MEET_ENABLED', 'false', now()::text),
+('GOOGLE_CALENDAR_SERVICE_ACCOUNT_JSON', '', now()::text),
+('GOOGLE_CALENDAR_DEFAULT_TIMEZONE', 'Asia/Kolkata', now()::text),
+('GOOGLE_CALENDAR_FALLBACK_TO_INTERNAL', 'true', now()::text),
+('AUTH_ENABLED', 'false', now()::text),
+('ADMIN_API_KEY', '', now()::text),
+('WEBHOOK_VERIFY_TOKEN', '', now()::text),
+('COST_GEMINI_VOICE_PER_MINUTE', '0', now()::text),
+('COST_SIP_PER_MINUTE', '0', now()::text),
+('COST_RECORDING_PER_MINUTE', '0', now()::text),
+('COST_WHATSAPP_TEMPLATE', '0', now()::text),
+('COST_WHATSAPP_FREE_TEXT', '0', now()::text),
+('COST_CURRENCY', 'INR', now()::text),
+('BROADCAST_MAX_SEND_PER_RUN', '50', now()::text)
 ON CONFLICT (key) DO NOTHING;
 
 -- ── Phase 8: WhatsApp Chat Inbox ──────────────────────────────────────────────
