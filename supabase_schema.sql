@@ -213,6 +213,37 @@ ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS last_followup_reason text DEFA
 ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS last_intent text DEFAULT '';
 ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS preferred_channel text DEFAULT '';
 ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS preferred_callback_at timestamptz;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS tags_json text NOT NULL DEFAULT '[]';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS custom_fields_json text NOT NULL DEFAULT '{}';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS handoff_required boolean NOT NULL DEFAULT false;
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS handoff_reason text NOT NULL DEFAULT '';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS handoff_assigned_to text NOT NULL DEFAULT '';
+ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS handoff_at timestamptz;
+CREATE INDEX IF NOT EXISTS idx_crm_contacts_handoff ON crm_contacts(handoff_required);
+
+CREATE TABLE IF NOT EXISTS crm_tags (
+    name text PRIMARY KEY,
+    color text DEFAULT '#6366f1',
+    created_at timestamptz DEFAULT now()
+);
+ALTER TABLE crm_tags DISABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS crm_custom_fields (
+    key text PRIMARY KEY,
+    label text NOT NULL,
+    field_type text NOT NULL DEFAULT 'text',
+    created_at timestamptz DEFAULT now()
+);
+ALTER TABLE crm_custom_fields DISABLE ROW LEVEL SECURITY;
+
+INSERT INTO crm_custom_fields (key, label, field_type) VALUES
+('budget', 'Budget', 'text'),
+('requirement_type', 'Requirement Type', 'text'),
+('priority', 'Priority', 'text'),
+('location', 'Location', 'text'),
+('campaign', 'Campaign', 'text'),
+('product_service_interest', 'Product/Service Interest', 'text')
+ON CONFLICT (key) DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_source ON crm_contacts(source);
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_business_name ON crm_contacts(business_name);

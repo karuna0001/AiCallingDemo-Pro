@@ -52,7 +52,7 @@ from db import (
     get_crm_summary, get_lead_statuses, get_crm_contact_by_phone,
     get_logs, get_recording_storage_stats, get_recordings_for_cleanup,
     get_setting, get_stats, init_db, log_error, mark_recording_deleted,
-    normalize_phone, _tz_today, upsert_crm_lead,
+    normalize_phone, _adb, _tz_today, upsert_crm_lead,
     save_appointment_settings, save_settings, set_default_agent_profile, set_setting,
     add_lead_status, delete_lead_status, update_agent_profile, update_call_notes,
     upsert_appointment_staff,
@@ -428,6 +428,95 @@ def _run_due_followup_actions_sync() -> None:
         logger.exception("Due follow-up actions failed: %s", exc)
 
 
+def _date_in_range(value: str, date_from: Optional[str], date_to: Optional[str]) -> bool:
+    day = (value or "")[:10]
+    if not day:
+        return False
+    if date_from and day < date_from:
+        return False
+    if date_to and day > date_to:
+        return False
+    return True
+
+
+def _sum_duration_minutes(rows: list[dict]) -> float:
+    return round(sum(float(r.get("duration_seconds") or 0) for r in rows) / 60.0, 2)
+
+
+def _json_list(value) -> list:
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []
+
+
+def _json_dict(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _table_rows(table_name: str, order_by: str = "created_at", limit: int = 5000) -> list[dict]:
+    try:
+        db = await _adb()
+        return (await db.table(table_name).select("*").order(order_by, desc=True).limit(limit).execute()).data or []
+    except Exception as exc:
+        await log_error("reports", "table_fetch_failed", f"table={table_name}; error={str(exc)[:300]}", "warning")
+        return []
+
+
+def _csv_response(filename: str, rows: list[dict]) -> StreamingResponse:
+    out = StringIO()
+    if rows:
+        headers = sorted({k for row in rows for k in row.keys()})
+        writer = csv.DictWriter(out, fieldnames=headers)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in headers})
+    else:
+        out.write("empty\n")
+    out.seek(0)
+    return StreamingResponse(iter([out.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+async def _report_data(date_from: Optional[str] = None, date_to: Optional[str] = None) -> dict:
+    calls = [r for r in await get_call_logs_for_export({}) if _date_in_range(r.get("timestamp") or "", date_from, date_to)]
+    contacts = [r for r in await get_crm_contacts() if _date_in_range(r.get("created_at") or r.get("updated_at") or "", date_from, date_to)]
+    appointments = [r for r in await get_all_appointments() if _date_in_range(r.get("date") or r.get("created_at") or "", date_from, date_to)]
+    wa_logs = [r for r in await get_whatsapp_logs(limit=5000) if _date_in_range(r.get("created_at") or "", date_from, date_to)]
+    wa_messages = [r for r in await _table_rows("whatsapp_messages", "created_at", 5000) if _date_in_range(r.get("created_at") or r.get("timestamp") or "", date_from, date_to)]
+    followups = await get_followup_actions(limit=5000)
+    return {"calls": calls, "contacts": contacts, "appointments": appointments, "whatsapp_logs": wa_logs, "whatsapp_messages": wa_messages, "followups": followups}
+
+
+def _status_slug(status: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (status or "").strip().lower()).strip("_") or "new_lead"
+
+
+KANBAN_COLUMNS = [
+    ("new_lead", "New Lead", {"new", "new_lead"}),
+    ("contacted", "Contacted", {"contacted", "callback_requested", "message_followup_requested"}),
+    ("interested", "Interested", {"hot_lead", "interested", "quote_given"}),
+    ("callback_requested", "Callback Requested", {"callback_requested"}),
+    ("demo_booked", "Demo Booked", {"demo_booked", "appointment_booked", "booked"}),
+    ("demo_done", "Demo Done", {"demo_done", "completed"}),
+    ("converted", "Converted", {"converted", "closed_won"}),
+    ("not_interested", "Not Interested", {"not_interested", "not_interested"}),
+    ("lost", "Lost", {"lost", "closed_lost", "wrong_number", "do_not_contact"}),
+]
+
+
 
 @app.on_event("startup")
 async def _startup():
@@ -718,6 +807,18 @@ class AppointmentStaffRequest(BaseModel):
     timezone: Optional[str] = "Asia/Kolkata"
     active: Optional[bool] = True
     round_robin_order: Optional[int] = 0
+
+
+class CrmTagRequest(BaseModel):
+    tag: str
+
+
+class CrmCustomFieldsRequest(BaseModel):
+    fields: dict[str, Any] = {}
+
+
+class CrmMoveStageRequest(BaseModel):
+    stage: str
 
 
 class WaConfirmRequest(BaseModel):
@@ -3390,6 +3491,219 @@ async def api_get_followups(phone: Optional[str] = None, status: Optional[str] =
     tz_name = await _display_timezone()
     actions = await get_followup_actions(phone=phone, status=status, limit=limit)
     return {"actions": [_with_followup_display(action, tz_name) for action in actions]}
+
+
+@app.get("/api/dashboard/summary")
+async def api_dashboard_summary():
+    tz_name = await _display_timezone()
+    today = datetime.now(ZoneInfo(tz_name)).date().isoformat()
+    data = await _report_data(today, today)
+    all_contacts = await get_crm_contacts()
+    due_followups = await get_due_followup_actions(limit=500)
+    return {
+        "today_calls": len(data["calls"]),
+        "answered_calls": sum(1 for r in data["calls"] if (r.get("outcome") or "").lower() in {"answered", "booked", "completed", "interested"}),
+        "no_answer_calls": sum(1 for r in data["calls"] if (r.get("outcome") or "").lower() in {"no_answer", "no answer"}),
+        "busy_calls": sum(1 for r in data["calls"] if (r.get("outcome") or "").lower() == "busy"),
+        "failed_calls": sum(1 for r in data["calls"] if "fail" in (r.get("outcome") or "").lower()),
+        "today_whatsapp_inbound": sum(1 for r in data["whatsapp_messages"] if (r.get("direction") or "").lower() == "inbound"),
+        "today_whatsapp_outbound": sum(1 for r in data["whatsapp_messages"] if (r.get("direction") or "").lower() == "outbound"),
+        "today_leads": len(data["contacts"]),
+        "appointments_today": len(data["appointments"]),
+        "pending_followups": sum(1 for r in await get_followup_actions(status="scheduled", limit=1000)),
+        "due_calls": sum(1 for r in due_followups if (r.get("channel") or "").lower() == "call"),
+        "due_today": sum(1 for r in all_contacts if (r.get("next_followup_at") or "").startswith(today)),
+        "converted_leads": sum(1 for r in all_contacts if _status_slug(r.get("crm_status") or "") in {"converted", "closed_won"}),
+        "no_response_leads": sum(1 for r in all_contacts if "no_response" in _status_slug(r.get("crm_status") or r.get("journey_stage") or "")),
+    }
+
+
+@app.get("/api/reports/summary")
+async def api_reports_summary(date_from: Optional[str] = None, date_to: Optional[str] = None):
+    data = await _report_data(date_from, date_to)
+    source_counts = {}
+    for lead in data["contacts"]:
+        source = lead.get("source") or "unknown"
+        source_counts[source] = source_counts.get(source, 0) + 1
+    staff_counts = {}
+    for appt in data["appointments"]:
+        staff = appt.get("staff_name") or appt.get("staff_id") or "unassigned"
+        staff_counts[staff] = staff_counts.get(staff, 0) + 1
+    return {
+        "calls_total": len(data["calls"]),
+        "answered": sum(1 for r in data["calls"] if (r.get("outcome") or "").lower() in {"answered", "booked", "completed", "interested"}),
+        "no_answer": sum(1 for r in data["calls"] if (r.get("outcome") or "").lower() in {"no_answer", "no answer"}),
+        "busy": sum(1 for r in data["calls"] if (r.get("outcome") or "").lower() == "busy"),
+        "failed": sum(1 for r in data["calls"] if "fail" in (r.get("outcome") or "").lower()),
+        "total_duration_minutes": _sum_duration_minutes(data["calls"]),
+        "whatsapp_sent": sum(1 for r in data["whatsapp_logs"] if (r.get("status") or "").lower() == "sent"),
+        "whatsapp_delivered": sum(1 for r in data["whatsapp_logs"] if (r.get("status") or "").lower() == "delivered"),
+        "whatsapp_read": sum(1 for r in data["whatsapp_logs"] if (r.get("status") or "").lower() == "read"),
+        "whatsapp_failed": sum(1 for r in data["whatsapp_logs"] if (r.get("status") or "").lower() == "failed"),
+        "inbound_whatsapp_count": sum(1 for r in data["whatsapp_messages"] if (r.get("direction") or "").lower() == "inbound"),
+        "appointments_booked": sum(1 for r in data["appointments"] if (r.get("status") or "").lower() == "booked"),
+        "demo_no_show": sum(1 for r in data["appointments"] if (r.get("status") or "").lower() == "no_show"),
+        "converted_leads": sum(1 for r in data["contacts"] if _status_slug(r.get("crm_status") or "") in {"converted", "closed_won"}),
+        "lost_leads": sum(1 for r in data["contacts"] if _status_slug(r.get("crm_status") or "") in {"lost", "closed_lost"}),
+        "source_wise_leads": source_counts,
+        "staff_wise_appointments": staff_counts,
+    }
+
+
+@app.get("/api/reports/calls")
+async def api_reports_calls(date_from: Optional[str] = None, date_to: Optional[str] = None, outcome: Optional[str] = None, export: Optional[str] = None):
+    rows = [r for r in (await _report_data(date_from, date_to))["calls"] if not outcome or (r.get("outcome") or "") == outcome]
+    return _csv_response("calls_report.csv", rows) if export == "csv" else {"rows": rows}
+
+
+@app.get("/api/reports/whatsapp")
+async def api_reports_whatsapp(date_from: Optional[str] = None, date_to: Optional[str] = None, status: Optional[str] = None, export: Optional[str] = None):
+    rows = [r for r in (await _report_data(date_from, date_to))["whatsapp_logs"] if not status or (r.get("status") or "") == status]
+    return _csv_response("whatsapp_report.csv", rows) if export == "csv" else {"rows": rows}
+
+
+@app.get("/api/reports/appointments")
+async def api_reports_appointments(date_from: Optional[str] = None, date_to: Optional[str] = None, status: Optional[str] = None, export: Optional[str] = None):
+    rows = [r for r in (await _report_data(date_from, date_to))["appointments"] if not status or (r.get("status") or "") == status]
+    return _csv_response("appointments_report.csv", rows) if export == "csv" else {"rows": rows}
+
+
+@app.get("/api/reports/leads")
+async def api_reports_leads(date_from: Optional[str] = None, date_to: Optional[str] = None, status: Optional[str] = None, source: Optional[str] = None, export: Optional[str] = None):
+    rows = [
+        r for r in (await _report_data(date_from, date_to))["contacts"]
+        if (not status or (r.get("crm_status") or "") == status) and (not source or (r.get("source") or "") == source)
+    ]
+    return _csv_response("leads_report.csv", rows) if export == "csv" else {"rows": rows}
+
+
+@app.get("/api/costs/summary")
+async def api_costs_summary(date_from: Optional[str] = None, date_to: Optional[str] = None):
+    data = await _report_data(date_from, date_to)
+    def num(key: str) -> float:
+        try:
+            return float(awaitable_values.get(key, "0"))
+        except Exception:
+            return 0.0
+    awaitable_values = {
+        "voice": await get_setting("COST_GEMINI_VOICE_PER_MINUTE", "0"),
+        "sip": await get_setting("COST_SIP_PER_MINUTE", "0"),
+        "recording": await get_setting("COST_RECORDING_PER_MINUTE", "0"),
+        "template": await get_setting("COST_WHATSAPP_TEMPLATE", "0"),
+        "free_text": await get_setting("COST_WHATSAPP_FREE_TEXT", "0"),
+    }
+    voice_minutes = _sum_duration_minutes(data["calls"])
+    template_count = sum(1 for r in data["whatsapp_messages"] if (r.get("message_type") or "").lower() == "template") or len(data["whatsapp_logs"])
+    free_text_count = sum(1 for r in data["whatsapp_messages"] if (r.get("message_type") or "").lower() == "text" and (r.get("direction") or "").lower() == "outbound")
+    gemini_cost = voice_minutes * num("voice")
+    sip_cost = voice_minutes * num("sip")
+    recording_cost = voice_minutes * num("recording")
+    template_cost = template_count * num("template")
+    free_text_cost = free_text_count * num("free_text")
+    total = gemini_cost + sip_cost + recording_cost + template_cost + free_text_cost
+    lead_count = max(len(data["contacts"]), 1)
+    appt_count = max(len(data["appointments"]), 1)
+    return {
+        "currency": await get_setting("COST_CURRENCY", "INR"),
+        "voice_minutes": voice_minutes,
+        "estimated_gemini_voice_cost": round(gemini_cost, 2),
+        "sip_call_cost": round(sip_cost, 2),
+        "recording_cost": round(recording_cost, 2),
+        "whatsapp_template_count": template_count,
+        "whatsapp_template_cost": round(template_cost, 2),
+        "whatsapp_free_text_count": free_text_count,
+        "whatsapp_free_text_cost": round(free_text_cost, 2),
+        "total_estimated_cost": round(total, 2),
+        "estimated_cost_per_lead": round(total / lead_count, 2),
+        "estimated_cost_per_appointment": round(total / appt_count, 2),
+        "estimate_only": True,
+    }
+
+
+@app.get("/api/crm/kanban")
+async def api_crm_kanban():
+    contacts = await get_crm_contacts()
+    columns = [{"id": cid, "label": label, "leads": []} for cid, label, _ in KANBAN_COLUMNS]
+    by_id = {c["id"]: c for c in columns}
+    for lead in contacts:
+        slug = _status_slug(lead.get("journey_stage") or lead.get("crm_status") or "new")
+        target = "new_lead"
+        for cid, _, aliases in KANBAN_COLUMNS:
+            if slug in aliases:
+                target = cid
+                break
+        by_id[target]["leads"].append(lead)
+    return {"columns": columns}
+
+
+@app.post("/api/crm/contacts/{phone}/move-stage")
+async def api_crm_move_stage(phone: str, req: CrmMoveStageRequest):
+    if not req.stage:
+        raise HTTPException(400, "stage is required")
+    ok = await update_lead_journey(phone, {"journey_stage": req.stage, "crm_status": req.stage})
+    if not ok:
+        ok = await update_crm_contact_status(phone, req.stage)
+    return {"success": bool(ok), "stage": req.stage}
+
+
+@app.get("/api/crm/tags")
+async def api_crm_tags():
+    try:
+        rows = await _table_rows("crm_tags", "created_at", 500)
+        names = [r.get("name") for r in rows if r.get("name")]
+    except Exception:
+        names = []
+    contacts = await get_crm_contacts()
+    for contact in contacts:
+        for tag in _json_list(contact.get("tags_json")):
+            if tag not in names:
+                names.append(tag)
+    return {"tags": sorted(set(names))}
+
+
+@app.post("/api/crm/tags")
+async def api_create_crm_tag(req: CrmTagRequest):
+    tag = (req.tag or "").strip()
+    if not tag:
+        raise HTTPException(400, "tag is required")
+    try:
+        db = await _adb()
+        await db.table("crm_tags").upsert({"name": tag, "created_at": datetime.now().isoformat()}, on_conflict="name").execute()
+    except Exception:
+        pass
+    return {"success": True, "tag": tag}
+
+
+@app.post("/api/crm/contacts/{phone}/tags")
+async def api_add_contact_tag(phone: str, req: CrmTagRequest):
+    clean = normalize_phone(phone)
+    contact = await get_crm_contact_by_phone(clean) or {}
+    tags = _json_list(contact.get("tags_json"))
+    tag = (req.tag or "").strip()
+    if tag and tag not in tags:
+        tags.append(tag)
+    await update_lead_journey(clean, {"tags_json": json.dumps(tags)})
+    await api_create_crm_tag(req)
+    return {"success": True, "tags": tags}
+
+
+@app.delete("/api/crm/contacts/{phone}/tags/{tag}")
+async def api_delete_contact_tag(phone: str, tag: str):
+    clean = normalize_phone(phone)
+    contact = await get_crm_contact_by_phone(clean) or {}
+    tags = [t for t in _json_list(contact.get("tags_json")) if t != tag]
+    await update_lead_journey(clean, {"tags_json": json.dumps(tags)})
+    return {"success": True, "tags": tags}
+
+
+@app.patch("/api/crm/contacts/{phone}/custom-fields")
+async def api_patch_contact_custom_fields(phone: str, req: CrmCustomFieldsRequest):
+    clean = normalize_phone(phone)
+    contact = await get_crm_contact_by_phone(clean) or {}
+    fields = _json_dict(contact.get("custom_fields_json"))
+    fields.update(req.fields or {})
+    ok = await update_lead_journey(clean, {"custom_fields_json": json.dumps(fields)})
+    return {"success": bool(ok), "custom_fields": fields}
 
 
 @app.post("/api/crm/call-selected")

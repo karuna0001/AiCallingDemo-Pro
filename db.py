@@ -1697,6 +1697,8 @@ JOURNEY_FIELDS = {
     "demo_reminder_count", "stop_automation", "stop_automation_reason",
     "last_followup_reason", "last_intent", "preferred_channel",
     "preferred_callback_at", "crm_status", "next_followup_at",
+    "tags_json", "custom_fields_json", "handoff_required",
+    "handoff_reason", "handoff_assigned_to", "handoff_at",
 }
 
 
