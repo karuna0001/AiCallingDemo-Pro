@@ -18,6 +18,7 @@ import re
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -45,6 +46,7 @@ WA_SETTINGS_KEYS = [
     "missed_call_template",
     "callback_confirmation_template",
     "appointment_confirmation_template",
+    "staff_appointment_notification_template",
     "reminder_template",
     "no_response_followup_template",
     "re_enquiry_followup_template",
@@ -55,6 +57,7 @@ WA_DEFAULTS = {
     "WHATSAPP_PROVIDER": "meta",
     "WHATSAPP_GRAPH_VERSION": "v20.0",
     "WHATSAPP_DEFAULT_LANGUAGE": "en",
+    "staff_appointment_notification_template": "staff_appointment_notification",
 }
 
 # ── Template purpose slot labels (for UI and health reporting) ───────────────
@@ -63,6 +66,7 @@ WA_TEMPLATE_PURPOSES = [
     ("missed_call_template",              "Missed Call Follow-up"),
     ("callback_confirmation_template",    "Callback Confirmation"),
     ("appointment_confirmation_template", "Appointment Confirmation"),
+    ("staff_appointment_notification_template", "Staff Appointment Notification"),
     ("reminder_template",                 "Reminder"),
     ("no_response_followup_template",     "No Response Follow-up"),
     ("re_enquiry_followup_template",      "Re-enquiry Follow-up"),
@@ -73,6 +77,7 @@ WA_TEMPLATE_PARAM_COUNTS = {
     "missed_call_template": 2,
     "callback_confirmation_template": 4,
     "appointment_confirmation_template": 4,
+    "staff_appointment_notification_template": 5,
     "reminder_template": 3,
     "no_response_followup_template": 2,
     "re_enquiry_followup_template": 2,
@@ -84,6 +89,7 @@ WA_TEMPLATE_COOLDOWNS = {
     "missed_call_template": 2 * 60,
     "missed_call_followup": 2 * 60,
     "appointment_confirmation_template": 30 * 24 * 60,
+    "staff_appointment_notification_template": 0,
 }
 
 # ── Backward-compat: old key → new purpose slot ───────────────────────────
@@ -95,6 +101,7 @@ _WA_LEGACY_KEY_MAP = {
     "WHATSAPP_FAILED_CALL_TEMPLATE":   "no_response_followup_template",
     "WHATSAPP_CALLBACK_TEMPLATE":      "callback_confirmation_template",
     "WHATSAPP_APPOINTMENT_TEMPLATE":   "appointment_confirmation_template",
+    "WHATSAPP_STAFF_APPOINTMENT_NOTIFICATION_TEMPLATE": "staff_appointment_notification_template",
     "WHATSAPP_SHOWROOM_VISIT_TEMPLATE":"appointment_confirmation_template",
     "WHATSAPP_RE_ENQUIRY_TEMPLATE":    "re_enquiry_followup_template",
     "WHATSAPP_FOLLOWUP_TEMPLATE":      "no_response_followup_template",
@@ -108,6 +115,7 @@ _WA_LEGACY_KEY_MAP = {
     "voice_ai_demo_welcome":           "welcome_template",
     "missed_call_followup":            "missed_call_template",
     "appointment_confirmation":        "appointment_confirmation_template",
+    "staff_appointment_notification":  "staff_appointment_notification_template",
     "demo_reminder":                   "reminder_template",
     "callback_confirmation":           "callback_confirmation_template",
     "re_enquiry_followup":             "re_enquiry_followup_template",
@@ -315,6 +323,7 @@ async def get_wa_health() -> dict:
             # Keep these keys for back-compat with existing UI badges
             "phone_number_id_configured": channel_id,
             "access_token_configured": auth_token,
+            "staff_appointment_notification_template_configured": bool(cfg.get("staff_appointment_notification_template", "").strip()),
             "templates_configured": len(templates),
             "template_purposes": [
                 {"key": k, "label": lbl, "configured": bool(cfg.get(k, "").strip())}
@@ -336,6 +345,7 @@ async def get_wa_health() -> dict:
         "provider": "meta",
         "phone_number_id_configured": phone_id,
         "access_token_configured": token,
+        "staff_appointment_notification_template_configured": bool(cfg.get("staff_appointment_notification_template", "").strip()),
         "templates_configured": len(templates),
         "template_purposes": [
             {"key": k, "label": lbl, "configured": bool(cfg.get(k, "").strip())}
@@ -1233,6 +1243,23 @@ def _build_template_params(purpose_or_name: str, contact: Optional[dict], contex
         return [name, service, date, time]
     if purpose == "appointment_confirmation_template":
         return [name, company, date, time]
+    if purpose == "staff_appointment_notification_template":
+        customer_phone = _first_value(
+            context.get("customer_phone"), context.get("phone"), context.get("phone_number"),
+            contact.get("customer_phone"), contact.get("phone"), contact.get("phone_number"),
+            fallback="",
+        )
+        source = _first_value(
+            context.get("source"), context.get("lead_source"),
+            contact.get("source"), contact.get("lead_source"),
+            fallback="WhatsApp",
+        )
+        appointment_datetime = _first_value(
+            context.get("appointment_datetime"),
+            f"{date} {time}".strip(),
+            fallback="the scheduled time",
+        )
+        return [name, customer_phone, service or company, appointment_datetime, source]
     if purpose == "reminder_template":
         return [name, company, time]
 
@@ -2993,6 +3020,129 @@ async def _send_telegram_appointment_notification(message: str) -> dict:
         return {"success": False, "error": str(exc)[:500], "reason": "telegram_send_failed"}
 
 
+def _format_appointment_datetime_for_staff(appointment: dict) -> str:
+    tz_name = (
+        appointment.get("timezone")
+        or appointment.get("appointment_timezone")
+        or appointment.get("tz")
+        or "Asia/Kolkata"
+    )
+    try:
+        tz = ZoneInfo(str(tz_name))
+    except Exception:
+        tz = ZoneInfo("Asia/Kolkata")
+
+    date_s = str(appointment.get("date") or appointment.get("appointment_date") or "").strip()
+    time_s = str(appointment.get("time") or appointment.get("appointment_time") or "").strip()[:5]
+    try:
+        local_dt = datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+        return local_dt.strftime("%d %b %Y, %I:%M %p").replace(", 0", ", ")
+    except Exception:
+        return _first_value(
+            appointment.get("appointment_datetime"),
+            f"{date_s} {time_s}".strip(),
+            fallback="the scheduled time",
+        )
+
+
+async def send_staff_appointment_notification(appointment: dict, *, source: str = "", update_appointment: bool = True) -> dict:
+    """Notify the assigned staff member about a booked appointment via approved WhatsApp template."""
+    appointment = appointment or {}
+    appointment_id = appointment.get("id") or appointment.get("appointment_id") or ""
+    customer_phone = appointment.get("phone") or appointment.get("customer_phone") or ""
+    customer_name = _first_value(
+        appointment.get("name"),
+        appointment.get("customer_name"),
+        appointment.get("lead_name"),
+        fallback="Customer",
+    )
+    service = _first_value(
+        appointment.get("service"),
+        appointment.get("service_type"),
+        appointment.get("requirement"),
+        fallback="Appointment",
+    )
+    source_label = _first_value(
+        source,
+        appointment.get("source"),
+        appointment.get("lead_source"),
+        appointment.get("source_label"),
+        fallback="WhatsApp",
+    )
+
+    async def finish(success: bool, reason: str = "", error: str = "", provider_message_id: str = "") -> dict:
+        if update_appointment and appointment_id:
+            try:
+                from db import update_appointment_notifications
+                await update_appointment_notifications(appointment_id, {
+                    "staff_notified": bool(success),
+                    "notification_error": "" if success else (error or reason),
+                })
+            except Exception as exc:
+                await _db().log_error("appointments", "staff_template_failed", f"appointment_id={appointment_id}; update_failed={str(exc)[:300]}", "warning")
+        return {
+            "success": bool(success),
+            "reason": reason,
+            "error": error,
+            "provider_message_id": provider_message_id,
+            "template_purpose": "staff_appointment_notification_template",
+        }
+
+    await _db().log_error(
+        "appointments",
+        "staff_notification_started",
+        f"appointment_id={appointment_id}; customer_phone={customer_phone}; staff_id={appointment.get('staff_id') or ''}",
+        "info",
+    )
+
+    staff_phone = ""
+    try:
+        from db import get_appointment_staff, normalize_phone
+        staff_id = appointment.get("staff_id") or ""
+        staff = next((s for s in await get_appointment_staff(include_inactive=True) if s.get("id") == staff_id), {})
+        staff_phone_raw = staff.get("whatsapp_number") or appointment.get("staff_whatsapp_number") or ""
+        if staff_phone_raw:
+            staff_phone = normalize_phone(staff_phone_raw)
+    except Exception as exc:
+        await _db().log_error("appointments", "staff_template_failed", f"appointment_id={appointment_id}; staff_lookup={str(exc)[:500]}", "error")
+        return await finish(False, "staff_lookup_failed", str(exc)[:500])
+
+    if not staff_phone:
+        await _db().log_error("appointments", "staff_whatsapp_missing", f"appointment_id={appointment_id}; staff_id={appointment.get('staff_id') or ''}", "warning")
+        return await finish(False, "staff_whatsapp_missing", "Assigned staff WhatsApp number is missing")
+
+    template = await resolve_wa_template("staff_appointment_notification_template")
+    if not template:
+        await _db().log_error("appointments", "staff_template_missing", f"appointment_id={appointment_id}; purpose=staff_appointment_notification_template", "warning")
+        return await finish(False, "staff_template_missing", "staff_appointment_notification_template is not configured")
+
+    params = [
+        customer_name,
+        customer_phone,
+        service,
+        _format_appointment_datetime_for_staff(appointment),
+        source_label,
+    ]
+    language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
+    result = await send_whatsapp_template(
+        staff_phone,
+        template,
+        language,
+        params,
+        event_type="staff_appointment_notification",
+        source_type="appointment",
+        source_id=appointment_id or customer_phone,
+        template_purpose="staff_appointment_notification_template",
+    )
+    if result.get("success"):
+        await _db().log_error("appointments", "staff_template_sent", f"appointment_id={appointment_id}; staff_phone={staff_phone}; template={template}", "info")
+        return await finish(True, "", "", result.get("provider_message_id") or "")
+
+    error = result.get("error") or result.get("reason") or "staff_template_failed"
+    await _db().log_error("appointments", "staff_template_failed", f"appointment_id={appointment_id}; staff_phone={staff_phone}; template={template}; error={str(error)[:500]}", "error")
+    return await finish(False, result.get("reason") or "staff_template_failed", str(error)[:500])
+
+
 async def _notify_appointment_booked(phone: str, appointment: dict, customer_name: str, company: str, staff_name: str, inbound_saved: Optional[dict]) -> dict:
     appointment_id = appointment.get("id", "")
     duration_minutes = int(appointment.get("duration_minutes") or 30)
@@ -3038,32 +3188,18 @@ async def _notify_appointment_booked(phone: str, appointment: dict, customer_nam
         errors.append(f"customer_confirmation: {str(exc)[:200]}")
         await _log_whatsapp_ai_event(phone, "appointment_confirmation_failed", str(exc)[:500], "error")
 
-    staff_phone = ""
     try:
-        from db import get_appointment_staff
-        staff_id = appointment.get("staff_id") or ""
-        staff = next((s for s in await get_appointment_staff(include_inactive=True) if s.get("id") == staff_id), {})
-        staff_phone = staff.get("whatsapp_number") or ""
-    except Exception as exc:
-        errors.append(f"staff_lookup: {str(exc)[:200]}")
-    staff_message = _appointment_internal_notification_text(customer_name, phone, company, appointment, staff_name, meet_link)
-    await _log_whatsapp_ai_event(phone, "staff_notification_started", f"appointment_id={appointment_id} staff_phone={staff_phone}")
-    if staff_phone:
-        staff_result = await send_whatsapp_text(staff_phone, staff_message)
+        staff_result = await send_staff_appointment_notification(
+            {**appointment, "name": customer_name, "phone": phone, "service": appointment.get("service") or company or "Appointment"},
+            source=appointment.get("source") or "WhatsApp",
+            update_appointment=False,
+        )
         staff_notified = bool(staff_result.get("success"))
-        if staff_notified:
-            await _log_whatsapp_ai_event(phone, "staff_notification_sent", f"staff_phone={staff_phone}")
-        else:
+        if not staff_notified:
             errors.append(f"staff_whatsapp: {staff_result.get('error') or staff_result.get('reason')}")
-            await _log_whatsapp_ai_event(phone, "staff_notification_failed", staff_result.get("error") or staff_result.get("reason") or "", "error")
-    else:
-        errors.append("staff_whatsapp: missing_staff_whatsapp_number")
-        await _log_whatsapp_ai_event(phone, "staff_notification_failed", "missing_staff_whatsapp_number", "warning")
-
-    telegram_result = await _send_telegram_appointment_notification(staff_message)
-    telegram_notified = bool(telegram_result.get("success"))
-    if not telegram_notified and telegram_result.get("reason") != "telegram_not_configured":
-        errors.append(f"telegram: {telegram_result.get('error') or telegram_result.get('reason')}")
+    except Exception as exc:
+        errors.append(f"staff_whatsapp: {str(exc)[:200]}")
+        await _db().log_error("appointments", "staff_template_failed", f"appointment_id={appointment_id}; error={str(exc)[:500]}", "error")
 
     try:
         from db import update_appointment_notifications

@@ -721,6 +721,24 @@ async def get_all_appointments(date_filter: Optional[str] = None, status_filter:
     return rows
 
 
+async def get_appointment_by_id(appointment_id: str) -> Optional[dict]:
+    appointment_id = (appointment_id or "").strip()
+    if not appointment_id:
+        return None
+    db = await _adb()
+    result = await db.table("appointments").select("*").eq("id", appointment_id).limit(1).execute()
+    row = _safe_row(result)
+    if row:
+        return row
+    if len(appointment_id) >= 4:
+        try:
+            result = await db.table("appointments").select("*").ilike("id", f"{appointment_id}%").limit(1).execute()
+            return _safe_row(result)
+        except Exception:
+            return None
+    return None
+
+
 async def update_appointment_status(appointment_id: str, status: str) -> bool:
     if status not in ("booked", "completed", "no_show", "cancelled", "rescheduled"):
         return False

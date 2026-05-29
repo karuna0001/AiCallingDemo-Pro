@@ -84,3 +84,20 @@
 - Confirm timestamps show local readable format, for example `28 May 2026, 04:32 PM`.
 - Confirm status/error cells have tooltips and short readable error text.
 - Confirm raw provider message ID remains visible and available in the tooltip.
+
+## Staff Appointment WhatsApp Notification
+- In WhatsApp Templates, confirm `staff_appointment_notification_template` is set to `staff_appointment_notification`.
+- In Appointment Staff, confirm the assigned staff row has a valid `whatsapp_number`.
+- Book an appointment through the normal WhatsApp AI booking flow.
+- Expected:
+  - customer receives the existing `appointment_confirmation_template`.
+  - assigned staff receives the `staff_appointment_notification_template`.
+  - template body params are customer name, customer phone, requirement/service, local appointment date/time, and source.
+  - appointment row has `staff_notified=true` and empty `notification_error`.
+  - logs include `staff_notification_started` and `staff_template_sent`.
+- Remove the staff WhatsApp number and book another appointment.
+- Expected: appointment row has `staff_notified=false`, `notification_error` contains the missing phone reason, and logs include `staff_whatsapp_missing`.
+- Clear the staff template setting and book another appointment.
+- Expected: logs include `staff_template_missing` and no free-text staff notification is sent.
+- Resend manually with `POST /api/appointments/{appointment_id}/notify-staff`.
+- Expected: staff receives the same approved template and logs show `staff_template_sent`.
