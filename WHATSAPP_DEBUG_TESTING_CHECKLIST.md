@@ -14,6 +14,8 @@
 - Confirm the response includes:
   - `normalized_phone=+919150151775`
   - a conversation record
+  - `found_active_conversation=true`
+  - `conversation_is_deleted=false`
   - the latest inbound message with `direction=inbound`, `message_type=text`, `message_text=Hi`, and `provider_status=received`
   - the latest outbound AI message with `direction=outbound` and `ai_generated=true`
 - Confirm dashboard WhatsApp Inbox shows the conversation.
@@ -44,6 +46,17 @@
   `Thanks, I received your message. Our team will check and get back shortly.`
 - If provider send fails, confirm the outbound AI message is still saved with `provider_status=failed` and the send error in raw payload.
 - Re-send the same webhook payload or provider message ID and confirm `whatsapp_duplicate_inbound_skipped` appears and no duplicate AI reply is sent.
+
+## Soft-Deleted Conversation Restore
+- Open a WhatsApp conversation in the dashboard and clear/delete it so the row is soft-deleted.
+- Call `GET /api/whatsapp/debug/phone/%2B919150151775` and confirm `found_deleted_conversation=true`.
+- Send a new WhatsApp message from the same phone.
+- Expected:
+  - `whatsapp_conversation_restored` or `whatsapp_conversation_restored_after_conflict` appears in logs.
+  - `found_active_conversation=true`.
+  - `conversation_is_deleted=false`.
+  - inbound message is saved.
+  - AI reply is saved and sent when AI is enabled and the service window is open.
 
 ## Status Webhooks
 - Trigger or wait for read/delivered/failed status updates.

@@ -90,7 +90,7 @@ from whatsapp import (
     get_or_create_conversation, update_conversation_last_message,
     soft_delete_whatsapp_message, soft_delete_whatsapp_conversation,
     parse_webhook_messages, handle_inbound_whatsapp_message,
-    get_whatsapp_message_activity,
+    get_conversations_by_phone, get_whatsapp_message_activity,
     fetch_whatsapp_media,
     get_whatsapp_gemini_model,
     run_due_appointment_reminders,
@@ -1937,10 +1937,10 @@ async def api_wa_debug_phone(phone: str):
         normalized = normalize_phone(unquote(phone))
     except Exception:
         normalized = unquote(phone)
-    convs = await get_conversations(search=normalized, limit=20)
-    conversation = next((c for c in convs if c.get("phone_number") == normalized), None)
-    if not conversation and convs:
-        conversation = convs[0]
+    all_matches = await get_conversations_by_phone(normalized, include_deleted=True, limit=20)
+    active_matches = [c for c in all_matches if not c.get("is_deleted")]
+    deleted_matches = [c for c in all_matches if c.get("is_deleted")]
+    conversation = active_matches[0] if active_matches else (all_matches[0] if all_matches else None)
     messages = []
     if conversation and conversation.get("id"):
         messages = await get_messages(conversation["id"], limit=20)
@@ -1957,7 +1957,11 @@ async def api_wa_debug_phone(phone: str):
             break
     return {
         "normalized_phone": normalized,
+        "found_active_conversation": bool(active_matches),
+        "found_deleted_conversation": bool(deleted_matches),
+        "conversation_is_deleted": bool(conversation and conversation.get("is_deleted")),
         "conversation": conversation,
+        "conversation_matches": all_matches,
         "messages": messages,
         "whatsapp_logs": wa_logs,
         "error_logs": error_logs,
