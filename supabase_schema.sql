@@ -92,6 +92,9 @@ ALTER TABLE appointments ADD COLUMN IF NOT EXISTS telegram_reminder_sent_at TEXT
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_error TEXT NOT NULL DEFAULT '';
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_processed BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_processed_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS meet_link TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS google_meet_link TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS calendar_event_id TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_appointments_staff ON appointments(staff_id);
 CREATE INDEX IF NOT EXISTS idx_appointments_date_time ON appointments(date, time);
 CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);
@@ -101,7 +104,14 @@ CREATE TABLE IF NOT EXISTS appointment_staff (
     name TEXT NOT NULL,
     email TEXT NOT NULL DEFAULT '',
     whatsapp_number TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT 'sales',
     calendar_email TEXT NOT NULL DEFAULT '',
+    google_calendar_id TEXT NOT NULL DEFAULT '',
+    google_calendar_connected BOOLEAN NOT NULL DEFAULT false,
+    google_meet_enabled BOOLEAN NOT NULL DEFAULT false,
+    calendar_sync_error TEXT NOT NULL DEFAULT '',
+    last_calendar_sync_at TEXT,
+    notes TEXT NOT NULL DEFAULT '',
     working_days TEXT NOT NULL DEFAULT '["mon","tue","wed","thu","fri","sat"]',
     start_time TEXT NOT NULL DEFAULT '09:00',
     end_time TEXT NOT NULL DEFAULT '18:00',
@@ -112,6 +122,13 @@ CREATE TABLE IF NOT EXISTS appointment_staff (
     updated_at TEXT NOT NULL
 );
 ALTER TABLE appointment_staff DISABLE ROW LEVEL SECURITY;
+ALTER TABLE appointment_staff ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'sales';
+ALTER TABLE appointment_staff ADD COLUMN IF NOT EXISTS google_calendar_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointment_staff ADD COLUMN IF NOT EXISTS google_calendar_connected BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE appointment_staff ADD COLUMN IF NOT EXISTS google_meet_enabled BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE appointment_staff ADD COLUMN IF NOT EXISTS calendar_sync_error TEXT NOT NULL DEFAULT '';
+ALTER TABLE appointment_staff ADD COLUMN IF NOT EXISTS last_calendar_sync_at TEXT;
+ALTER TABLE appointment_staff ADD COLUMN IF NOT EXISTS notes TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_appointment_staff_active ON appointment_staff(active);
 CREATE INDEX IF NOT EXISTS idx_appointment_staff_order ON appointment_staff(round_robin_order);
 
@@ -270,7 +287,21 @@ INSERT INTO settings (key, value, updated_at) VALUES
 ('FOLLOWUP_STOP_ON_WRONG_NUMBER', 'true', now()::text),
 ('APPOINTMENT_TELEGRAM_REMINDER_ENABLED', '0', now()::text),
 ('staff_appointment_notification_template', 'staff_appointment_notification', now()::text),
-('staff_appointment_reminder_template', 'staff_appointment_reminder', now()::text)
+('staff_appointment_reminder_template', 'staff_appointment_reminder', now()::text),
+('GOOGLE_CALENDAR_ENABLED', 'false', now()::text),
+('GOOGLE_MEET_ENABLED', 'false', now()::text),
+('GOOGLE_CALENDAR_SERVICE_ACCOUNT_JSON', '', now()::text),
+('GOOGLE_CALENDAR_DEFAULT_TIMEZONE', 'Asia/Kolkata', now()::text),
+('GOOGLE_CALENDAR_FALLBACK_TO_INTERNAL', 'true', now()::text),
+('AUTH_ENABLED', 'false', now()::text),
+('ADMIN_API_KEY', '', now()::text),
+('WEBHOOK_VERIFY_TOKEN', '', now()::text),
+('COST_GEMINI_VOICE_PER_MINUTE', '0', now()::text),
+('COST_SIP_PER_MINUTE', '0', now()::text),
+('COST_RECORDING_PER_MINUTE', '0', now()::text),
+('COST_WHATSAPP_TEMPLATE', '0', now()::text),
+('COST_WHATSAPP_FREE_TEXT', '0', now()::text),
+('COST_CURRENCY', 'INR', now()::text)
 ON CONFLICT (key) DO NOTHING;
 
 -- ── Phase 8: WhatsApp Chat Inbox ──────────────────────────────────────────────

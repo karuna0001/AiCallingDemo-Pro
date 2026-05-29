@@ -40,7 +40,7 @@ ssl.create_default_context = _certifi_ssl
 from db import (
     ConfigError, CRM_TERMINAL_STATUSES, DuplicateContactError,
     cancel_appointment, clear_all_test_data, clear_appointments,
-    delete_appointment_staff, get_appointment_settings, get_appointment_staff,
+    activate_appointment_staff, deactivate_appointment_staff, delete_appointment_staff, get_appointment_settings, get_appointment_staff,
     update_appointment_status, update_appointment_notes, reschedule_appointment,
     clear_call_logs, clear_campaigns, clear_contact_memory, clear_error_logs,
     clear_errors, create_agent_profile, create_campaign, delete_agent_profile,
@@ -179,6 +179,16 @@ def _admin_config_error() -> Optional[str]:
     return None
 
 
+async def _auth_enabled() -> bool:
+    raw = os.getenv("AUTH_ENABLED", "")
+    if not raw:
+        try:
+            raw = await get_setting("AUTH_ENABLED", "false")
+        except Exception:
+            raw = "false"
+    return str(raw or "false").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
 def _b64encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
@@ -221,9 +231,14 @@ def _request_is_https(request: Request) -> bool:
 
 @app.middleware("http")
 async def _admin_auth_middleware(request: Request, call_next):
-    if request.url.path.startswith("/api/") and (request.method, request.url.path) not in PUBLIC_API_ROUTES:
-        if not _read_session(request):
-            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    if await _auth_enabled():
+        if request.url.path.startswith("/api/") and (request.method, request.url.path) not in PUBLIC_API_ROUTES:
+            api_key = request.headers.get("x-api-key") or request.query_params.get("api_key") or ""
+            expected = await get_setting("ADMIN_API_KEY", "")
+            if expected and hmac.compare_digest(api_key, expected):
+                return await call_next(request)
+            if not _read_session(request):
+                return JSONResponse(status_code=401, content={"error": "Unauthorized"})
     return await call_next(request)
 
 
@@ -691,7 +706,12 @@ class AppointmentStaffRequest(BaseModel):
     name: str
     email: Optional[str] = ""
     whatsapp_number: Optional[str] = ""
+    role: Optional[str] = "sales"
     calendar_email: Optional[str] = ""
+    google_calendar_id: Optional[str] = ""
+    google_calendar_connected: Optional[bool] = False
+    google_meet_enabled: Optional[bool] = False
+    notes: Optional[str] = ""
     working_days: Optional[list] = None
     start_time: Optional[str] = "09:00"
     end_time: Optional[str] = "18:00"
@@ -733,6 +753,8 @@ async def api_auth_login(req: AuthRequest, request: Request):
 
 @app.get("/api/auth/me")
 async def api_auth_me(request: Request):
+    if not await _auth_enabled():
+        return {"authenticated": True, "username": "local", "configured": True, "auth_enabled": False}
     config_error = _admin_config_error()
     username = _read_session(request)
     payload = {"authenticated": bool(username), "username": username if username else None}
@@ -749,6 +771,21 @@ async def api_auth_logout(request: Request):
     response = JSONResponse(content={"success": True})
     response.delete_cookie(SESSION_COOKIE_NAME, path="/", samesite="lax", secure=_request_is_https(request))
     return response
+
+
+@app.get("/api/security/health")
+async def api_security_health():
+    auth_enabled = await _auth_enabled()
+    api_key_configured = bool(await get_setting("ADMIN_API_KEY", ""))
+    webhook_token_configured = bool(await get_setting("WEBHOOK_VERIFY_TOKEN", await get_setting("WHATSAPP_VERIFY_TOKEN", "")))
+    return {
+        "auth_enabled": auth_enabled,
+        "admin_session_configured": not bool(_admin_config_error()),
+        "admin_api_key_configured": api_key_configured,
+        "webhook_verify_token_configured": webhook_token_configured,
+        "health_secret_leak_check": "ok",
+        "meta_webhook_signature_verification": "placeholder",
+    }
 
 
 @app.get("/api/health")
@@ -842,12 +879,18 @@ async def api_health():
     appointment_timezone = clean_timezone(appointment_timezone_raw, app_timezone)
     whatsapp_display_timezone_raw, _ = await setting_value_with_source("WHATSAPP_DISPLAY_TIMEZONE", app_timezone)
     whatsapp_display_timezone = clean_timezone(whatsapp_display_timezone_raw, app_timezone)
+    google_calendar_enabled = (await get_setting("GOOGLE_CALENDAR_ENABLED", "false") or "false").lower() in {"1", "true", "yes", "on"}
+    google_meet_enabled = (await get_setting("GOOGLE_MEET_ENABLED", "false") or "false").lower() in {"1", "true", "yes", "on"}
+    google_calendar_fallback = (await get_setting("GOOGLE_CALENDAR_FALLBACK_TO_INTERNAL", "true") or "true").lower() in {"1", "true", "yes", "on"}
     supabase_configured, supabase_error = await supabase_status(supabase_url, supabase_key)
     response = {
         "status": "ok",
         "app_timezone": app_timezone,
         "appointment_timezone": appointment_timezone,
         "whatsapp_display_timezone": whatsapp_display_timezone,
+        "google_calendar_enabled": google_calendar_enabled,
+        "google_meet_enabled": google_meet_enabled,
+        "google_calendar_fallback_to_internal": google_calendar_fallback,
         "livekit_configured": bool(livekit_url and livekit_key and livekit_secret),
         "gemini_configured": bool(google_key),
         "supabase_configured": supabase_configured,
@@ -872,6 +915,7 @@ async def api_health():
         "fixed_greeting_reason": fixed_greeting_reason,
         "recording_auto_delete_enabled": recording_auto_delete,
         "recording_retention_days": recording_retention_days,
+        "auth_enabled": await _auth_enabled(),
     }
     if supabase_error:
         response["supabase_error"] = supabase_error
@@ -1306,6 +1350,11 @@ async def api_get_appointment_staff(include_inactive: bool = True):
     return {"staff": await get_appointment_staff(include_inactive=include_inactive)}
 
 
+@app.get("/api/appointment-staff")
+async def api_get_appointment_staff_alias(include_inactive: bool = True):
+    return await api_get_appointment_staff(include_inactive=include_inactive)
+
+
 @app.post("/api/appointments/staff")
 async def api_create_appointment_staff(req: AppointmentStaffRequest):
     try:
@@ -1313,6 +1362,11 @@ async def api_create_appointment_staff(req: AppointmentStaffRequest):
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"success": True, "staff": staff}
+
+
+@app.post("/api/appointment-staff")
+async def api_create_appointment_staff_alias(req: AppointmentStaffRequest):
+    return await api_create_appointment_staff(req)
 
 
 @app.put("/api/appointments/staff/{staff_id}")
@@ -1324,12 +1378,68 @@ async def api_update_appointment_staff(staff_id: str, req: AppointmentStaffReque
     return {"success": True, "staff": staff}
 
 
+@app.patch("/api/appointment-staff/{staff_id}")
+async def api_patch_appointment_staff_alias(staff_id: str, req: AppointmentStaffRequest):
+    return await api_update_appointment_staff(staff_id, req)
+
+
 @app.delete("/api/appointments/staff/{staff_id}")
 async def api_delete_appointment_staff(staff_id: str):
     result = await delete_appointment_staff(staff_id)
     if not (result.get("deleted") or result.get("deactivated")):
         raise HTTPException(404, "Staff member not found")
     return {"success": True, **result}
+
+
+@app.delete("/api/appointment-staff/{staff_id}")
+async def api_delete_appointment_staff_alias(staff_id: str):
+    return await api_delete_appointment_staff(staff_id)
+
+
+@app.post("/api/appointment-staff/{staff_id}/activate")
+async def api_activate_appointment_staff(staff_id: str):
+    ok = await activate_appointment_staff(staff_id)
+    if not ok:
+        raise HTTPException(404, "Staff member not found")
+    return {"success": True, "active": True}
+
+
+@app.post("/api/appointment-staff/{staff_id}/deactivate")
+async def api_deactivate_appointment_staff(staff_id: str):
+    ok = await deactivate_appointment_staff(staff_id)
+    if not ok:
+        raise HTTPException(404, "Staff member not found")
+    return {"success": True, "active": False}
+
+
+@app.get("/api/calendar/health")
+async def api_calendar_health():
+    enabled = (await get_setting("GOOGLE_CALENDAR_ENABLED", "false") or "false").lower() in {"1", "true", "yes", "on"}
+    meet_enabled = (await get_setting("GOOGLE_MEET_ENABLED", "false") or "false").lower() in {"1", "true", "yes", "on"}
+    service_json = await get_setting("GOOGLE_CALENDAR_SERVICE_ACCOUNT_JSON", "")
+    fallback = (await get_setting("GOOGLE_CALENDAR_FALLBACK_TO_INTERNAL", "true") or "true").lower() in {"1", "true", "yes", "on"}
+    timezone_name = await get_setting("GOOGLE_CALENDAR_DEFAULT_TIMEZONE", "Asia/Kolkata")
+    staff = await get_appointment_staff(include_inactive=True)
+    return {
+        "google_calendar_enabled": enabled,
+        "google_meet_enabled": meet_enabled,
+        "service_account_configured": bool(service_json),
+        "timezone": timezone_name,
+        "fallback_to_internal": fallback,
+        "staff_calendar_status": [
+            {
+                "id": s.get("id"),
+                "name": s.get("name"),
+                "active": s.get("active"),
+                "google_calendar_id": s.get("google_calendar_id") or s.get("calendar_email") or "",
+                "google_calendar_connected": bool(s.get("google_calendar_connected")),
+                "google_meet_enabled": bool(s.get("google_meet_enabled")),
+                "calendar_sync_error": s.get("calendar_sync_error") or "",
+                "last_calendar_sync_at": s.get("last_calendar_sync_at") or "",
+            }
+            for s in staff
+        ],
+    }
 
 
 @app.post("/api/appointments/{appointment_id}/notify-staff")
