@@ -304,6 +304,11 @@ class AppointmentTools(llm.ToolContext):
                         source_type="followup_tool",
                         source_id=self.phone_number,
                         template_purpose=template_purpose,
+                        template_context={
+                            "customer_name": self.lead_name or "there",
+                            "phone": self.phone_number,
+                            "service_type": details_type,
+                        },
                     )
                     await _log("followup_details_whatsapp_path", f"phone={self.phone_number}; path=template_24h_window_closed; template_purpose={template_purpose}")
                 else:

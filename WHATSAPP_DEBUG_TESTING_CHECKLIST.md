@@ -107,3 +107,9 @@
 - Expected: logs include `staff_template_missing` and no free-text staff notification is sent.
 - Resend manually with `POST /api/appointments/{appointment_id}/notify-staff`.
 - Expected: staff receives the same approved template and logs show `staff_template_sent`.
+
+## Live Template Parameter Mapping
+- Trigger a live `no_response_followup` and confirm `no_response_followup_template` sends without `#132000`.
+- Trigger a live `demo_reminder` and confirm `reminder_template` sends without `#132000`.
+- Book an appointment and confirm `appointment_confirmation_template` sends without `#132000`.
+- Cause a parameter-related template failure, retry the same phone, template, and event within six hours, and confirm `whatsapp_template_failure_cooldown_active` is logged without another Meta send.
