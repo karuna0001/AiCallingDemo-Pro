@@ -330,7 +330,18 @@ async def run_due_followup_actions() -> dict:
                     wa_result = await send_whatsapp_text(phone, message)
                     await log_error("followup", "followup_whatsapp_path", f"id={action_id}; phone={phone}; path=free_text_24h_window_open", "info")
                 elif template:
-                    wa_result = await send_whatsapp_template(phone, template, "en", [], event_type=action.get("event_type") or "followup", source_type="followup_actions", source_id=action_id, template_purpose=template_purpose)
+                    wa_result = await send_whatsapp_template(
+                        phone, template, "en", [],
+                        event_type=action.get("event_type") or "followup",
+                        source_type="followup_actions", source_id=action_id,
+                        template_purpose=template_purpose,
+                        template_context={
+                            **state,
+                            **payload,
+                            "customer_name": state.get("lead_name") or action.get("lead_name") or "there",
+                            "phone": phone,
+                        },
+                    )
                     await log_error("followup", "followup_whatsapp_path", f"id={action_id}; phone={phone}; path=template; template_purpose={template_purpose}; service_window_open={str(service_window_open).lower()}", "info")
                 else:
                     wa_result = {"success": False, "error": "outside_24h_window_template_missing" if not service_window_open else "template_missing", "reason": "template_missing"}
@@ -1746,18 +1757,13 @@ async def api_post_appointment_no_show(appointment_id: str, req: AppointmentActi
 async def _send_appointment_reminder_now(appointment: dict) -> dict:
     appointment_id = str(appointment.get("id") or "")
     phone = appointment.get("phone") or ""
-    customer_params = [
-        appointment.get("name") or "there",
-        f"{appointment.get('date')} {str(appointment.get('time') or '')[:5]}",
-        appointment.get("service") or "demo",
-    ]
-    staff_params = [
-        appointment.get("name") or "Customer",
-        phone,
-        appointment.get("service") or "demo",
-        f"{appointment.get('date')} {str(appointment.get('time') or '')[:5]}",
-        appointment.get("source") or "CRM",
-    ]
+    template_context = {
+        **appointment,
+        "customer_name": appointment.get("name") or "there",
+        "customer_phone": phone,
+        "appointment_date": appointment.get("date") or "",
+        "appointment_time": str(appointment.get("time") or "")[:5],
+    }
     updates = {"reminder_processed": True, "reminder_processed_at": datetime.now().isoformat()}
     result = {"customer": None, "staff": None}
     errors = []
@@ -1766,9 +1772,10 @@ async def _send_appointment_reminder_now(appointment: dict) -> dict:
         if template and phone:
             result["customer"] = await send_whatsapp_template(
                 phone, template, await get_setting("WHATSAPP_DEFAULT_LANGUAGE", "en"),
-                customer_params, event_type="appointment_reminder",
+                [], event_type="appointment_reminder",
                 source_type="appointments", source_id=appointment_id,
                 template_purpose="reminder_template",
+                template_context=template_context,
             )
             if result["customer"].get("success"):
                 updates["customer_reminder_sent"] = True
@@ -1791,9 +1798,10 @@ async def _send_appointment_reminder_now(appointment: dict) -> dict:
             if staff_template:
                 result["staff"] = await send_whatsapp_template(
                     staff_phone, staff_template, await get_setting("WHATSAPP_DEFAULT_LANGUAGE", "en"),
-                    staff_params, event_type="staff_appointment_reminder",
+                    [], event_type="staff_appointment_reminder",
                     source_type="appointments", source_id=appointment_id,
                     template_purpose="staff_appointment_reminder_template",
+                    template_context=template_context,
                 )
                 if result["staff"].get("success"):
                     updates["staff_reminder_sent"] = True
@@ -4134,10 +4142,6 @@ async def api_start_broadcast_campaign(campaign_id: str, req: BroadcastStartRequ
             skipped += 1
             continue
         recipient_id = str(uuid.uuid4())
-        params = [
-            lead.get("lead_name") or "there",
-            lead.get("service_type") or lead.get("requirement") or "our service",
-        ]
         recipient = {
             "id": recipient_id,
             "campaign_id": campaign_id,
@@ -4150,9 +4154,10 @@ async def api_start_broadcast_campaign(campaign_id: str, req: BroadcastStartRequ
             await db.table("broadcast_recipients").insert(recipient).execute()
             result = await send_whatsapp_template(
                 phone, template_name, await get_setting("WHATSAPP_DEFAULT_LANGUAGE", "en"),
-                params, event_type="broadcast_campaign",
+                [], event_type="broadcast_campaign",
                 source_type="broadcast_campaigns", source_id=campaign_id,
                 template_purpose=campaign.get("template_purpose") or "",
+                template_context={**lead, "customer_name": lead.get("lead_name") or "there", "phone": phone},
             )
             status = "sent" if result.get("success") else "failed"
             if status == "sent":
@@ -4220,19 +4225,13 @@ async def _notify_handoff_staff(staff: dict, contact: dict, reason: str) -> dict
     if not template:
         await log_error("handoff", "staff_template_missing", "purpose=staff_handoff_notification_template", "warning")
         return {"success": False, "reason": "staff_template_missing"}
-    params = [
-        contact.get("lead_name") or "Customer",
-        contact.get("phone_number") or "",
-        contact.get("service_type") or contact.get("requirement") or "Lead follow-up",
-        reason or "human_handoff",
-        contact.get("source") or "CRM",
-    ]
     await log_error("handoff", "staff_notification_started", f"staff_id={staff.get('id')}; phone={contact.get('phone_number')}", "info")
     result = await send_whatsapp_template(
         phone, template, await get_setting("WHATSAPP_DEFAULT_LANGUAGE", "en"),
-        params, event_type="human_handoff",
+        [], event_type="human_handoff",
         source_type="crm_contacts", source_id=contact.get("phone_number") or "",
         template_purpose="staff_handoff_notification_template",
+        template_context={**contact, "customer_name": contact.get("lead_name") or "Customer", "customer_phone": contact.get("phone_number") or "", "reason": reason or "human_handoff"},
     )
     await log_error("handoff", "staff_template_sent" if result.get("success") else "staff_template_failed", f"staff_id={staff.get('id')}; result={result.get('reason') or result.get('error') or result.get('status')}", "info" if result.get("success") else "warning")
     return result

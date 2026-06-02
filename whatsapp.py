@@ -408,6 +408,7 @@ async def send_whatsapp_template(
     source_type: str = "",
     source_id: str = "",
     template_purpose: str = "",
+    template_context: Optional[dict] = None,
 ) -> dict:
     """Send an approved WhatsApp template message via Meta Cloud API.
 
@@ -426,6 +427,52 @@ async def send_whatsapp_template(
         result = {"success": False, "provider_message_id": None, "error": "template_name is required", "reason": "template_missing"}
         await log_and_record("failed", None, "template_name is required")
         return result
+
+    purpose = await _template_purpose_for_send(template_purpose, template_name)
+    if purpose:
+        context = _template_context_from_legacy_params(purpose, parameters)
+        context.update(template_context or {})
+        built = await build_template_params(purpose, context)
+        template_name = built["template_name"] or template_name
+        language = built["language"] or language
+        parameters = built["params"]
+        expected_count = await get_template_expected_param_count(purpose)
+        actual_count = len(parameters)
+        await _db().log_error(
+            "whatsapp_template",
+            "whatsapp_template_send_prepared",
+            (
+                f"phone={_mask_phone(phone)}; event={event_type}; source={source_type}; "
+                f"template_purpose={purpose}; template_name={template_name}; "
+                f"params_count={actual_count}; expected_count={expected_count}"
+            ),
+            "info",
+        )
+        failure_cooldown = await _template_failure_cooldown_check(phone, event_type, template_name)
+        if failure_cooldown.get("active"):
+            await _db().log_error(
+                "whatsapp_template",
+                "whatsapp_template_failure_cooldown_active",
+                f"phone={_mask_phone(phone)}; event={event_type}; source={source_type}; template_name={template_name}; cooldown_until={failure_cooldown.get('cooldown_until')}",
+                "warning",
+            )
+            return {
+                "success": False,
+                "provider_message_id": None,
+                "error": "whatsapp_template_failure_cooldown_active",
+                "reason": "failure_cooldown_active",
+                "cooldown_until": failure_cooldown.get("cooldown_until"),
+            }
+        if expected_count != actual_count:
+            err = f"template_param_mismatch expected={expected_count} actual={actual_count}"
+            await log_and_record("failed", None, err)
+            await _db().log_error(
+                "whatsapp_template",
+                "whatsapp_template_param_mismatch",
+                f"phone={_mask_phone(phone)}; event={event_type}; source={source_type}; template_purpose={purpose}; template_name={template_name}; {err}",
+                "warning",
+            )
+            return {"success": False, "provider_message_id": None, "error": err, "reason": "template_param_mismatch"}
 
     cooldown_minutes = _template_cooldown_minutes(event_type, template_name, template_purpose)
     if cooldown_minutes and not _template_cooldown_bypassed(source_type, event_type):
@@ -537,7 +584,7 @@ async def send_whatsapp_template(
                     err_msg = str(error_data.get("message", "") if isinstance(error_data, dict) else error_data)[:500]
                     if "132000" in err_msg or "Number of parameters" in err_msg:
                         purpose = _template_purpose_key(template_purpose)
-                        expected = WA_TEMPLATE_PARAM_COUNTS.get(purpose)
+                        expected = await get_template_expected_param_count(purpose)
                         sent = len(parameters or [])
                         detail = f" sent_params={sent}"
                         if expected is not None:
@@ -660,6 +707,42 @@ def _meta_error_reason(error_message: str) -> tuple[str, str]:
             "Meta restricted this template delivery for this recipient. Try after customer replies or use another approved template.",
         )
     return "provider_error", raw[:500]
+
+
+def _mask_phone(phone: str) -> str:
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    return f"***{digits[-4:]}" if len(digits) > 4 else digits
+
+
+async def _template_failure_cooldown_check(phone: str, event_type: str, template_name: str) -> dict:
+    if not (phone and template_name):
+        return {"active": False}
+    cutoff = (datetime.now() - timedelta(hours=6)).isoformat()
+    try:
+        db = await _db()._adb()
+        res = await db.table("whatsapp_logs") \
+            .select("*") \
+            .eq("phone_number", phone) \
+            .eq("event_type", event_type or "") \
+            .eq("template_name", template_name) \
+            .eq("status", "failed") \
+            .gte("created_at", cutoff) \
+            .order("created_at", desc=True) \
+            .limit(10) \
+            .execute()
+        for row in res.data or []:
+            error = str(row.get("error_message") or "")
+            lower = error.lower()
+            if "template_param_mismatch" not in lower and "132000" not in lower and not ("#100" in lower and "invalid parameter" in lower):
+                continue
+            try:
+                base = datetime.fromisoformat(str(row.get("created_at") or "").replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                base = datetime.now()
+            return {"active": True, "cooldown_until": (base + timedelta(hours=6)).isoformat()}
+    except Exception as exc:
+        logger.warning("whatsapp_template_failure_cooldown_check failed: %s", exc)
+    return {"active": False}
 
 
 def _template_cooldown_minutes(event_type: str, template_name: str, template_purpose: str = "") -> int:
@@ -1093,6 +1176,16 @@ def _template_purpose_key(purpose_or_name: str) -> str:
     return _WA_LEGACY_KEY_MAP.get(purpose_or_name, "")
 
 
+async def _template_purpose_for_send(template_purpose: str, template_name: str) -> str:
+    purpose = _template_purpose_key(template_purpose or template_name)
+    if purpose:
+        return purpose
+    for candidate, _ in WA_TEMPLATE_PURPOSES:
+        if template_name and template_name == await resolve_wa_template(candidate):
+            return candidate
+    return ""
+
+
 async def execute_automation_rule(
     event_type: str,
     contact: dict,
@@ -1293,6 +1386,26 @@ async def build_template_params(template_purpose: str, context: Optional[dict] =
         "language": language,
         "params": params,
     }
+
+
+def _template_context_from_legacy_params(template_purpose: str, parameters: Optional[list]) -> dict:
+    values = list(parameters or [])
+    context = {}
+    purpose_fields = {
+        "no_response_followup_template": ["customer_name", "business_name", "service_type"],
+        "reminder_template": ["customer_name", "appointment_date", "appointment_time", "business_name"],
+        "appointment_confirmation_template": ["customer_name", "business_name", "appointment_date", "appointment_time"],
+        "staff_appointment_notification_template": ["customer_name", "customer_phone", "service_type", "appointment_datetime", "source"],
+        "staff_appointment_reminder_template": ["customer_name", "customer_phone", "service_type", "appointment_datetime", "source"],
+        "re_enquiry_followup_template": ["customer_name", "business_name", "service_type"],
+        "callback_confirmation_template": ["customer_name", "service_type", "appointment_date", "appointment_time"],
+        "welcome_template": ["customer_name", "business_name", "service_type"],
+        "missed_call_template": ["customer_name", "business_name", "service_type"],
+        "staff_handoff_notification_template": ["customer_name", "customer_phone", "reason", "source", "service_type"],
+    }
+    for key, value in zip(purpose_fields.get(template_purpose, []), values):
+        context[key] = value
+    return context
 
 
 def _build_template_params(purpose_or_name: str, contact: Optional[dict], context: Optional[dict] = None) -> list:
@@ -3266,6 +3379,14 @@ async def send_staff_appointment_notification(appointment: dict, *, source: str 
         source_type="appointment",
         source_id=appointment_id or customer_phone,
         template_purpose="staff_appointment_notification_template",
+        template_context={
+            **appointment,
+            "customer_name": customer_name,
+            "customer_phone": customer_phone,
+            "service_type": service,
+            "appointment_datetime": _format_appointment_datetime_for_staff(appointment),
+            "source": source_label,
+        },
     )
     if result.get("success"):
         await _db().log_error("appointments", "staff_template_sent", f"appointment_id={appointment_id}; staff_phone={staff_phone}; template={template}", "info")
@@ -3302,6 +3423,13 @@ async def _notify_appointment_booked(phone: str, appointment: dict, customer_nam
                 source_type="whatsapp_ai",
                 source_id=appointment_id or phone,
                 template_purpose="appointment_confirmation_template",
+                template_context={
+                    **appointment,
+                    "customer_name": customer_name,
+                    "business_name": company or "your business",
+                    "appointment_date": appointment.get("date"),
+                    "appointment_time": appointment.get("time"),
+                },
             )
             confirmation_sent = bool(result.get("success"))
             if confirmation_sent:
@@ -4046,6 +4174,13 @@ async def run_due_appointment_reminders() -> None:
                         source_type="whatsapp_ai",
                         source_id=appt_id or phone,
                         template_purpose=template_purpose,
+                        template_context={
+                            **appt,
+                            "customer_name": customer_name,
+                            "appointment_date": date_s,
+                            "appointment_time": time_s,
+                            "staff_name": staff_name,
+                        },
                     )
                     if result.get("success"):
                         updates["customer_reminder_sent"] = True
@@ -4098,6 +4233,14 @@ async def run_due_appointment_reminders() -> None:
                             source_type="appointment",
                             source_id=appt_id or phone,
                             template_purpose=staff_template_purpose,
+                            template_context={
+                                **appt,
+                                "customer_name": customer_name,
+                                "customer_phone": phone,
+                                "appointment_datetime": _format_appointment_datetime_for_staff(appt),
+                                "appointment_date": date_s,
+                                "appointment_time": time_s,
+                            },
                         )
                     elif await is_whatsapp_service_window_open(staff_phone):
                         staff_result = await send_whatsapp_text(staff_phone, staff_msg)
