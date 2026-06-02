@@ -87,8 +87,8 @@ Run this checklist on the deployed branch before merging into the stable product
 - Confirm approved template is used, parameter count is logged, and no Telegram path runs.
 
 ## 22. Kanban Status Move
-- Move a lead in Pipeline/Kanban.
-- Confirm CRM `journey_stage` and `crm_status` update.
+- Drag a lead card between Pipeline/Kanban columns.
+- Confirm CRM `journey_stage` and `crm_status` update and the card refreshes in the target column.
 
 ## 23. Tags/Custom Fields
 - Add and remove tags in a CRM lead.
@@ -117,6 +117,8 @@ Run this checklist on the deployed branch before merging into the stable product
 ## 29. Supabase Schema Check
 - Apply `supabase_schema.sql` to a test database.
 - Confirm all `CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD COLUMN IF NOT EXISTS`, indexes, and settings inserts run safely.
+- Open `/api/schema/health` and confirm `ok=true` with no missing tables.
+- If schema health reports missing `broadcast_campaigns` or another table, run the latest `supabase_schema.sql`, wait 30 seconds or reload the Supabase API to refresh the PostgREST schema cache, then re-test `/api/schema/health`.
 
 ## 30. Final Merge Readiness
 - Run `python -m py_compile server.py whatsapp.py db.py tools.py prompts.py followup.py agent.py`.

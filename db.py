@@ -1,3 +1,4 @@
+import asyncio
 import json as _json_mod
 import logging
 import os
@@ -859,6 +860,7 @@ async def insert_appointment(name: str, phone: str, date: str, time: str, servic
             f"phone={phone}; date={date}; time={time[:5]}; existing_id={existing.get('id')}; staff_id={existing.get('staff_id') or ''}",
             "warning",
         )
+        await update_lead_journey(phone, crm_stage_updates("demo_booked"))
         return str(existing.get("id") or "")[:8].upper()
     staff = await _select_staff_round_robin(start)
     if not staff and await get_appointment_staff(include_inactive=True):
@@ -894,6 +896,7 @@ async def insert_appointment(name: str, phone: str, date: str, time: str, servic
         await db.table("appointments").insert(fallback).execute()
     if staff:
         await set_setting("APPOINTMENT_LAST_STAFF_ID", staff["id"])
+    await update_lead_journey(phone, crm_stage_updates("demo_booked"))
     return full_id[:8].upper()
 
 
@@ -985,9 +988,13 @@ async def update_appointment_status(appointment_id: str, status: str) -> bool:
     if status in ("completed", "no_show", "cancelled", "rescheduled"):
         updates["reminder_processed"] = True
 
+    appointment = await get_appointment_by_id(appointment_id)
     db = await _adb()
     result = await db.table("appointments").update(updates).eq("id", appointment_id).execute()
-    return len(result.data or []) > 0
+    ok = len(result.data or []) > 0
+    if ok and status == "completed" and appointment:
+        await update_lead_journey(appointment.get("phone") or appointment.get("phone_number") or "", crm_stage_updates("demo_done"))
+    return ok
 
 
 async def update_appointment_notes(appointment_id: str, notes: str) -> bool:
@@ -1395,6 +1402,57 @@ CRM_DUE_TODAY_STATUSES = {
     "No Answer", "Busy", "Interested",
 }
 
+CRM_PIPELINE_STAGES = {
+    "new_lead", "contacted", "interested", "callback_requested",
+    "demo_booked", "demo_done", "converted", "not_interested", "lost",
+}
+CRM_PIPELINE_STAGE_ALIASES = {
+    "new": "new_lead",
+    "pending_call": "new_lead",
+    "hot_lead": "interested",
+    "quote_given": "interested",
+    "quotation_sent": "interested",
+    "details_requested": "interested",
+    "details_sent": "interested",
+    "demo_requested": "interested",
+    "appointment_booked": "demo_booked",
+    "booked": "demo_booked",
+    "completed": "demo_done",
+    "closed_won": "converted",
+    "closed_lost": "lost",
+    "wrong_number": "lost",
+    "invalid_number": "lost",
+    "do_not_contact": "lost",
+}
+CRM_PIPELINE_NEXT_ACTIONS = {
+    "callback_requested": "call_customer",
+    "demo_booked": "demo_reminder",
+    "demo_done": "post_demo_followup",
+    "converted": "",
+    "not_interested": "",
+    "lost": "",
+}
+CRM_PIPELINE_TERMINAL_STAGES = {"converted", "not_interested", "lost"}
+
+
+def canonical_crm_stage(stage: str) -> Optional[str]:
+    slug = re.sub(r"[^a-z0-9]+", "_", (stage or "").strip().lower()).strip("_")
+    if slug in CRM_PIPELINE_STAGES:
+        return slug
+    return CRM_PIPELINE_STAGE_ALIASES.get(slug)
+
+
+def crm_stage_updates(stage: str) -> dict:
+    canonical = canonical_crm_stage(stage)
+    if not canonical:
+        raise ValueError(f"Unsupported CRM pipeline stage: {stage}")
+    updates = {"crm_status": canonical, "journey_stage": canonical}
+    if canonical in CRM_PIPELINE_NEXT_ACTIONS:
+        updates["next_best_action"] = CRM_PIPELINE_NEXT_ACTIONS[canonical]
+    if canonical in CRM_PIPELINE_TERMINAL_STAGES:
+        updates["stop_automation"] = True
+    return updates
+
 
 def _tz_today(timezone_name: Optional[str] = None) -> str:
     """Return today's date as YYYY-MM-DD in the given IANA timezone (or local)."""
@@ -1433,22 +1491,41 @@ async def get_crm_contacts(
     assigned_to: Optional[str] = None,
     recording_available: Optional[bool] = None,
     has_followup: Optional[bool] = None,
+    warnings: Optional[list] = None,
 ) -> list:
-    try:
-        db = await _adb()
-        query = db.table("crm_contacts").select("*").order("updated_at", desc=True)
-        if status:
-            query = query.eq("crm_status", status)
-        if outcome:
-            query = query.eq("last_call_outcome", outcome)
-        result = await query.execute()
-        rows = result.data or []
-    except Exception as exc:
-        await log_error("server", "CRM contacts unavailable, falling back to call logs", str(exc), "warning")
-        rows = []
+    rows = []
+    fetch_error = None
+    for attempt in range(2):
+        try:
+            db = await _adb()
+            query = db.table("crm_contacts").select("*").order("updated_at", desc=True)
+            if status:
+                query = query.eq("crm_status", status)
+            if outcome:
+                query = query.eq("last_call_outcome", outcome)
+            result = await query.execute()
+            rows = result.data or []
+            fetch_error = None
+            break
+        except Exception as exc:
+            fetch_error = exc
+            if attempt == 0:
+                await asyncio.sleep(0.15)
+
+    if fetch_error is not None:
+        warning = "crm_contacts_fetch_failed_fallback_used"
+        if warnings is not None and warning not in warnings:
+            warnings.append(warning)
+        await log_error("server", warning, f"CRM contacts unavailable after retry; using call logs fallback. error={str(fetch_error)[:300]}", "warning")
 
     if not rows:
-        rows = [_crm_fallback_contact(c) for c in await get_contacts()]
+        try:
+            rows = [_crm_fallback_contact(c) for c in await get_contacts()]
+        except Exception as exc:
+            if warnings is not None and "call_logs_fallback_fetch_failed" not in warnings:
+                warnings.append("call_logs_fallback_fetch_failed")
+            await log_error("server", "call_logs_fallback_fetch_failed", f"CRM contact fallback unavailable. error={str(exc)[:300]}", "warning")
+            rows = []
     else:
         rows = [_crm_fallback_contact(c) for c in rows]
 
@@ -1616,7 +1693,8 @@ async def upsert_crm_lead(
         return {"status": "duplicate", "phone_number": phone}
 
     # Fresh insert — default followup to today at outbound start time + default status.
-    incoming.setdefault("crm_status", "New")
+    incoming.setdefault("crm_status", "new_lead")
+    incoming.setdefault("journey_stage", "new_lead")
     if not incoming.get("next_followup_at"):
         # Automatically Due Today and callable as soon as the calling window opens.
         today_str = _tz_today()
@@ -1667,7 +1745,7 @@ async def _ensure_crm_contact(phone: str) -> None:
     except Exception as exc:
         logger.warning("_ensure_crm_contact: call_logs lookup failed for %s: %s", phone, exc)
         calls = []
-    row = {"phone_number": phone, "crm_status": "New", "updated_at": datetime.now().isoformat()}
+    row = {"phone_number": phone, "crm_status": "new_lead", "journey_stage": "new_lead", "updated_at": datetime.now().isoformat()}
     if calls:
         row.update({
             "lead_name": calls[0].get("lead_name"),
@@ -1719,14 +1797,22 @@ async def update_lead_journey(phone: str, fields: dict) -> bool:
     if not phone or not fields:
         return False
     await _ensure_crm_contact(phone)
-    payload = {k: v for k, v in (fields or {}).items() if k in JOURNEY_FIELDS}
+    requested_stage = fields.get("crm_status") or fields.get("journey_stage") or ""
+    canonical_stage = canonical_crm_stage(requested_stage)
+    normalized_fields = dict(fields or {})
+    if canonical_stage:
+        normalized_fields.update(crm_stage_updates(canonical_stage))
+    payload = {k: v for k, v in normalized_fields.items() if k in JOURNEY_FIELDS}
     if not payload:
         return False
     payload["updated_at"] = datetime.now().isoformat()
     try:
         db = await _adb()
         result = await db.table("crm_contacts").update(payload).eq("phone_number", phone).execute()
-        return len(_safe_list(result)) > 0
+        ok = len(_safe_list(result)) > 0
+        if ok and canonical_stage:
+            await log_error("crm", "crm_stage_auto_updated", f"phone={phone}; stage={canonical_stage}", "info")
+        return ok
     except Exception as exc:
         await log_error("followup", "lead_journey_update_skipped", f"phone={phone}; error={exc}", "warning")
         ok_any = False
@@ -1860,14 +1946,19 @@ async def increment_lead_attempts(phone: str, channel: str) -> bool:
     state = await get_lead_followup_state(phone) or {}
     now = datetime.now().isoformat()
     if (channel or "").lower() == "call":
-        return await update_lead_journey(phone, {
+        updates = {
             "call_attempt_count": int(state.get("call_attempt_count") or 0) + 1,
             "last_call_attempt_at": now,
-        })
-    return await update_lead_journey(phone, {
+        }
+    else:
+        updates = {
         "whatsapp_followup_count": int(state.get("whatsapp_followup_count") or 0) + 1,
         "last_whatsapp_sent_at": now,
-    })
+        }
+    current_stage = canonical_crm_stage(state.get("crm_status") or state.get("journey_stage") or "")
+    if current_stage in (None, "new_lead"):
+        updates.update(crm_stage_updates("contacted"))
+    return await update_lead_journey(phone, updates)
 
 
 async def mark_lead_stop_automation(phone: str, reason: str, status: str) -> bool:
