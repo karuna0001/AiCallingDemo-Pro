@@ -77,7 +77,8 @@ from prompts import (
     get_kb_prompt_prefix,
 )
 from whatsapp import (
-    WA_SETTINGS_KEYS, AUTOMATION_EVENT_TYPES, AUTOMATION_ACTION_TYPES,
+    WA_SETTINGS_KEYS, WA_TEMPLATE_PURPOSES, AUTOMATION_EVENT_TYPES, AUTOMATION_ACTION_TYPES,
+    build_template_params, get_template_expected_param_count,
     get_wa_settings_masked, save_wa_settings, get_wa_health,
     send_whatsapp_template, get_whatsapp_logs,
     get_automation_rules, get_automation_rules_with_source, save_automation_rules, find_automation_rule, source_to_event_type,
@@ -769,6 +770,12 @@ class WaSendTemplateRequest(BaseModel):
     template_name: str
     language: str = "en"
     parameters: Optional[list] = None
+
+
+class WaTemplateDebugTestRequest(BaseModel):
+    phone: str
+    template_purpose: str
+    dry_run: bool = True
 
 
 class AutomationRulesRequest(BaseModel):
@@ -2301,6 +2308,58 @@ async def api_save_wa_settings(req: WaSettingsRequest):
 @app.get("/api/whatsapp/health")
 async def api_wa_health():
     return await get_wa_health()
+
+
+@app.get("/api/whatsapp/templates/debug")
+async def api_wa_templates_debug():
+    await log_error("whatsapp_template_debug", "whatsapp_template_debug_requested", "endpoint=/api/whatsapp/templates/debug", "info")
+    templates = []
+    for purpose, _ in WA_TEMPLATE_PURPOSES:
+        built = await build_template_params(purpose, {})
+        templates.append({
+            "purpose": purpose,
+            "template_name": built["template_name"],
+            "configured": bool(built["template_name"]),
+            "expected_params": await get_template_expected_param_count(purpose),
+            "sample_params": built["params"],
+            "actual_sample_count": len(built["params"]),
+        })
+    return {"templates": templates}
+
+
+@app.post("/api/whatsapp/templates/test")
+async def api_wa_templates_test(req: WaTemplateDebugTestRequest):
+    if not req.dry_run:
+        raise HTTPException(400, "live send not enabled in this debug step")
+    supported_purposes = {purpose for purpose, _ in WA_TEMPLATE_PURPOSES}
+    if req.template_purpose not in supported_purposes:
+        raise HTTPException(400, "unsupported template_purpose")
+    try:
+        phone = normalize_phone(req.phone)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    built = await build_template_params(req.template_purpose, {"phone": phone, "customer_phone": phone})
+    expected_count = await get_template_expected_param_count(req.template_purpose)
+    actual_count = len(built["params"])
+    error = ""
+    if not built["template_name"]:
+        error = "template_not_configured"
+    elif expected_count != actual_count:
+        error = f"template_param_mismatch expected={expected_count} actual={actual_count}"
+    await log_error(
+        "whatsapp_template_debug",
+        "whatsapp_template_dry_run",
+        f"phone={phone}; purpose={req.template_purpose}; template={built['template_name']}; expected={expected_count}; actual={actual_count}; error={error}",
+        "warning" if error else "info",
+    )
+    return {
+        "template_name": built["template_name"],
+        "params": built["params"],
+        "expected_count": expected_count,
+        "actual_count": actual_count,
+        "would_send": not error,
+        "error": error or None,
+    }
 
 
 @app.post("/api/whatsapp/send-template")
