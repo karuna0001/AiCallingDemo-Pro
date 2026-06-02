@@ -511,8 +511,11 @@ async def send_whatsapp_template(
                         msg_id = messages[0].get("id")
                     await log_and_record("sent", msg_id, None)
                     try:
-                        from db import update_lead_journey
-                        await update_lead_journey(phone, {"last_whatsapp_sent_at": datetime.now().isoformat()})
+                        from db import crm_stage_updates, update_lead_journey
+                        updates = {"last_whatsapp_sent_at": datetime.now().isoformat()}
+                        if _template_purpose_key(template_purpose or template_name) == "welcome_template":
+                            updates.update(crm_stage_updates("contacted"))
+                        await update_lead_journey(phone, updates)
                     except Exception:
                         pass
                     return {"success": True, "provider_message_id": msg_id, "error": None, "reason": None}
