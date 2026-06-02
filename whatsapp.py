@@ -91,6 +91,19 @@ WA_TEMPLATE_PARAM_COUNTS = {
     "re_enquiry_followup_template": 2,
 }
 
+WA_TEMPLATE_DEBUG_PARAM_COUNTS = {
+    "no_response_followup_template": 1,
+    "reminder_template": 3,
+    "appointment_confirmation_template": 3,
+    "staff_appointment_notification_template": 5,
+    "staff_appointment_reminder_template": 4,
+    "re_enquiry_followup_template": 2,
+    "callback_confirmation_template": 2,
+    "welcome_template": 2,
+    "missed_call_template": 2,
+    "staff_handoff_notification_template": 4,
+}
+
 WA_TEMPLATE_COOLDOWNS = {
     "re_enquiry_followup_template": 24 * 60,
     "no_response_followup_template": 24 * 60,
@@ -1230,6 +1243,56 @@ def _first_value(*values, fallback: str = "") -> str:
         if value is not None and str(value).strip():
             return str(value).strip()
     return fallback
+
+
+async def get_template_expected_param_count(template_purpose: str) -> int:
+    purpose = _template_purpose_key(template_purpose) or (template_purpose or "").strip()
+    default = WA_TEMPLATE_DEBUG_PARAM_COUNTS.get(purpose, 0)
+    raw = await _get_wa_setting(f"TEMPLATE_PARAM_COUNT_{purpose}")
+    if not str(raw or "").strip():
+        return default
+    try:
+        return max(int(str(raw).strip()), 0)
+    except ValueError:
+        return default
+
+
+async def build_template_params(template_purpose: str, context: Optional[dict] = None) -> dict:
+    context = context or {}
+    purpose = _template_purpose_key(template_purpose) or (template_purpose or "").strip()
+    template_name = await resolve_wa_template(purpose)
+    language = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
+    expected = await get_template_expected_param_count(purpose)
+    name = _first_value(context.get("customer_name"), context.get("lead_name"), context.get("name"), fallback="Demo Customer")
+    company = _first_value(context.get("business_name"), context.get("company_name"), context.get("company"), fallback="Demo Business")
+    service = _first_value(context.get("service_type"), context.get("service"), context.get("requirement"), fallback="Demo Service")
+    date = _first_value(context.get("appointment_date"), context.get("date"), fallback="2026-06-15")
+    time = _first_value(context.get("appointment_time"), context.get("time"), fallback="10:00 AM")
+    appointment_datetime = _first_value(context.get("appointment_datetime"), fallback=f"{date} {time}")
+    customer_phone = _first_value(context.get("customer_phone"), context.get("phone_number"), context.get("phone"), fallback="+919876543210")
+    staff_name = _first_value(context.get("staff_name"), fallback="Demo Staff")
+    source = _first_value(context.get("source"), fallback="CRM")
+    reason = _first_value(context.get("reason"), fallback="Customer requested assistance")
+
+    variants = {
+        "no_response_followup_template": [name, company, service],
+        "reminder_template": [name, date, time, company or staff_name],
+        "appointment_confirmation_template": [name, date, time, company],
+        "staff_appointment_notification_template": [name, customer_phone, service, appointment_datetime, source],
+        "staff_appointment_reminder_template": [name, customer_phone, service, appointment_datetime, source],
+        "re_enquiry_followup_template": [name, company, service],
+        "callback_confirmation_template": [name, appointment_datetime, service, company],
+        "welcome_template": [name, company, service],
+        "missed_call_template": [name, company, service],
+        "staff_handoff_notification_template": [name, customer_phone, reason, source, service],
+    }
+    params = variants.get(purpose, [])[:expected]
+    return {
+        "template_purpose": purpose,
+        "template_name": template_name,
+        "language": language,
+        "params": params,
+    }
 
 
 def _build_template_params(purpose_or_name: str, contact: Optional[dict], context: Optional[dict] = None) -> list:
