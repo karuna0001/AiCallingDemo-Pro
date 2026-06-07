@@ -1340,7 +1340,7 @@ def _first_value(*values, fallback: str = "") -> str:
 
 async def get_template_expected_param_count(template_purpose: str) -> int:
     purpose = _template_purpose_key(template_purpose) or (template_purpose or "").strip()
-    default = WA_TEMPLATE_DEBUG_PARAM_COUNTS.get(purpose, 0)
+    default = WA_TEMPLATE_PARAM_COUNTS.get(purpose, 0)
     raw = await _get_wa_setting(f"TEMPLATE_PARAM_COUNT_{purpose}")
     if not str(raw or "").strip():
         return default
