@@ -2388,6 +2388,14 @@ async def api_wa_templates_test(req: WaTemplateDebugTestRequest):
         except Exception as e:
             logger.warning("whatsapp_template_debug_cooldown_check failed: %s", e)
 
+        if req.confirm == "SEND_TEST_FORCE":
+            await log_error(
+                "whatsapp_template_debug",
+                "whatsapp_template_test_force_bypass_used",
+                f"phone={phone}; purpose={req.template_purpose}; template={built['template_name']}",
+                "info",
+            )
+
         # Call existing template send function
         result = await send_whatsapp_template(
             phone=phone,
@@ -2398,6 +2406,7 @@ async def api_wa_templates_test(req: WaTemplateDebugTestRequest):
             source_type="debug_test",
             source_id=f"expected={expected_count};actual={actual_count};params={actual_count}",
             template_purpose=req.template_purpose,
+            bypass_failure_cooldown=(req.confirm == "SEND_TEST_FORCE"),
         )
 
         return {

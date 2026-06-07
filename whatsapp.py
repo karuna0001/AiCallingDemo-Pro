@@ -409,6 +409,7 @@ async def send_whatsapp_template(
     source_id: str = "",
     template_purpose: str = "",
     template_context: Optional[dict] = None,
+    bypass_failure_cooldown: bool = False,
 ) -> dict:
     """Send an approved WhatsApp template message via Meta Cloud API.
 
@@ -448,21 +449,22 @@ async def send_whatsapp_template(
             ),
             "info",
         )
-        failure_cooldown = await _template_failure_cooldown_check(phone, event_type, template_name)
-        if failure_cooldown.get("active"):
-            await _db().log_error(
-                "whatsapp_template",
-                "whatsapp_template_failure_cooldown_active",
-                f"phone={_mask_phone(phone)}; event={event_type}; source={source_type}; template_name={template_name}; cooldown_until={failure_cooldown.get('cooldown_until')}",
-                "warning",
-            )
-            return {
-                "success": False,
-                "provider_message_id": None,
-                "error": "whatsapp_template_failure_cooldown_active",
-                "reason": "failure_cooldown_active",
-                "cooldown_until": failure_cooldown.get("cooldown_until"),
-            }
+        if not bypass_failure_cooldown:
+            failure_cooldown = await _template_failure_cooldown_check(phone, event_type, template_name)
+            if failure_cooldown.get("active"):
+                await _db().log_error(
+                    "whatsapp_template",
+                    "whatsapp_template_failure_cooldown_active",
+                    f"phone={_mask_phone(phone)}; event={event_type}; source={source_type}; template_name={template_name}; cooldown_until={failure_cooldown.get('cooldown_until')}",
+                    "warning",
+                )
+                return {
+                    "success": False,
+                    "provider_message_id": None,
+                    "error": "whatsapp_template_failure_cooldown_active",
+                    "reason": "failure_cooldown_active",
+                    "cooldown_until": failure_cooldown.get("cooldown_until"),
+                }
         if expected_count != actual_count:
             err = f"template_param_mismatch expected={expected_count} actual={actual_count}"
             await log_and_record("failed", None, err)
@@ -475,7 +477,7 @@ async def send_whatsapp_template(
             return {"success": False, "provider_message_id": None, "error": err, "reason": "template_param_mismatch"}
 
     cooldown_minutes = _template_cooldown_minutes(event_type, template_name, template_purpose)
-    if cooldown_minutes and not _template_cooldown_bypassed(source_type, event_type):
+    if cooldown_minutes and not _template_cooldown_bypassed(source_type, event_type) and not bypass_failure_cooldown:
         dup = await _template_duplicate_check(phone, event_type, template_name, cooldown_minutes, source_id=source_id)
         if dup.get("duplicate"):
             reason = "duplicate_suppressed_cooldown"
