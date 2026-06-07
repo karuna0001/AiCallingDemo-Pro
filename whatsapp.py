@@ -1064,11 +1064,11 @@ async def insert_automation_action(
     return action_id
 
 
-async def get_automation_actions(
+async def get_automation_actions_raw(
     status: Optional[str] = None,
     phone: Optional[str] = None,
     limit: int = 100,
-) -> list:
+) -> tuple[list, bool]:
     try:
         db = await _db()._adb()
         query = db.table("automation_actions").select("*").order("scheduled_at", desc=True).limit(limit)
@@ -1077,10 +1077,19 @@ async def get_automation_actions(
         if phone:
             query = query.eq("phone_number", phone)
         result = await query.execute()
-        return result.data or []
+        return result.data or [], True
     except Exception as exc:
-        logger.debug("get_automation_actions failed: %s", exc)
-        return []
+        logger.warning("get_automation_actions_raw failed: %s", exc)
+        return [], False
+
+
+async def get_automation_actions(
+    status: Optional[str] = None,
+    phone: Optional[str] = None,
+    limit: int = 100,
+) -> list:
+    actions, _ok = await get_automation_actions_raw(status=status, phone=phone, limit=limit)
+    return actions
 
 
 async def update_automation_action_status(action_id: str, status: str, result: Optional[dict] = None, error: str = "") -> bool:
