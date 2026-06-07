@@ -23,8 +23,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8000
 
-# Safe increased healthcheck retries to allow remote database pre-warming on startup
-HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=12 \
-    CMD curl -fsS http://127.0.0.1:${PORT:-8000}/api/health || exit 1
+# Use lightweight /api/live endpoint for health check to avoid remote database bottlenecks during startup.
+# Increased start period and timeout for reliable container transitions on slow hosts/VPS.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=10 \
+    CMD curl -fsS http://127.0.0.1:${PORT:-8000}/api/live || exit 1
 
 CMD ["sh", "/app/start.sh"]
