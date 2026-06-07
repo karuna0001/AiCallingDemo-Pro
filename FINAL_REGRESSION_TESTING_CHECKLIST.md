@@ -120,7 +120,14 @@ Run this checklist on the deployed branch before merging into the stable product
 - Open `/api/schema/health` and confirm `ok=true` with no missing tables.
 - If schema health reports missing `broadcast_campaigns` or another table, run the latest `supabase_schema.sql`, wait 30 seconds or reload the Supabase API to refresh the PostgREST schema cache, then re-test `/api/schema/health`.
 
-## 30. Final Merge Readiness
+## 30. Coolify & Traefik Runtime Health Checks
+- Open `/api/live` and confirm it returns immediately with `process_alive=true` and uptime.
+- Open `/api/ready` and confirm it returns `ok` or `degraded` without crashing the Python process.
+- Open `/api/runtime/health` and verify detailed container system metrics (timezone, uptime, memory usage, background task status) are returned.
+- Verify Coolify health check configuration is mapped to `/api/live`.
+- Leave the application idle and recheck readiness and logs after 12/24 hours to confirm no background crashes.
+
+## 31. Final Merge Readiness
 - Run `python -m py_compile server.py whatsapp.py db.py tools.py prompts.py followup.py agent.py`.
 - Run `git diff --check`.
 - Confirm no work was done on `main`, no SaaS/multi-client isolation was added, and existing voice/WhatsApp/follow-up/appointment flows still pass smoke tests.
