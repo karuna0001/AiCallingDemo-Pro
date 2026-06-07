@@ -124,3 +124,13 @@ Run this checklist on the deployed branch before merging into the stable product
 - Run `python -m py_compile server.py whatsapp.py db.py tools.py prompts.py followup.py agent.py`.
 - Run `git diff --check`.
 - Confirm no work was done on `main`, no SaaS/multi-client isolation was added, and existing voice/WhatsApp/follow-up/appointment flows still pass smoke tests.
+
+## 31. Automation Rules UI & Logging
+- Open Automation tab on the dashboard.
+- Verify that `Lead Sources` tab content is active and visible by default (no blank page).
+- Click on `Follow-up Events`, `Automation Queue`, and `Test` sub-tabs, and confirm they render correctly.
+- Verify console logs for "automation_load_started" and "automation_load_success".
+- Check that "Loading automation rules..." displays during API calls.
+- Temporarily block the `/api/automation/rules` API (or mock a failure) and confirm the UI displays a readable error message instead of a blank page or `[object Object]`.
+- Verify backend logs contain "automation_rules_load_started", "automation_rules_load_success", and "automation_rules_load_failed" when appropriate.
+- Test a rule in the Test sub-tab and confirm test execution/dry-run outputs render cleanly.

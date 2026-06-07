@@ -2761,8 +2761,27 @@ async def api_wa_conv_send_template(conv_id: str, req: WaConvTemplateRequest):
 
 @app.get("/api/automation/rules")
 async def api_get_automation_rules():
-    rules, source = await get_automation_rules_with_source()
-    return {"rules": rules, "rules_source": source, "event_types": AUTOMATION_EVENT_TYPES, "action_types": AUTOMATION_ACTION_TYPES}
+    logger.info("automation_rules_load_started")
+    try:
+        await log_error("automation", "automation_rules_load_started", "Request to load automation rules", "info")
+    except Exception:
+        pass
+
+    try:
+        rules, source = await get_automation_rules_with_source()
+        logger.info("automation_rules_load_success source=%s count=%s", source, len(rules))
+        try:
+            await log_error("automation", "automation_rules_load_success", f"Loaded rules count={len(rules)} source={source}", "info")
+        except Exception:
+            pass
+        return {"rules": rules, "rules_source": source, "event_types": AUTOMATION_EVENT_TYPES, "action_types": AUTOMATION_ACTION_TYPES}
+    except Exception as exc:
+        logger.error("automation_rules_load_failed: %s", exc)
+        try:
+            await log_error("automation", "automation_rules_load_failed", str(exc), "error")
+        except Exception:
+            pass
+        raise HTTPException(500, f"Failed to load automation rules: {exc}")
 
 
 @app.post("/api/automation/rules")
@@ -2788,24 +2807,38 @@ async def api_reset_automation_rules():
 
 @app.post("/api/automation/test")
 async def api_test_automation(req: AutomationTestRequest):
+    logger.info("automation_test_started phone=%s event=%s", req.phone, req.event_type)
     try:
-        phone = normalize_phone(req.phone)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    rules = await get_automation_rules()
-    rule = find_automation_rule(rules, req.event_type, req.source)
-    if req.dry_run:
-        return {
-            "dry_run": True,
-            "event_type": req.event_type,
-            "source": req.source,
-            "matched_rule": rule,
-            "planned_action": rule.get("action") if rule else "no_matching_rule",
-            "whatsapp_enabled": await get_wa_health(),
-        }
-    contact = {"phone": phone, "lead_name": req.lead_name or "Demo Contact", "source": req.source or ""}
-    result = await execute_automation_rule(req.event_type, contact)
-    return {"dry_run": False, "event_type": req.event_type, **result}
+        await log_error("automation", "automation_test_started", f"Testing automation phone={req.phone} event={req.event_type}", "info")
+    except Exception:
+        pass
+
+    try:
+        try:
+            phone = normalize_phone(req.phone)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        rules = await get_automation_rules()
+        rule = find_automation_rule(rules, req.event_type, req.source)
+        if req.dry_run:
+            return {
+                "dry_run": True,
+                "event_type": req.event_type,
+                "source": req.source,
+                "matched_rule": rule,
+                "planned_action": rule.get("action") if rule else "no_matching_rule",
+                "whatsapp_enabled": await get_wa_health(),
+            }
+        contact = {"phone": phone, "lead_name": req.lead_name or "Demo Contact", "source": req.source or ""}
+        result = await execute_automation_rule(req.event_type, contact)
+        return {"dry_run": False, "event_type": req.event_type, **result}
+    except Exception as exc:
+        logger.error("automation_test_failed: %s", exc)
+        try:
+            await log_error("automation", "automation_test_failed", str(exc), "error")
+        except Exception:
+            pass
+        raise HTTPException(500, f"Automation test failed: {exc}")
 
 
 # ── Automation Action Queue ───────────────────────────────────────────────────
@@ -2817,8 +2850,27 @@ async def api_get_automation_actions(status: Optional[str] = None, phone: Option
             phone = normalize_phone(phone)
         except Exception:
             pass
-    actions = await get_automation_actions(status=status, phone=phone, limit=min(limit, 500))
-    return {"actions": actions, "total": len(actions)}
+    try:
+        # We check if get_automation_actions fails or if table is missing.
+        # Inside whatsapp.py, get_automation_actions returns a list or throws/logs inside.
+        # We will retrieve actions. If empty and supabase fails, a warning is raised.
+        from whatsapp import get_automation_actions_raw
+        actions, ok = await get_automation_actions_raw(status=status, phone=phone, limit=min(limit, 500))
+        if not ok:
+            logger.warning("automation_queue_load_failed")
+            try:
+                await log_error("automation", "automation_queue_load_failed", "Failed to retrieve automation queue from DB", "warning")
+            except Exception:
+                pass
+            return {"actions": [], "total": 0, "warning": "automation_actions table may be missing or inaccessible"}
+        return {"actions": actions, "total": len(actions)}
+    except Exception as exc:
+        logger.error("automation_queue_load_failed: %s", exc)
+        try:
+            await log_error("automation", "automation_queue_load_failed", str(exc), "warning")
+        except Exception:
+            pass
+        return {"actions": [], "total": 0, "warning": f"automation_actions table error: {exc}"}
 
 
 @app.patch("/api/automation/actions/{action_id}/status")
