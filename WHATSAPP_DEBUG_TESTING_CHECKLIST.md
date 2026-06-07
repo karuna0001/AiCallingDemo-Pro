@@ -113,3 +113,11 @@
 - Trigger a live `demo_reminder` and confirm `reminder_template` sends without `#132000`.
 - Book an appointment and confirm `appointment_confirmation_template` sends without `#132000`.
 - Cause a parameter-related template failure, retry the same phone, template, and event within six hours, and confirm `whatsapp_template_failure_cooldown_active` is logged without another Meta send.
+
+## Safe Template Live Testing
+- Perform a dry run template test using `POST /api/whatsapp/templates/test` with `dry_run=true` and confirm valid parameters are mapped.
+- Perform a safe live template test to a confirmed test phone number using `POST /api/whatsapp/templates/test` with `dry_run=false` and `confirm="SEND_TEST"`.
+- Confirm the response contains `"ok": true`, `"sent": true`, and a `provider_message_id`.
+- Verify the WhatsApp logs table records the event `template_test` with correct parameter counts and a status of `sent`/`delivered`.
+- Confirm the recipient receives the message without any `#132000` or `#100` param errors.
+- Test cooldown protection by retrying a failed target and confirming it blocks sending for 5 minutes unless `confirm="SEND_TEST_FORCE"` is supplied.
