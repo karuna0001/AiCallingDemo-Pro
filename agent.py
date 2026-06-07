@@ -1462,4 +1462,24 @@ if __name__ == "__main__":
     load_db_settings_to_env()
     _log_agent_startup_fingerprint()
     _start_agent_heartbeat_thread()
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name=_outbound_agent_name()))
+
+    # Prevent container crash if LiveKit credentials are not yet set
+    lk_url = (os.getenv("LIVEKIT_URL") or "").strip()
+    lk_key = (os.getenv("LIVEKIT_API_KEY") or "").strip()
+    lk_secret = (os.getenv("LIVEKIT_API_SECRET") or "").strip()
+
+    is_missing = (
+        not lk_url or not lk_key or not lk_secret or
+        "missing" in lk_url.lower() or "missing" in lk_key.lower() or "missing" in lk_secret.lower()
+    )
+
+    if is_missing:
+        logger.error("❌ LiveKit credentials missing or set to placeholder. Agent worker will idle to prevent container crash.")
+        try:
+            asyncio.run(log_error("agent", "agent_worker_idle", "LiveKit credentials missing, entering idle watchdog mode", "warning"))
+        except Exception:
+            pass
+        while True:
+            time.sleep(3600)
+    else:
+        agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name=_outbound_agent_name()))
