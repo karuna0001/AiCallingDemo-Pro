@@ -107,6 +107,33 @@ logger = logging.getLogger("server")
 VOICE_FLOW_RUNTIME = "v4_combined_opening"
 DEFAULT_OUTBOUND_AGENT_NAME = "outbound-caller-v3"
 
+_START_TIME = time.time()
+LAST_BACKGROUND_ERROR = None
+
+def _record_background_error(task: str, exc: Exception):
+    global LAST_BACKGROUND_ERROR
+    error_msg = str(exc)
+    LAST_BACKGROUND_ERROR = {
+        "task": task,
+        "error": error_msg,
+        "timestamp": datetime.now().isoformat()
+    }
+    logger.error("Background task error in %s: %s", task, error_msg)
+    try:
+        loop = None
+        try:
+            loop = asyncio.get_event_loop()
+        except Exception:
+            pass
+        if loop and loop.is_running():
+            loop.create_task(log_error("background_task_error", "scheduler_loop_error", f"task={task}; error={error_msg[:400]}", "error"))
+            loop.create_task(log_error("server", "runtime_health_background_error", f"task={task}; error={error_msg[:400]}", "error"))
+        else:
+            asyncio.run(log_error("background_task_error", "scheduler_loop_error", f"task={task}; error={error_msg[:400]}", "error"))
+            asyncio.run(log_error("server", "runtime_health_background_error", f"task={task}; error={error_msg[:400]}", "error"))
+    except Exception as e:
+        logger.warning("Failed to save background error to db: %s", e)
+
 
 def _deployed_code_version() -> str:
     env_version = os.getenv("DEPLOYED_CODE_VERSION") or os.getenv("RENDER_GIT_COMMIT") or os.getenv("SOURCE_VERSION")
@@ -268,6 +295,7 @@ def _run_due_appointment_reminders_sync():
         asyncio.run(run_due_appointment_reminders())
         logger.info("Due appointment reminders completed")
     except Exception as exc:
+        _record_background_error("appointment_reminders", exc)
         logger.exception("Due appointment reminders failed: %s", exc)
 
 
@@ -438,6 +466,7 @@ def _run_due_followup_actions_sync() -> None:
         asyncio.run(evaluate_no_response_followups())
         logger.info("Due follow-up actions completed")
     except Exception as exc:
+        _record_background_error("followup_actions", exc)
         logger.exception("Due follow-up actions failed: %s", exc)
 
 
@@ -554,6 +583,53 @@ async def _startup():
     except Exception:
         pass
     await _sanitize_saved_voice_prompt_setting()
+
+    logger.info("app_starting")
+    try:
+        await log_error("server", "app_starting", "Application startup diagnostics check initiated", "info")
+    except Exception:
+        pass
+
+    port = os.getenv("PORT", "8000")
+    system_tz = str(datetime.now().astimezone().tzinfo or "UTC")
+    app_tz = "Asia/Kolkata"
+    auth_enabled = False
+    whatsapp_enabled = False
+    supabase_configured = False
+    livekit_configured = False
+
+    try:
+        from db import get_setting
+        app_tz = await get_setting("APP_TIMEZONE", "Asia/Kolkata")
+        auth_enabled = (await get_setting("AUTH_ENABLED", "false")).lower() in ("true", "1", "yes", "on")
+        whatsapp_enabled = (await get_setting("WHATSAPP_ENABLED", "false")).lower() in ("true", "1", "yes", "on")
+        supabase_configured = True
+    except Exception:
+        pass
+
+    try:
+        url = await eff("LIVEKIT_URL")
+        key = await eff("LIVEKIT_API_KEY")
+        secret = await eff("LIVEKIT_API_SECRET")
+        livekit_configured = bool(url and key and secret)
+    except Exception:
+        pass
+
+    scheduler_status = "configured_and_running" if (_scheduler and _scheduler.running) else ("configured" if _scheduler else "disabled")
+
+    diag_msg = (
+        f"port={port}; timezone={system_tz}; app_timezone={app_tz}; "
+        f"auth_enabled={auth_enabled}; whatsapp_enabled={whatsapp_enabled}; "
+        f"supabase_configured={supabase_configured}; livekit_configured={livekit_configured}; "
+        f"scheduler_status={scheduler_status}"
+    )
+
+    logger.info("app_started: %s", diag_msg)
+    try:
+        await log_error("server", "app_started", diag_msg, "info")
+    except Exception:
+        pass
+
     if _scheduler:
         _scheduler.start()
         await _reschedule_all_campaigns()
@@ -2297,6 +2373,148 @@ async def api_save_kb_section(section: str, req: Request):
         raise HTTPException(400, "Invalid JSON body")
     await save_kb_section(section, data)
     return {"status": "saved", "section": section}
+
+
+# ── Coolify Runtime & Health Check Endpoints ─────────────────────────────────
+
+def _get_memory_usage() -> Optional[float]:
+    try:
+        import resource
+        import sys
+        rusage = resource.getrusage(resource.RUSAGE_SELF)
+        if sys.platform == "darwin":
+            return round(rusage.ru_maxrss / (1024.0 * 1024.0), 2)
+        else:
+            return round(rusage.ru_maxrss / 1024.0, 2)
+    except Exception:
+        pass
+    try:
+        if os.path.exists("/proc/self/status"):
+            with open("/proc/self/status", "r") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            return round(float(parts[1]) / 1024.0, 2)
+    except Exception:
+        pass
+    return None
+
+
+@app.get("/api/live")
+async def api_live():
+    """Lightweight liveness endpoint that returns immediately without checking external services."""
+    return {
+        "status": "ok",
+        "process_alive": True,
+        "timestamp": datetime.now().isoformat(),
+        "uptime_seconds": int(time.time() - _START_TIME)
+    }
+
+
+@app.get("/api/ready")
+async def api_ready():
+    """Readiness endpoint verifying status of external integrations (Supabase, WhatsApp, LiveKit)."""
+    warnings = []
+    supabase_configured = False
+    whatsapp_configured = False
+    livekit_configured = False
+
+    # Supabase check
+    try:
+        from db import get_setting
+        await get_setting("APP_TIMEZONE", "Asia/Kolkata")
+        supabase_configured = True
+    except Exception as e:
+        warnings.append(f"Supabase connection check failed: {e}")
+
+    # WhatsApp check
+    try:
+        from whatsapp import get_wa_health
+        wa_health = await get_wa_health()
+        if wa_health.get("status") == "ok":
+            whatsapp_configured = True
+        else:
+            warnings.append(f"WhatsApp degraded: missing {wa_health.get('missing', [])}")
+    except Exception as e:
+        warnings.append(f"WhatsApp configuration check failed: {e}")
+
+    # LiveKit check
+    try:
+        url = await eff("LIVEKIT_URL")
+        key = await eff("LIVEKIT_API_KEY")
+        secret = await eff("LIVEKIT_API_SECRET")
+        if url and key and secret:
+            livekit_configured = True
+        else:
+            warnings.append("LiveKit credentials not configured")
+    except Exception as e:
+        warnings.append(f"LiveKit configuration check failed: {e}")
+
+    status = "degraded" if warnings else "ok"
+    return {
+        "status": status,
+        "app_ready": True,
+        "supabase_configured": supabase_configured,
+        "whatsapp_configured": whatsapp_configured,
+        "livekit_configured": livekit_configured,
+        "warnings": warnings
+    }
+
+
+@app.get("/api/runtime/health")
+async def api_runtime_health():
+    """Extensive runtime health endpoint for detailed container diagnostics."""
+    import sys
+
+    # Timezone & app timezone info
+    current_time = datetime.now()
+    timezone_name = str(current_time.astimezone().tzinfo or "UTC")
+    app_tz = "Asia/Kolkata"
+    supabase_configured = False
+    whatsapp_enabled = False
+    auth_enabled = False
+
+    try:
+        from db import get_setting
+        app_tz = await get_setting("APP_TIMEZONE", "Asia/Kolkata")
+        supabase_configured = True
+        auth_enabled = (await get_setting("AUTH_ENABLED", "false")).lower() in ("true", "1", "yes", "on")
+        whatsapp_enabled = (await get_setting("WHATSAPP_ENABLED", "false")).lower() in ("true", "1", "yes", "on")
+    except Exception:
+        pass
+
+    # LiveKit configuration check
+    livekit_configured = False
+    try:
+        url = await eff("LIVEKIT_URL")
+        key = await eff("LIVEKIT_API_KEY")
+        secret = await eff("LIVEKIT_API_SECRET")
+        livekit_configured = bool(url and key and secret)
+    except Exception:
+        pass
+
+    # Scheduler status
+    scheduler_status = {
+        "configured": _scheduler is not None,
+        "running": _scheduler.running if _scheduler else False
+    }
+
+    return {
+        "process_alive": True,
+        "uptime_seconds": int(time.time() - _START_TIME),
+        "current_time": current_time.isoformat(),
+        "timezone": timezone_name,
+        "app_timezone": app_tz,
+        "scheduler_status": scheduler_status,
+        "last_background_error": LAST_BACKGROUND_ERROR,
+        "python_version": sys.version,
+        "memory_mb": _get_memory_usage(),
+        "auth_enabled": auth_enabled,
+        "supabase_configured": supabase_configured,
+        "whatsapp_enabled": whatsapp_enabled,
+        "livekit_configured": livekit_configured
+    }
 
 
 # ── WhatsApp Settings & Health ───────────────────────────────────────────────
@@ -5159,6 +5377,7 @@ def _run_campaign_sync(campaign_id: str) -> None:
     try:
         asyncio.run(_run_campaign(campaign_id))
     except Exception as exc:
+        _record_background_error(f"campaign_run_{campaign_id}", exc)
         logger.exception("Scheduled campaign run failed (id=%s): %s", campaign_id, exc)
 
 
@@ -5169,6 +5388,7 @@ def _run_due_automation_actions_sync() -> None:
         asyncio.run(run_due_automation_actions())
         logger.info("Due automation actions completed")
     except Exception as exc:
+        _record_background_error("automation_actions", exc)
         logger.exception("Due automation actions failed: %s", exc)
 
 
@@ -5177,6 +5397,7 @@ def _scheduled_recording_cleanup_sync() -> None:
     try:
         asyncio.run(_scheduled_recording_cleanup())
     except Exception as exc:
+        _record_background_error("recording_cleanup", exc)
         logger.exception("Scheduled recording cleanup (sync wrapper) failed: %s", exc)
 
 
