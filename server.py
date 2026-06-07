@@ -787,6 +787,7 @@ class WaTemplateDebugTestRequest(BaseModel):
     phone: str
     template_purpose: str
     dry_run: bool = True
+    confirm: Optional[str] = None
 
 
 class AutomationRulesRequest(BaseModel):
@@ -2337,11 +2338,11 @@ async def api_wa_templates_debug():
 
 @app.post("/api/whatsapp/templates/test")
 async def api_wa_templates_test(req: WaTemplateDebugTestRequest):
-    if not req.dry_run:
-        raise HTTPException(400, "live send not enabled in this debug step")
     supported_purposes = {purpose for purpose, _ in WA_TEMPLATE_PURPOSES}
-    if req.template_purpose not in supported_purposes:
-        raise HTTPException(400, "unsupported template_purpose")
+    if not req.template_purpose or req.template_purpose.strip() not in supported_purposes:
+        raise HTTPException(400, "unsupported or missing template_purpose")
+    if not req.phone or not req.phone.strip():
+        raise HTTPException(400, "phone is required")
     try:
         phone = normalize_phone(req.phone)
     except ValueError as exc:
@@ -2349,6 +2350,68 @@ async def api_wa_templates_test(req: WaTemplateDebugTestRequest):
     built = await build_template_params(req.template_purpose, {"phone": phone, "customer_phone": phone})
     expected_count = await get_template_expected_param_count(req.template_purpose)
     actual_count = len(built["params"])
+
+    if not req.dry_run:
+        # Check confirm value
+        if req.confirm not in ("SEND_TEST", "SEND_TEST_FORCE"):
+            raise HTTPException(400, "confirm must be 'SEND_TEST' or 'SEND_TEST_FORCE' for live send")
+
+        # Check template configuration
+        if not built["template_name"]:
+            raise HTTPException(400, "Template is not configured")
+
+        # Check expected vs actual param counts
+        if expected_count != actual_count:
+            raise HTTPException(400, f"Template parameter count mismatch: expected {expected_count}, got {actual_count}")
+
+        # Cooldown protection check
+        cutoff = (datetime.now() - timedelta(minutes=5)).isoformat()
+        try:
+            adb = await _adb()
+            res = await adb.table("whatsapp_logs") \
+                .select("*") \
+                .eq("phone_number", phone) \
+                .eq("template_name", built["template_name"]) \
+                .eq("status", "failed") \
+                .gte("created_at", cutoff) \
+                .execute()
+            has_failed = False
+            for row in res.data or []:
+                err = str(row.get("error_message") or "")
+                if "132000" in err or "100" in err:
+                    has_failed = True
+                    break
+            if has_failed and req.confirm != "SEND_TEST_FORCE":
+                raise HTTPException(400, "Recent parameter/invalid template failure detected. Use confirm='SEND_TEST_FORCE' to bypass 5-minute cooldown.")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning("whatsapp_template_debug_cooldown_check failed: %s", e)
+
+        # Call existing template send function
+        result = await send_whatsapp_template(
+            phone=phone,
+            template_name=built["template_name"],
+            language=built["language"] or "en",
+            parameters=built["params"],
+            event_type="template_test",
+            source_type="debug_test",
+            source_id=f"expected={expected_count};actual={actual_count};params={actual_count}",
+            template_purpose=req.template_purpose,
+        )
+
+        return {
+            "ok": bool(result.get("success")),
+            "template_name": built["template_name"],
+            "params": built["params"],
+            "expected_count": expected_count,
+            "actual_count": actual_count,
+            "sent": bool(result.get("success")),
+            "provider_message_id": result.get("provider_message_id") or "",
+            "error": result.get("error") or None,
+        }
+
+    # dry_run = True (existing behavior)
     error = ""
     if not built["template_name"]:
         error = "template_not_configured"
