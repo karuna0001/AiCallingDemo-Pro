@@ -148,3 +148,10 @@ Run this checklist on the deployed branch before merging into the stable product
 - Wait 30 minutes and confirm the app still responds immediately to `/api/live`.
 - Confirm scheduler background jobs run regularly without logging `OSError: [Errno 24] Too many open files`.
 - Verify background logs contain `background_event_loop_started`, `background_job_started`, and `background_job_completed`.
+
+## 33. Automation Queue Compatibility Endpoints
+- Open `GET /api/automation/queue` and verify it returns a valid JSON response containing `queue`, `actions`, `count`, and `warning` fields.
+- Open `GET /api/automation/queue/health` and verify it returns `status`, `table_available`, `count`, and `warning`.
+- Navigate to the Automation Queue tab on the dashboard, click Refresh, and confirm it loads and populates successfully or displays a clear empty state if no items exist.
+- Verify logs contain `automation_queue_load_started` and `automation_queue_load_success` / `automation_queue_load_failed` when loading.
+- Verify logs contain `automation_queue_health_checked` when requesting health status.

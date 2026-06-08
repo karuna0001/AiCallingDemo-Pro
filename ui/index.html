@@ -1058,7 +1058,31 @@ function testAutomationRule(){autoSwitchTab('test')}
 async function runAutoTest(){
   console.debug('runAutoTest started');
   const phone=$('auto-test-phone').value;const event_type=$('auto-test-event').value;const source=$('auto-test-source').value||null;const dry_run=$('auto-test-dryrun').value==='true';try{const r=await api('/api/automation/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,event_type,source,dry_run})});$('auto-test-result').textContent=JSON.stringify(r,null,2)}catch(e){$('auto-test-result').textContent='Error: '+e.message}}
-async function loadAutomationQueue(){const status=$('auto-queue-status').value;const phone=$('auto-queue-phone').value;let url='/api/automation/actions?limit=100';if(status)url+='&status='+encodeURIComponent(status);if(phone)url+='&phone='+encodeURIComponent(phone);try{const r=await api(url);const rows=r.actions||[];const brief=a=>{let res={};try{res=JSON.parse(a.result||'{}')}catch(_){res={}}return esc(a.error_message||res.skip_reason||res.whatsapp_status||res.call_status||res.automation_status||'')};$('auto-queue-list').innerHTML=rows.length?`<table><thead><tr><th>Phone</th><th>Event</th><th>Action</th><th>Status</th><th>Reason</th><th>Scheduled</th><th>Completed</th><th>Cancel</th></tr></thead><tbody>${rows.map(a=>`<tr><td>${esc(a.phone_number||'')}</td><td>${esc(a.event_type||'')}</td><td>${esc(a.action_type||'')}</td><td><span class="badge ${a.status==='completed'?'ok':a.status==='failed'?'err':(a.status==='pending'||a.status==='waiting_schedule')?'warnc':a.status==='skipped'?'warnc':''}">${esc(a.status||'')}</span></td><td style="font-size:0.75rem;color:#aaa;max-width:180px">${brief(a)}</td><td style="white-space:nowrap">${esc((a.scheduled_at||'').slice(0,16).replace('T',' '))}</td><td style="white-space:nowrap">${esc((a.completed_at||'').slice(0,16).replace('T',' '))}</td><td>${a.status==='pending'||a.status==='waiting_schedule'?`<button class="danger" style="padding:2px 8px" onclick="cancelAction('${esc(a.id)}')">✕</button>`:''}</td></tr>`).join('')}</tbody></table>`:'<p class="muted">No actions found.</p>'}catch(e){toast(e.message,'err')}}
+async function loadAutomationQueue(){
+  const status=$('auto-queue-status').value;
+  const phone=$('auto-queue-phone').value;
+  let url='/api/automation/queue?limit=100';
+  if(status)url+='&status='+encodeURIComponent(status);
+  if(phone)url+='&phone='+encodeURIComponent(phone);
+  try{
+    const r=await api(url);
+    const rows=r.queue||r.actions||[];
+    const brief=a=>{
+      let res={};
+      try{res=JSON.parse(a.result||'{}')}catch(_){res={}}
+      return esc(a.error_message||res.skip_reason||res.whatsapp_status||res.call_status||res.automation_status||'')
+    };
+
+    let warnBanner = '';
+    if(r.warning) {
+      warnBanner = `<div class="warn" style="padding:10px;border:1px solid var(--warn);border-radius:6px;margin-bottom:12px;color:var(--warn)">⚠️ Warning: ${esc(r.warning)}</div>`;
+    }
+
+    $('auto-queue-list').innerHTML=warnBanner + (rows.length?`<table><thead><tr><th>Phone</th><th>Event</th><th>Action</th><th>Status</th><th>Reason</th><th>Scheduled</th><th>Completed</th><th>Cancel</th></tr></thead><tbody>${rows.map(a=>`<tr><td>${esc(a.phone_number||'')}</td><td>${esc(a.event_type||'')}</td><td>${esc(a.action_type||'')}</td><td><span class="badge ${a.status==='completed'?'ok':a.status==='failed'?'err':(a.status==='pending'||a.status==='waiting_schedule')?'warnc':a.status==='skipped'?'warnc':''}">${esc(a.status||'')}</span></td><td style="font-size:0.75rem;color:#aaa;max-width:180px">${brief(a)}</td><td style="white-space:nowrap">${esc((a.scheduled_at||'').slice(0,16).replace('T',' '))}</td><td style="white-space:nowrap">${esc((a.completed_at||'').slice(0,16).replace('T',' '))}</td><td>${a.status==='pending'||a.status==='waiting_schedule'?`<button class="danger" style="padding:2px 8px" onclick="cancelAction('${esc(a.id)}')">✕</button>`:''}</td></tr>`).join('')}</tbody></table>`:'<p class="muted">No automation queue items yet.</p>');
+  }catch(e){
+    toast(e.message,'err');
+  }
+}
 window.cancelAction=async id=>{try{await api('/api/automation/actions/'+id+'/status',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'cancelled'})});loadAutomationQueue();toast('Action cancelled')}catch(e){toast(e.message,'err')}}
 async function runDueActions(){try{const r=await api('/api/automation/actions/run-due',{method:'POST'});toast('Ran due actions: '+r.processed+' processed');loadAutomationQueue()}catch(e){toast(e.message,'err')}}
 // ── WhatsApp ──────────────────────────────────────────────────────────────────

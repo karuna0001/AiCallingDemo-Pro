@@ -3178,6 +3178,97 @@ async def api_get_automation_actions(status: Optional[str] = None, phone: Option
         return {"actions": [], "total": 0, "warning": f"automation_actions table error: {exc}"}
 
 
+@app.get("/api/automation/queue")
+async def api_get_automation_queue(status: Optional[str] = None, phone: Optional[str] = None, limit: int = 100):
+    logger.info("automation_queue_load_started")
+    try:
+        await log_error("automation", "automation_queue_load_started", "Request to load automation queue", "info")
+    except Exception:
+        pass
+
+    if phone:
+        try:
+            phone = normalize_phone(phone)
+        except Exception:
+            pass
+
+    try:
+        from whatsapp import get_automation_actions_raw
+        actions, ok = await get_automation_actions_raw(status=status, phone=phone, limit=min(limit, 500))
+        if not ok:
+            logger.warning("automation_queue_load_failed")
+            try:
+                await log_error("automation", "automation_queue_load_failed", "Failed to retrieve automation queue from DB", "warning")
+            except Exception:
+                pass
+            return {
+                "queue": [],
+                "actions": [],
+                "count": 0,
+                "warning": "automation_queue_unavailable"
+            }
+        logger.info("automation_queue_load_success count=%s", len(actions))
+        try:
+            await log_error("automation", "automation_queue_load_success", f"Loaded automation queue count={len(actions)}", "info")
+        except Exception:
+            pass
+        return {
+            "queue": actions,
+            "actions": actions,
+            "count": len(actions),
+            "warning": ""
+        }
+    except Exception as exc:
+        logger.error("automation_queue_load_failed: %s", exc)
+        try:
+            await log_error("automation", "automation_queue_load_failed", str(exc), "warning")
+        except Exception:
+            pass
+        return {
+            "queue": [],
+            "actions": [],
+            "count": 0,
+            "warning": "automation_queue_unavailable"
+        }
+
+
+@app.get("/api/automation/queue/health")
+async def api_get_automation_queue_health():
+    table_available = False
+    count = None
+    warning_msg = ""
+    try:
+        from whatsapp import get_automation_actions_raw
+        actions, ok = await get_automation_actions_raw(limit=1)
+        if ok:
+            table_available = True
+            try:
+                db = await _adb()
+                res = await db.table("automation_actions").select("id", count="exact").limit(1).execute()
+                count = res.count if res and res.count is not None else len(actions)
+            except Exception:
+                count = len(actions)
+        else:
+            warning_msg = "database query returned not ok status"
+    except Exception as exc:
+        warning_msg = str(exc)
+
+    status_val = "ok" if (table_available and not warning_msg) else "degraded"
+
+    logger.info("automation_queue_health_checked status=%s", status_val)
+    try:
+        await log_error("automation", "automation_queue_health_checked", f"status={status_val}; count={count}; warning={warning_msg}", "info")
+    except Exception:
+        pass
+
+    return {
+        "status": status_val,
+        "table_available": table_available,
+        "count": count,
+        "warning": warning_msg
+    }
+
+
 @app.patch("/api/automation/actions/{action_id}/status")
 async def api_update_action_status(action_id: str, req: StatusRequest):
     allowed = {"pending", "running", "completed", "failed", "cancelled", "waiting_schedule", "skipped"}
