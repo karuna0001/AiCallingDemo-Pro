@@ -45,9 +45,15 @@ echo "🤖 Starting LiveKit agent worker..."
 python agent.py start &
 AGENT_PID=$!
 
-# Portable watchdog: exit as soon as either child dies so the
-# container orchestrator (Coolify / Docker) can restart us.
-while kill -0 "$SERVER_PID" 2>/dev/null && kill -0 "$AGENT_PID" 2>/dev/null; do
+# Portable watchdog: exit as soon as the uvicorn server dies.
+# Automatically restart the LiveKit agent worker if it exits.
+while kill -0 "$SERVER_PID" 2>/dev/null; do
+    if ! kill -0 "$AGENT_PID" 2>/dev/null; then
+        echo "⚠️ LiveKit agent worker exited — restarting in 5 seconds..."
+        sleep 5
+        python agent.py start &
+        AGENT_PID=$!
+    fi
     sleep 2
 done
 
@@ -57,5 +63,5 @@ kill -TERM "$AGENT_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 wait "$AGENT_PID"  2>/dev/null || true
 
-echo "❌ One of the processes exited — stopping container so the orchestrator can restart it."
+echo "❌ FastAPI server exited — stopping container so the orchestrator can restart it."
 exit 1
