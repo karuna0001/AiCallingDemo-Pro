@@ -489,27 +489,34 @@ async def evaluate_no_response_followups() -> dict:
         await log_error("followup", "no_response_sequence_started", f"phone={phone}; action_id={action_id}; count={count + 1}", "info")
         scheduled += 1
     try:
-        booked = await get_all_appointments(status_filter="booked")
+        from db import get_setting
+        demo_check_enabled = (await get_setting("DEMO_COMPLETION_CHECK_ENABLED", "true")).lower() in ("true", "1", "yes", "on")
     except Exception:
-        booked = []
-    for appt in booked:
-        phone = appt.get("phone") or appt.get("phone_number") or ""
-        if not phone:
-            continue
+        demo_check_enabled = True
+
+    if not demo_check_enabled:
         try:
-            appt_dt = datetime.fromisoformat(f"{appt.get('date')}T{str(appt.get('time') or '00:00')[:5]}:00")
+            booked = await get_all_appointments(status_filter="booked")
         except Exception:
-            continue
-        if appt_dt >= now:
-            continue
-        state = await get_lead_followup_state(phone) or {}
-        if state.get("journey_stage") == "demo_no_show":
-            continue
-        await update_appointment_status(appt.get("id"), "no_show")
-        await update_lead_journey(phone, {"journey_stage": "demo_no_show", "crm_status": "demo_no_show", "last_followup_reason": "demo_time_passed_no_response"})
-        action_id = await create_followup_action(phone, "demo_no_show", "whatsapp_template", "whatsapp", now, reason="reschedule_after_demo_no_show", payload={"template_purpose": "no_response_followup_template", "appointment_id": appt.get("id")})
-        await log_error("followup", "demo_no_show_detected", f"phone={phone}; appointment_id={appt.get('id')}; action_id={action_id}", "info")
-        scheduled += 1
+            booked = []
+        for appt in booked:
+            phone = appt.get("phone") or appt.get("phone_number") or ""
+            if not phone:
+                continue
+            try:
+                appt_dt = datetime.fromisoformat(f"{appt.get('date')}T{str(appt.get('time') or '00:00')[:5]}:00")
+            except Exception:
+                continue
+            if appt_dt >= now:
+                continue
+            state = await get_lead_followup_state(phone) or {}
+            if state.get("journey_stage") == "demo_no_show":
+                continue
+            await update_appointment_status(appt.get("id"), "no_show")
+            await update_lead_journey(phone, {"journey_stage": "demo_no_show", "crm_status": "demo_no_show", "last_followup_reason": "demo_time_passed_no_response"})
+            action_id = await create_followup_action(phone, "demo_no_show", "whatsapp_template", "whatsapp", now, reason="reschedule_after_demo_no_show", payload={"template_purpose": "no_response_followup_template", "appointment_id": appt.get("id")})
+            await log_error("followup", "demo_no_show_detected", f"phone={phone}; appointment_id={appt.get('id')}; action_id={action_id}", "info")
+            scheduled += 1
     return {"scheduled": scheduled}
 
 
@@ -1818,6 +1825,277 @@ async def api_appointment_debug(appointment_id: str):
         },
         "whatsapp_logs": wa_logs,
         "error_logs": related_logs,
+        "demo_status": {
+            "demo_status_requested": appointment.get("demo_status_requested") or False,
+            "demo_status_requested_at": appointment.get("demo_status_requested_at"),
+            "demo_status_request_count": appointment.get("demo_status_request_count") or 0,
+            "demo_result": appointment.get("demo_result"),
+            "demo_status_updated_by": appointment.get("demo_status_updated_by"),
+            "demo_status_updated_at": appointment.get("demo_status_updated_at"),
+        },
+    }
+
+
+class DemoResultRequest(BaseModel):
+    result: str
+    notes: Optional[str] = None
+
+
+@app.post("/api/appointments/{appointment_id}/request-demo-status")
+async def api_request_demo_status(appointment_id: str):
+    from db import get_appointment_by_id, get_appointment_staff, update_appointment_demo_fields, log_error
+    from whatsapp import send_whatsapp_template, send_whatsapp_text, get_demo_completion_template_and_purpose, is_whatsapp_service_window_open, _get_wa_setting, _build_template_params
+
+    appt = await get_appointment_by_id(appointment_id)
+    if not appt:
+        raise HTTPException(404, "Appointment not found")
+
+    staff_list = await get_appointment_staff(include_inactive=True)
+    staff = next((s for s in staff_list if s.get("id") == appt.get("staff_id")), {})
+    staff_phone = staff.get("whatsapp_number") or ""
+    if not staff_phone:
+        raise HTTPException(400, "No staff WhatsApp number configured for this appointment")
+
+    customer_name = appt.get("name", "")
+    phone = appt.get("phone") or appt.get("phone_number") or ""
+    date_s = appt.get("date", "")
+    time_s = appt.get("time", "")
+
+    success = False
+    msg_id = ""
+    err_msg = ""
+
+    staff_msg = (
+        f"Demo status update needed.\n\n"
+        f"Customer: {customer_name}\n"
+        f"Phone: {phone}\n"
+        f"Demo Time: {date_s} {time_s}\n\n"
+        f"Please reply:\n"
+        f"1 - Demo completed\n"
+        f"2 - Customer no-show\n"
+        f"3 - Rescheduled\n"
+        f"4 - Customer interested\n"
+        f"5 - Not interested\n"
+        f"6 - Need follow-up"
+    )
+
+    try:
+        from db import get_setting
+        use_template = (await get_setting("DEMO_COMPLETION_USE_TEMPLATE", "true")).lower() in ("true", "1", "yes", "on")
+    except Exception:
+        use_template = True
+
+    if use_template:
+        template_name, template_purpose = await get_demo_completion_template_and_purpose()
+        if template_name:
+            lang = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
+            params = _build_template_params(
+                template_purpose,
+                {"lead_name": customer_name, "phone": phone},
+                {"appointment_datetime": f"{date_s} {time_s}", "date": date_s, "time": time_s}
+            )
+            res = await send_whatsapp_template(
+                staff_phone, template_name, lang, params,
+                event_type="staff_demo_status_request",
+                source_type="appointment",
+                source_id=appointment_id,
+                template_purpose=template_purpose,
+                template_context={
+                    **appt,
+                    "customer_name": customer_name,
+                    "customer_phone": phone,
+                    "appointment_datetime": f"{date_s} {time_s}"
+                }
+            )
+            success = res.get("success", False)
+            msg_id = res.get("provider_message_id") or ""
+            err_msg = res.get("error") or res.get("reason") or ""
+        else:
+            if await is_whatsapp_service_window_open(staff_phone):
+                res = await send_whatsapp_text(staff_phone, staff_msg)
+                success = res.get("success", False)
+                msg_id = res.get("provider_message_id") or ""
+                err_msg = res.get("error") or res.get("reason") or ""
+            else:
+                err_msg = "template_missing"
+    else:
+        if await is_whatsapp_service_window_open(staff_phone):
+            res = await send_whatsapp_text(staff_phone, staff_msg)
+            success = res.get("success", False)
+            msg_id = res.get("provider_message_id") or ""
+            err_msg = res.get("error") or res.get("reason") or ""
+        else:
+            err_msg = "service_window_closed"
+
+    if success:
+        now = datetime.now(timezone.utc)
+        req_count = int(appt.get("demo_status_request_count") or 0)
+        updates = {
+            "demo_status_requested": True,
+            "demo_status_requested_at": now.isoformat(),
+            "demo_status_request_count": req_count + 1,
+            "demo_status_reply_message_id": msg_id
+        }
+        await update_appointment_demo_fields(appointment_id, updates)
+        await log_error("appointments", "demo_status_request_sent", f"Manually sent demo status request for appt {appointment_id}", "info")
+        return {"success": True, "message": "Demo status request sent to staff"}
+    else:
+        await log_error("appointments", "demo_status_request_failed", f"Failed manually sending demo status request for appt {appointment_id}: {err_msg}", "warning")
+        raise HTTPException(400, f"Failed sending message to staff: {err_msg}")
+
+
+@app.post("/api/appointments/{appointment_id}/mark-completed")
+async def api_mark_appointment_completed(appointment_id: str):
+    from db import get_appointment_by_id, update_appointment_demo_fields, update_lead_journey, log_error
+    appt = await get_appointment_by_id(appointment_id)
+    if not appt:
+        raise HTTPException(404, "Appointment not found")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    appt_updates = {
+        "status": "completed",
+        "completed_at": now_iso,
+        "demo_result": "completed",
+        "demo_status_updated_by": "dashboard_admin",
+        "demo_status_updated_at": now_iso
+    }
+    ok = await update_appointment_demo_fields(appointment_id, appt_updates)
+    if not ok:
+        raise HTTPException(400, "Failed to update appointment")
+
+    cust_phone = appt.get("phone") or appt.get("phone_number") or ""
+    if cust_phone:
+        await update_lead_journey(cust_phone, {
+            "crm_status": "demo_done",
+            "journey_stage": "demo_done",
+            "next_best_action": "post_demo_followup"
+        })
+    await log_error("appointments", "demo_status_updated", f"Manually completed appt {appointment_id}", "info")
+    return {"success": True}
+
+
+@app.post("/api/appointments/{appointment_id}/mark-no-show")
+async def api_mark_appointment_no_show(appointment_id: str):
+    from db import get_appointment_by_id, update_appointment_demo_fields, update_lead_journey, log_error
+    appt = await get_appointment_by_id(appointment_id)
+    if not appt:
+        raise HTTPException(404, "Appointment not found")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    appt_updates = {
+        "status": "no_show",
+        "no_show_at": now_iso,
+        "demo_result": "no_show",
+        "demo_status_updated_by": "dashboard_admin",
+        "demo_status_updated_at": now_iso
+    }
+    ok = await update_appointment_demo_fields(appointment_id, appt_updates)
+    if not ok:
+        raise HTTPException(400, "Failed to update appointment")
+
+    cust_phone = appt.get("phone") or appt.get("phone_number") or ""
+    if cust_phone:
+        await update_lead_journey(cust_phone, {
+            "crm_status": "demo_no_show",
+            "journey_stage": "demo_no_show",
+            "next_best_action": "reschedule_demo"
+        })
+    await log_error("appointments", "demo_status_updated", f"Manually marked appt {appointment_id} as no-show", "info")
+    return {"success": True}
+
+
+@app.post("/api/appointments/{appointment_id}/demo-result")
+async def api_set_demo_result(appointment_id: str, req: DemoResultRequest):
+    from db import get_appointment_by_id, update_appointment_demo_fields, update_lead_journey, log_error
+    appt = await get_appointment_by_id(appointment_id)
+    if not appt:
+        raise HTTPException(404, "Appointment not found")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    result_key = req.result.strip().lower()
+
+    valid_results = {"completed", "no_show", "rescheduled", "interested", "not_interested", "need_followup"}
+    if result_key not in valid_results:
+        raise HTTPException(400, f"Invalid demo result. Must be one of {valid_results}")
+
+    appt_updates = {
+        "demo_result": result_key,
+        "demo_result_notes": req.notes,
+        "demo_status_updated_by": "dashboard_admin",
+        "demo_status_updated_at": now_iso
+    }
+
+    crm_updates = {}
+    if result_key == "completed":
+        appt_updates["status"] = "completed"
+        appt_updates["completed_at"] = now_iso
+        crm_updates = {
+            "crm_status": "demo_done",
+            "journey_stage": "demo_done",
+            "next_best_action": "post_demo_followup"
+        }
+    elif result_key == "no_show":
+        appt_updates["status"] = "no_show"
+        appt_updates["no_show_at"] = now_iso
+        crm_updates = {
+            "crm_status": "demo_no_show",
+            "journey_stage": "demo_no_show",
+            "next_best_action": "reschedule_demo"
+        }
+    elif result_key == "rescheduled":
+        appt_updates["status"] = "reschedule_requested"
+        appt_updates["rescheduled_at"] = now_iso
+        crm_updates = {
+            "crm_status": "callback_requested",
+            "journey_stage": "callback_requested",
+            "next_best_action": "reschedule_demo"
+        }
+    elif result_key == "interested":
+        crm_updates = {
+            "crm_status": "interested",
+            "journey_stage": "interested",
+            "next_best_action": "sales_followup"
+        }
+    elif result_key == "not_interested":
+        crm_updates = {
+            "crm_status": "not_interested",
+            "journey_stage": "not_interested",
+            "stop_automation": True,
+            "stop_automation_reason": "staff_marked_not_interested"
+        }
+    elif result_key == "need_followup":
+        crm_updates = {
+            "crm_status": "callback_requested",
+            "journey_stage": "callback_requested",
+            "next_best_action": "follow_up_customer"
+        }
+
+    ok = await update_appointment_demo_fields(appointment_id, appt_updates)
+    if not ok:
+        raise HTTPException(400, "Failed to update appointment")
+
+    cust_phone = appt.get("phone") or appt.get("phone_number") or ""
+    if cust_phone and crm_updates:
+        await update_lead_journey(cust_phone, crm_updates)
+
+    await log_error("appointments", "demo_status_updated", f"Manually set appt {appointment_id} result to {result_key}", "info")
+    return {"success": True}
+
+
+@app.get("/api/appointments/{appointment_id}/demo-status")
+async def api_get_appointment_demo_status(appointment_id: str):
+    from db import get_appointment_by_id
+    appt = await get_appointment_by_id(appointment_id)
+    if not appt:
+        raise HTTPException(404, "Appointment not found")
+    return {
+        "demo_status_requested": appt.get("demo_status_requested") or False,
+        "demo_status_requested_at": appt.get("demo_status_requested_at"),
+        "demo_status_request_count": appt.get("demo_status_request_count") or 0,
+        "demo_result": appt.get("demo_result"),
+        "demo_status_updated_by": appt.get("demo_status_updated_by"),
+        "demo_status_updated_at": appt.get("demo_status_updated_at"),
+        "demo_result_notes": appt.get("demo_result_notes")
     }
 
 
@@ -4457,6 +4735,13 @@ async def api_crm_kanban():
             or canonical_crm_stage(lead.get("custom_status") or "")
             or "new_lead"
         )
+        if target not in by_id:
+            if target == "demo_no_show":
+                target = "demo_no_show" if "demo_no_show" in by_id else "callback_requested"
+            elif target in ("demo_reschedule_requested", "rescheduled", "reschedule_requested", "need_followup"):
+                target = "callback_requested"
+            else:
+                target = "new_lead"
         by_id[target]["leads"].append(lead)
     await log_error("crm", "kanban_loaded", f"contacts={len(seen)}; warnings={','.join(warnings)}", "info")
     return {"columns": columns, "warnings": warnings}

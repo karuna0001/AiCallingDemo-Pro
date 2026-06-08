@@ -52,6 +52,7 @@ WA_SETTINGS_KEYS = [
     "reminder_template",
     "no_response_followup_template",
     "re_enquiry_followup_template",
+    "staff_demo_status_request",
 ]
 
 WA_DEFAULTS = {
@@ -62,6 +63,7 @@ WA_DEFAULTS = {
     "staff_appointment_notification_template": "staff_appointment_notification",
     "staff_appointment_reminder_template": "staff_appointment_reminder",
     "staff_handoff_notification_template": "staff_appointment_alert",
+    "staff_demo_status_request": "staff_demo_status_request",
 }
 
 # ── Template purpose slot labels (for UI and health reporting) ───────────────
@@ -76,6 +78,7 @@ WA_TEMPLATE_PURPOSES = [
     ("reminder_template",                 "Reminder"),
     ("no_response_followup_template",     "No Response Follow-up"),
     ("re_enquiry_followup_template",      "Re-enquiry Follow-up"),
+    ("staff_demo_status_request",         "Staff Demo Status Request"),
 ]
 
 WA_TEMPLATE_PARAM_COUNTS = {
@@ -89,6 +92,7 @@ WA_TEMPLATE_PARAM_COUNTS = {
     "reminder_template": 3,
     "no_response_followup_template": 2,
     "re_enquiry_followup_template": 2,
+    "staff_demo_status_request": 3,
 }
 
 WA_TEMPLATE_DEBUG_PARAM_COUNTS = {
@@ -102,6 +106,7 @@ WA_TEMPLATE_DEBUG_PARAM_COUNTS = {
     "welcome_template": 2,
     "missed_call_template": 2,
     "staff_handoff_notification_template": 4,
+    "staff_demo_status_request": 3,
 }
 
 WA_TEMPLATE_COOLDOWNS = {
@@ -1475,6 +1480,18 @@ def _build_template_params(purpose_or_name: str, contact: Optional[dict], contex
         return [name, customer_phone, service or company, appointment_datetime, source]
     if purpose == "reminder_template":
         return [name, company, time]
+    if purpose == "staff_demo_status_request":
+        customer_phone = _first_value(
+            context.get("customer_phone"), context.get("phone"), context.get("phone_number"),
+            contact.get("customer_phone"), contact.get("phone"), contact.get("phone_number"),
+            fallback="",
+        )
+        appointment_datetime = _first_value(
+            context.get("appointment_datetime"),
+            f"{date} {time}".strip(),
+            fallback="the scheduled time",
+        )
+        return [name, customer_phone, appointment_datetime]
 
     params = [name]
     if service:
@@ -3764,6 +3781,12 @@ async def handle_inbound_whatsapp_message(parsed: dict) -> None:
         phone = phone_raw  # use as-is if normalization fails
 
     text = parsed.get("text", "")
+    if text:
+        try:
+            if await handle_staff_demo_status_reply(phone, text):
+                return
+        except Exception as e:
+            logger.error("Failed handling staff demo status reply: %s", e)
     msg_type = parsed.get("message_type", "text")
     media_url = parsed.get("media_url", "")
     media_id = parsed.get("media_id", "")
@@ -4134,6 +4157,7 @@ async def run_due_appointment_reminders() -> None:
         due_appointments = await get_due_reminder_appointments(window_minutes)
 
         if not due_appointments:
+            await check_demo_completions()
             return
 
         await log_error("appointment_reminder", "appointment_reminder_scan_started", f"Found {len(due_appointments)} due appointments", "info")
@@ -4275,9 +4299,393 @@ async def run_due_appointment_reminders() -> None:
             await update_appointment_notifications(appt_id, updates)
             await log_error("appointment_reminder", "appointment_reminder_processed", f"Processed reminder for {appt_id}, errors: {updates.get('reminder_error')}", "info")
 
+        await check_demo_completions()
+
     except Exception as exc:
         import traceback
         trace = traceback.format_exc()
         logger.error("run_due_appointment_reminders error: %s", exc)
         from db import log_error
         await log_error("appointment_reminder", "appointment_reminder_runner_failed", str(trace)[:2000], "error")
+
+
+async def get_demo_completion_template_and_purpose() -> tuple[str, str]:
+    # 1. Try staff_demo_status_request
+    template = await resolve_wa_template("staff_demo_status_request")
+    if template:
+        return template, "staff_demo_status_request"
+    # 2. Try override in settings: DEMO_COMPLETION_STAFF_TEMPLATE
+    from db import get_setting
+    setting_val = await get_setting("DEMO_COMPLETION_STAFF_TEMPLATE", "staff_demo_status_request")
+    if setting_val and setting_val != "staff_demo_status_request":
+        resolved = await resolve_wa_template(setting_val)
+        if resolved:
+            return resolved, _template_purpose_key(setting_val)
+    # 3. Fallbacks:
+    fallback_1 = await resolve_wa_template("staff_handoff_notification_template")
+    if fallback_1:
+        return fallback_1, "staff_handoff_notification_template"
+
+    fallback_2 = await resolve_wa_template("staff_appointment_reminder_template")
+    if fallback_2:
+        return fallback_2, "staff_appointment_reminder_template"
+
+    return "", ""
+
+
+async def check_demo_completions() -> None:
+    try:
+        from db import (
+            get_setting, get_all_appointments, get_appointment_staff,
+            update_appointment_demo_fields, log_error, normalize_phone
+        )
+
+        enabled = (await get_setting("DEMO_COMPLETION_CHECK_ENABLED", "true")).lower() in ("true", "1", "yes", "on")
+        if not enabled:
+            return
+
+        await log_error("appointment_reminder", "demo_completion_check_due", "Starting demo completion checks", "info")
+
+        delay_min = int(await get_setting("DEMO_COMPLETION_CHECK_DELAY_MINUTES", "15"))
+        max_requests = int(await get_setting("DEMO_COMPLETION_MAX_REQUESTS", "2"))
+        cooldown_min = int(await get_setting("DEMO_COMPLETION_REQUEST_COOLDOWN_MINUTES", "60"))
+
+        use_template = (await get_setting("DEMO_COMPLETION_USE_TEMPLATE", "true")).lower() in ("true", "1", "yes", "on")
+
+        booked = await get_all_appointments(status_filter="booked")
+        if not booked:
+            return
+
+        staff_list = await get_appointment_staff(include_inactive=True)
+        now = datetime.now(timezone.utc)
+
+        for appt in booked:
+            appt_id = appt.get("id")
+            phone = appt.get("phone") or appt.get("phone_number") or ""
+            customer_name = appt.get("name", "")
+            date_s = appt.get("date", "")
+            time_s = appt.get("time", "")
+            staff_id = appt.get("staff_id", "")
+
+            try:
+                tz_name = appt.get("timezone") or "Asia/Kolkata"
+                tzinfo = ZoneInfo(tz_name)
+                dt_str = f"{date_s} {time_s[:5]}"
+                local_dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=tzinfo)
+                appt_utc = local_dt.astimezone(timezone.utc)
+            except Exception as e:
+                logger.error("Failed parsing datetime for appointment %s: %s", appt_id, e)
+                continue
+
+            if now < appt_utc + timedelta(minutes=delay_min):
+                continue
+
+            if appt.get("demo_result"):
+                continue
+
+            req_count = int(appt.get("demo_status_request_count") or 0)
+            if req_count >= max_requests:
+                continue
+
+            req_at_str = appt.get("demo_status_requested_at")
+            if req_at_str:
+                try:
+                    req_at = datetime.fromisoformat(req_at_str)
+                    if req_at.tzinfo is None:
+                        req_at = req_at.replace(tzinfo=timezone.utc)
+                    if now < req_at + timedelta(minutes=cooldown_min):
+                        continue
+                except Exception:
+                    pass
+
+            staff = next((s for s in staff_list if s.get("id") == staff_id), {})
+            staff_phone = staff.get("whatsapp_number") or ""
+            if not staff_phone:
+                continue
+
+            success = False
+            msg_id = ""
+            err_msg = ""
+
+            staff_msg = (
+                f"Demo status update needed.\n\n"
+                f"Customer: {customer_name}\n"
+                f"Phone: {phone}\n"
+                f"Demo Time: {date_s} {time_s}\n\n"
+                f"Please reply:\n"
+                f"1 - Demo completed\n"
+                f"2 - Customer no-show\n"
+                f"3 - Rescheduled\n"
+                f"4 - Customer interested\n"
+                f"5 - Not interested\n"
+                f"6 - Need follow-up"
+            )
+
+            if use_template:
+                template_name, template_purpose = await get_demo_completion_template_and_purpose()
+                if template_name:
+                    lang = await _get_wa_setting("WHATSAPP_DEFAULT_LANGUAGE") or "en"
+                    params = _build_template_params(
+                        template_purpose,
+                        {"lead_name": customer_name, "phone": phone},
+                        {"appointment_datetime": f"{date_s} {time_s}", "date": date_s, "time": time_s}
+                    )
+                    await log_error("appointment_reminder", "demo_status_request_template_send_started", f"phone={staff_phone}; template={template_name}", "info")
+                    res = await send_whatsapp_template(
+                        staff_phone, template_name, lang, params,
+                        event_type="staff_demo_status_request",
+                        source_type="appointment",
+                        source_id=appt_id,
+                        template_purpose=template_purpose,
+                        template_context={
+                            **appt,
+                            "customer_name": customer_name,
+                            "customer_phone": phone,
+                            "appointment_datetime": f"{date_s} {time_s}"
+                        }
+                    )
+                    success = res.get("success", False)
+                    msg_id = res.get("provider_message_id") or ""
+                    err_msg = res.get("error") or res.get("reason") or ""
+                else:
+                    await log_error("appointment_reminder", "template_missing", f"No template configured for demo status request or fallbacks. Skipped template send.", "warning")
+                    if await is_whatsapp_service_window_open(staff_phone):
+                        res = await send_whatsapp_text(staff_phone, staff_msg)
+                        success = res.get("success", False)
+                        msg_id = res.get("provider_message_id") or ""
+                        err_msg = res.get("error") or res.get("reason") or ""
+            else:
+                if await is_whatsapp_service_window_open(staff_phone):
+                    res = await send_whatsapp_text(staff_phone, staff_msg)
+                    success = res.get("success", False)
+                    msg_id = res.get("provider_message_id") or ""
+                    err_msg = res.get("error") or res.get("reason") or ""
+                else:
+                    err_msg = "service_window_closed"
+
+            if success:
+                await log_error("appointment_reminder", "demo_status_request_sent", f"Sent demo status request to staff {staff_phone} for appointment {appt_id}", "info")
+                updates = {
+                    "demo_status_requested": True,
+                    "demo_status_requested_at": now.isoformat(),
+                    "demo_status_request_count": req_count + 1,
+                    "demo_status_reply_message_id": msg_id
+                }
+                await update_appointment_demo_fields(appt_id, updates)
+            else:
+                await log_error("appointment_reminder", "demo_status_request_failed", f"Failed sending request to staff {staff_phone} for appointment {appt_id}: {err_msg}", "warning")
+
+    except Exception as exc:
+        logger.error("check_demo_completions error: %s", exc)
+        try:
+            from db import log_error
+            await log_error("appointment_reminder", "demo_status_request_failed", f"check_demo_completions run failed: {exc}", "error")
+        except Exception:
+            pass
+
+
+def parse_staff_reply(reply: str) -> Optional[str]:
+    clean = reply.strip().lower()
+    if clean in ("1", "completed", "done", "demo completed"):
+        return "completed"
+    if clean in ("2", "no show", "not attended", "customer no-show", "no_show"):
+        return "no_show"
+    if clean in ("3", "rescheduled", "reschedule"):
+        return "rescheduled"
+    if clean in ("4", "interested", "customer interested"):
+        return "interested"
+    if clean in ("5", "not interested", "not_interested"):
+        return "not_interested"
+    if clean in ("6", "follow-up", "follow up", "need follow-up", "need_followup"):
+        return "need_followup"
+    if "1" in clean or "completed" in clean or "done" in clean:
+        return "completed"
+    if "2" in clean or "no show" in clean or "not attended" in clean:
+        return "no_show"
+    if "3" in clean or "rescheduled" in clean:
+        return "rescheduled"
+    if "4" in clean or "interested" in clean:
+        return "interested"
+    if "5" in clean or "not interested" in clean:
+        return "not_interested"
+    if "6" in clean or "follow-up" in clean or "follow up" in clean:
+        return "need_followup"
+    return None
+
+
+async def handle_staff_demo_status_reply(staff_phone: str, text: str) -> bool:
+    try:
+        from db import (
+            get_appointment_staff, get_all_appointments,
+            update_appointment_demo_fields, update_lead_journey, log_error, normalize_phone
+        )
+
+        staff_list = await get_appointment_staff(include_inactive=False)
+        staff_member = next((s for s in staff_list if normalize_phone(s.get("whatsapp_number") or "") == normalize_phone(staff_phone)), None)
+        if not staff_member:
+            return False
+
+        staff_id = staff_member.get("id")
+
+        booked = await get_all_appointments(status_filter="booked")
+        pending = [
+            a for a in booked
+            if a.get("staff_id") == staff_id
+            and bool(a.get("demo_status_requested"))
+            and not (a.get("demo_result") or "").strip()
+        ]
+        if not pending:
+            return False
+
+        def get_req_at(a):
+            val = a.get("demo_status_requested_at") or ""
+            return val
+        pending.sort(key=get_req_at, reverse=True)
+        appt = pending[0]
+        appt_id = appt.get("id")
+        cust_phone = appt.get("phone") or appt.get("phone_number") or ""
+        cust_name = appt.get("name") or "Customer"
+
+        await log_error("appointment_reminder", "staff_demo_status_reply_received", f"Received reply from staff {staff_phone}: {text[:200]}", "info")
+
+        result_key = parse_staff_reply(text)
+        if not result_key:
+            await log_error("appointment_reminder", "staff_demo_status_reply_unmatched", f"Staff {staff_phone} replied with unmatched value: {text[:200]}", "warning")
+            ack = "Please reply with 1, 2, 3, 4, 5, or 6."
+            res = await send_whatsapp_text(staff_phone, ack)
+            if res.get("success"):
+                await log_error("appointment_reminder", "demo_status_ack_sent", f"Sent unclear reply ack to staff {staff_phone}", "info")
+            else:
+                await log_error("appointment_reminder", "demo_status_ack_failed", f"Failed sending unclear reply ack to staff {staff_phone}: {res.get('error')}", "warning")
+            return True
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        appt_updates = {
+            "demo_result": result_key,
+            "demo_status_updated_by": staff_member.get("name") or "staff_whatsapp",
+            "demo_status_updated_at": now_iso
+        }
+
+        crm_updates = {}
+
+        if result_key == "completed":
+            appt_updates["status"] = "completed"
+            appt_updates["completed_at"] = now_iso
+            crm_updates = {
+                "crm_status": "demo_done",
+                "journey_stage": "demo_done",
+                "next_best_action": "post_demo_followup"
+            }
+        elif result_key == "no_show":
+            appt_updates["status"] = "no_show"
+            appt_updates["no_show_at"] = now_iso
+            crm_updates = {
+                "crm_status": "demo_no_show",
+                "journey_stage": "demo_no_show",
+                "next_best_action": "reschedule_demo"
+            }
+        elif result_key == "rescheduled":
+            appt_updates["status"] = "reschedule_requested"
+            appt_updates["rescheduled_at"] = now_iso
+            crm_updates = {
+                "crm_status": "callback_requested",
+                "journey_stage": "callback_requested",
+                "next_best_action": "reschedule_demo"
+            }
+        elif result_key == "interested":
+            crm_updates = {
+                "crm_status": "interested",
+                "journey_stage": "interested",
+                "next_best_action": "sales_followup"
+            }
+        elif result_key == "not_interested":
+            crm_updates = {
+                "crm_status": "not_interested",
+                "journey_stage": "not_interested",
+                "stop_automation": True,
+                "stop_automation_reason": "staff_marked_not_interested"
+            }
+        elif result_key == "need_followup":
+            crm_updates = {
+                "crm_status": "callback_requested",
+                "journey_stage": "callback_requested",
+                "next_best_action": "follow_up_customer"
+            }
+
+        await update_appointment_demo_fields(appt_id, appt_updates)
+        await log_error("appointment_reminder", "demo_status_updated", f"Updated appointment {appt_id} demo status to {result_key}", "info")
+
+        if cust_phone and crm_updates:
+            await update_lead_journey(cust_phone, crm_updates)
+
+        ack = f"Updated. Demo marked as {result_key.replace('_', ' ')} for {cust_name}."
+        res = await send_whatsapp_text(staff_phone, ack)
+        if res.get("success"):
+            await log_error("appointment_reminder", "demo_status_ack_sent", f"Sent success ack to staff {staff_phone}", "info")
+        else:
+            await log_error("appointment_reminder", "demo_status_ack_failed", f"Failed sending success ack to staff {staff_phone}: {res.get('error')}", "warning")
+
+        if cust_phone and not crm_updates.get("stop_automation"):
+            try:
+                from db import create_followup_action
+                followup_scheduled = False
+
+                window_open = await is_whatsapp_service_window_open(cust_phone)
+
+                if result_key == "no_show":
+                    action_type = "whatsapp_template"
+                    payload = {"template_purpose": "no_response_followup_template", "appointment_id": appt_id}
+                    if window_open:
+                        action_type = "whatsapp_text"
+                        payload = {"text": f"Hi {cust_name}, we missed you for our demo appointment. Would you like to reschedule?", "appointment_id": appt_id}
+
+                    await create_followup_action(
+                        cust_phone, "demo_no_show", action_type, "whatsapp",
+                        datetime.now(timezone.utc),
+                        reason="reschedule_after_demo_no_show",
+                        payload=payload
+                    )
+                    followup_scheduled = True
+
+                elif result_key == "completed":
+                    action_type = "whatsapp_template"
+                    payload = {"template_purpose": "welcome_template", "appointment_id": appt_id}
+                    if window_open:
+                        action_type = "whatsapp_text"
+                        payload = {"text": f"Hi {cust_name}, thank you for attending the demo today! Do you have any questions?", "appointment_id": appt_id}
+
+                    await create_followup_action(
+                        cust_phone, "post_demo_followup", action_type, "whatsapp",
+                        datetime.now(timezone.utc) + timedelta(minutes=10),
+                        reason="post_demo_thanks",
+                        payload=payload
+                    )
+                    followup_scheduled = True
+
+                elif result_key == "interested":
+                    action_type = "whatsapp_template"
+                    payload = {"template_purpose": "welcome_template", "appointment_id": appt_id}
+                    if window_open:
+                        action_type = "whatsapp_text"
+                        payload = {"text": f"Hi {cust_name}, great to hear you are interested! Let's schedule a call to discuss the next steps.", "appointment_id": appt_id}
+
+                    await create_followup_action(
+                        cust_phone, "sales_followup", action_type, "whatsapp",
+                        datetime.now(timezone.utc) + timedelta(hours=1),
+                        reason="sales_followup",
+                        payload=payload
+                    )
+                    followup_scheduled = True
+
+                if followup_scheduled:
+                    await log_error("appointment_reminder", "demo_status_customer_followup_scheduled", f"Scheduled customer follow-up for {cust_phone} after {result_key}", "info")
+
+            except Exception as e:
+                await log_error("appointment_reminder", "demo_status_customer_followup_failed", f"Failed scheduling follow-up for {cust_phone}: {e}", "warning")
+
+        return True
+
+    except Exception as exc:
+        logger.error("handle_staff_demo_status_reply error: %s", exc)
+        return False
