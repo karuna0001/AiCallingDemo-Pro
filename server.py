@@ -695,11 +695,11 @@ async def _startup():
         pass
 
     if _scheduler:
-        _scheduler.start()
-        await _reschedule_all_campaigns()
-        await _schedule_recording_cleanup()
-        # Automation action runner — every 60 seconds
         try:
+            _scheduler.start()
+            await _reschedule_all_campaigns()
+            await _schedule_recording_cleanup()
+            # Automation action runner — every 60 seconds
             from apscheduler.triggers.interval import IntervalTrigger
             _scheduler.add_job(
                 _run_due_automation_actions_sync,
@@ -720,7 +720,7 @@ async def _startup():
                 replace_existing=True,
             )
         except Exception as _e:
-            logger.warning("Runners schedule failed: %s", _e)
+            logger.warning("Scheduler startup or runner schedule failed: %s", _e)
 
 
 @app.on_event("shutdown")
