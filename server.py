@@ -661,8 +661,14 @@ async def _startup():
         from db import get_setting
         app_tz = await get_setting("APP_TIMEZONE", "Asia/Kolkata")
         auth_enabled = (await get_setting("AUTH_ENABLED", "false")).lower() in ("true", "1", "yes", "on")
-        whatsapp_enabled = (await get_setting("WHATSAPP_ENABLED", "false")).lower() in ("true", "1", "yes", "on")
         supabase_configured = True
+    except Exception:
+        pass
+
+    try:
+        from whatsapp import get_wa_health
+        wa_h = await get_wa_health()
+        whatsapp_enabled = bool(wa_h.get("enabled", False))
     except Exception:
         pass
 
@@ -2833,16 +2839,26 @@ async def api_runtime_health():
     current_time = datetime.now()
     timezone_name = str(current_time.astimezone().tzinfo or "UTC")
     app_tz = "Asia/Kolkata"
-    supabase_configured = False
     whatsapp_enabled = False
-    auth_enabled = False
+    whatsapp_provider = "meta"
+    whatsapp_templates_configured = 0
+    whatsapp_status = "missing_config"
 
     try:
         from db import get_setting
         app_tz = await get_setting("APP_TIMEZONE", "Asia/Kolkata")
         supabase_configured = True
         auth_enabled = (await get_setting("AUTH_ENABLED", "false")).lower() in ("true", "1", "yes", "on")
-        whatsapp_enabled = (await get_setting("WHATSAPP_ENABLED", "false")).lower() in ("true", "1", "yes", "on")
+    except Exception:
+        pass
+
+    try:
+        from whatsapp import get_wa_health
+        wa_h = await get_wa_health()
+        whatsapp_enabled = bool(wa_h.get("enabled", False))
+        whatsapp_provider = wa_h.get("provider", "meta")
+        whatsapp_templates_configured = wa_h.get("templates_configured", 0)
+        whatsapp_status = wa_h.get("status", "missing_config")
     except Exception:
         pass
 
@@ -2877,6 +2893,9 @@ async def api_runtime_health():
         "auth_enabled": auth_enabled,
         "supabase_configured": supabase_configured,
         "whatsapp_enabled": whatsapp_enabled,
+        "whatsapp_provider": whatsapp_provider,
+        "whatsapp_templates_configured": whatsapp_templates_configured,
+        "whatsapp_status": whatsapp_status,
         "livekit_configured": livekit_configured,
         **fd_diag
     }

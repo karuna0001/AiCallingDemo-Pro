@@ -12,6 +12,8 @@ This guide details how to configure health checks in Coolify/Traefik and diagnos
 * **Readiness Path (Alternative)**: `/api/ready`
   * Verifies that the container can connect to Supabase, WhatsApp API, and LiveKit.
   * **Warning**: Only use this if you want Coolify to hold routing traffic during a complete external service failure. Do not use this as a frequent (e.g. every 5s) health check to prevent load spikes.
+* **Diagnostics Path**: `/api/runtime/health`
+  * Provides comprehensive runtime diagnostics for troubleshooting, including timezone info, scheduler state, process memory usage, file descriptor counts, and WhatsApp health attributes (such as `whatsapp_enabled`, `whatsapp_provider`, `whatsapp_templates_configured`, and `whatsapp_status`). Do not use this for Traefik proxy checks since it queries dynamic settings.
 
 ---
 

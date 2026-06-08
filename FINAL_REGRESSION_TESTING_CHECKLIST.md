@@ -156,7 +156,12 @@ Run this checklist on the deployed branch before merging into the stable product
 - Verify logs contain `automation_queue_load_started` and `automation_queue_load_success` / `automation_queue_load_failed` when loading.
 - Verify logs contain `automation_queue_health_checked` when requesting health status.
 
-## 34. Appointment Demo Completion Follow-up
+## 34. Runtime WhatsApp Health Display
+- Open `GET /api/whatsapp/health` and verify `enabled` is `true`.
+- Open `GET /api/runtime/health` and verify `whatsapp_enabled` is `true` (and shows accurate provider, templates count, and status ok).
+- Boot the application and verify that the startup log `app_started` displays `whatsapp_enabled=True` when Meta configuration is present.
+
+## 35. Appointment Demo Completion Follow-up
 - Book a demo appointment and verify the staff receives the appointment notification successfully.
 - Verify that once the demo time passes (plus the configured delay), the scheduler triggers a WhatsApp request message/template sent to the assigned staff member asking for the demo result.
 - Confirm the staff reply triggers the mapped status updates (e.g., reply `1` marks status as Completed/Demo Done, reply `2` marks as no-show and schedules reschedule follow-up).
