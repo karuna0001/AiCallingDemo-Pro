@@ -110,6 +110,34 @@ DEFAULT_OUTBOUND_AGENT_NAME = "outbound-caller-v3"
 _START_TIME = time.time()
 LAST_BACKGROUND_ERROR = None
 
+# Persistent background event loop for scheduler jobs to prevent asyncio.run loop/socket leaks
+BACKGROUND_LOOP = None
+_BACKGROUND_LOOP_LOCK = asyncio.Lock if asyncio else None # simple reference
+
+# Guard against overlapping jobs
+_RUNNING_JOBS = {}
+_RUNNING_JOBS_LOCK = threading.Lock()
+
+# Throttle DB error logging for Errno 24 scenario
+_LAST_DB_ERROR_LOG_TIME = {}
+_LAST_DB_ERROR_LOG_TIME_LOCK = threading.Lock()
+
+def _start_background_loop():
+    global BACKGROUND_LOOP
+    BACKGROUND_LOOP = asyncio.new_event_loop()
+
+    def run_loop():
+        asyncio.set_event_loop(BACKGROUND_LOOP)
+        logger.info("background_event_loop_started")
+        BACKGROUND_LOOP.run_forever()
+
+    t = threading.Thread(target=run_loop, name="persistent-background-loop", daemon=True)
+    t.start()
+
+# Start background loop immediately on app start
+_start_background_loop()
+
+
 def _record_background_error(task: str, exc: Exception):
     global LAST_BACKGROUND_ERROR
     error_msg = str(exc)
@@ -119,20 +147,51 @@ def _record_background_error(task: str, exc: Exception):
         "timestamp": datetime.now().isoformat()
     }
     logger.error("Background task error in %s: %s", task, error_msg)
-    try:
-        loop = None
+
+    # Throttle DB log saving
+    now = time.time()
+    cache_key = (task, error_msg)
+    with _LAST_DB_ERROR_LOG_TIME_LOCK:
+        last_logged = _LAST_DB_ERROR_LOG_TIME.get(cache_key, 0)
+        if now - last_logged < 300: # 5 minutes cooldown
+            return
+        _LAST_DB_ERROR_LOG_TIME[cache_key] = now
+
+    # Dispatch to background loop safely
+    if BACKGROUND_LOOP and BACKGROUND_LOOP.is_running():
         try:
-            loop = asyncio.get_event_loop()
-        except Exception:
-            pass
-        if loop and loop.is_running():
-            loop.create_task(log_error("background_task_error", "scheduler_loop_error", f"task={task}; error={error_msg[:400]}", "error"))
-            loop.create_task(log_error("server", "runtime_health_background_error", f"task={task}; error={error_msg[:400]}", "error"))
-        else:
-            asyncio.run(log_error("background_task_error", "scheduler_loop_error", f"task={task}; error={error_msg[:400]}", "error"))
-            asyncio.run(log_error("server", "runtime_health_background_error", f"task={task}; error={error_msg[:400]}", "error"))
-    except Exception as e:
-        logger.warning("Failed to save background error to db: %s", e)
+            asyncio.run_coroutine_threadsafe(log_error("background_task_error", "scheduler_loop_error", f"task={task}; error={error_msg[:400]}", "error"), BACKGROUND_LOOP)
+            asyncio.run_coroutine_threadsafe(log_error("server", "runtime_health_background_error", f"task={task}; error={error_msg[:400]}", "error"), BACKGROUND_LOOP)
+        except Exception as e:
+            logger.warning("Failed to dispatch background error to db: %s", e)
+
+
+def run_coro_background(coro, job_name: str, timeout: float = 45.0) -> Any:
+    # Overlapping check
+    if job_name in ("automation_actions", "appointment_reminders", "followup_actions"):
+        with _RUNNING_JOBS_LOCK:
+            if _RUNNING_JOBS.get(job_name, False):
+                logger.warning("background_job_skipped_already_running job_name=%s", job_name)
+                return None
+            _RUNNING_JOBS[job_name] = True
+
+    logger.info("background_job_started job_name=%s", job_name)
+    try:
+        future = asyncio.run_coroutine_threadsafe(coro, BACKGROUND_LOOP)
+        res = future.result(timeout=timeout)
+        logger.info("background_job_completed job_name=%s", job_name)
+        return res
+    except TimeoutError as exc:
+        logger.error("background_job_timeout job_name=%s timeout=%s", job_name, timeout)
+        return None
+    except Exception as exc:
+        logger.error("background_job_failed job_name=%s error=%s", job_name, exc)
+        _record_background_error(job_name, exc)
+        return None
+    finally:
+        if job_name in ("automation_actions", "appointment_reminders", "followup_actions"):
+            with _RUNNING_JOBS_LOCK:
+                _RUNNING_JOBS[job_name] = False
 
 
 def _deployed_code_version() -> str:
@@ -290,13 +349,7 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
 
 def _run_due_appointment_reminders_sync():
     """Sync wrapper for APScheduler appointment reminders."""
-    logger.info("Running due appointment reminders")
-    try:
-        asyncio.run(run_due_appointment_reminders())
-        logger.info("Due appointment reminders completed")
-    except Exception as exc:
-        _record_background_error("appointment_reminders", exc)
-        logger.exception("Due appointment reminders failed: %s", exc)
+    run_coro_background(run_due_appointment_reminders(), "appointment_reminders")
 
 
 async def run_due_followup_actions() -> dict:
@@ -459,15 +512,13 @@ async def evaluate_no_response_followups() -> dict:
     return {"scheduled": scheduled}
 
 
+async def _run_followup_and_evaluate():
+    await run_due_followup_actions()
+    await evaluate_no_response_followups()
+
+
 def _run_due_followup_actions_sync() -> None:
-    logger.info("Running due follow-up actions")
-    try:
-        asyncio.run(run_due_followup_actions())
-        asyncio.run(evaluate_no_response_followups())
-        logger.info("Due follow-up actions completed")
-    except Exception as exc:
-        _record_background_error("followup_actions", exc)
-        logger.exception("Due follow-up actions failed: %s", exc)
+    run_coro_background(_run_followup_and_evaluate(), "followup_actions")
 
 
 def _date_in_range(value: str, date_from: Optional[str], date_to: Optional[str]) -> bool:
@@ -2462,6 +2513,38 @@ async def api_ready():
     }
 
 
+def _get_fd_diagnostics() -> dict:
+    open_fds_count = None
+    open_fds_soft_limit = None
+    open_fds_hard_limit = None
+
+    # Linux fd counting
+    try:
+        if os.path.exists("/proc/self/fd"):
+            open_fds_count = len(os.listdir("/proc/self/fd"))
+    except Exception:
+        pass
+
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        open_fds_soft_limit = soft
+        open_fds_hard_limit = hard
+
+        # Log warning if open FDs count > 70% of soft limit
+        if open_fds_count is not None and soft > 0:
+            if open_fds_count > 0.7 * soft:
+                logger.warning("open_fds_warning count=%s soft_limit=%s", open_fds_count, soft)
+    except Exception:
+        pass
+
+    return {
+        "open_fds_count": open_fds_count,
+        "open_fds_soft_limit": open_fds_soft_limit,
+        "open_fds_hard_limit": open_fds_hard_limit
+    }
+
+
 @app.get("/api/runtime/health")
 async def api_runtime_health():
     """Extensive runtime health endpoint for detailed container diagnostics."""
@@ -2500,6 +2583,8 @@ async def api_runtime_health():
         "running": _scheduler.running if _scheduler else False
     }
 
+    fd_diag = _get_fd_diagnostics()
+
     return {
         "process_alive": True,
         "uptime_seconds": int(time.time() - _START_TIME),
@@ -2513,7 +2598,8 @@ async def api_runtime_health():
         "auth_enabled": auth_enabled,
         "supabase_configured": supabase_configured,
         "whatsapp_enabled": whatsapp_enabled,
-        "livekit_configured": livekit_configured
+        "livekit_configured": livekit_configured,
+        **fd_diag
     }
 
 
@@ -5426,31 +5512,17 @@ async def _reschedule_all_campaigns() -> None:
 
 def _run_campaign_sync(campaign_id: str) -> None:
     """Sync wrapper for APScheduler campaign cron job."""
-    try:
-        asyncio.run(_run_campaign(campaign_id))
-    except Exception as exc:
-        _record_background_error(f"campaign_run_{campaign_id}", exc)
-        logger.exception("Scheduled campaign run failed (id=%s): %s", campaign_id, exc)
+    run_coro_background(_run_campaign(campaign_id), f"campaign_run_{campaign_id}")
 
 
 def _run_due_automation_actions_sync() -> None:
     """Sync wrapper for APScheduler — bridges thread context to async."""
-    logger.info("Running due automation actions")
-    try:
-        asyncio.run(run_due_automation_actions())
-        logger.info("Due automation actions completed")
-    except Exception as exc:
-        _record_background_error("automation_actions", exc)
-        logger.exception("Due automation actions failed: %s", exc)
+    run_coro_background(run_due_automation_actions(), "automation_actions")
 
 
 def _scheduled_recording_cleanup_sync() -> None:
     """Sync wrapper for APScheduler recording cleanup."""
-    try:
-        asyncio.run(_scheduled_recording_cleanup())
-    except Exception as exc:
-        _record_background_error("recording_cleanup", exc)
-        logger.exception("Scheduled recording cleanup (sync wrapper) failed: %s", exc)
+    run_coro_background(_scheduled_recording_cleanup(), "recording_cleanup")
 
 
 async def _scheduled_recording_cleanup() -> None:
