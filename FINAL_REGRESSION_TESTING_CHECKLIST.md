@@ -155,3 +155,11 @@ Run this checklist on the deployed branch before merging into the stable product
 - Navigate to the Automation Queue tab on the dashboard, click Refresh, and confirm it loads and populates successfully or displays a clear empty state if no items exist.
 - Verify logs contain `automation_queue_load_started` and `automation_queue_load_success` / `automation_queue_load_failed` when loading.
 - Verify logs contain `automation_queue_health_checked` when requesting health status.
+
+## 34. Appointment Demo Completion Follow-up
+- Book a demo appointment and verify the staff receives the appointment notification successfully.
+- Verify that once the demo time passes (plus the configured delay), the scheduler triggers a WhatsApp request message/template sent to the assigned staff member asking for the demo result.
+- Confirm the staff reply triggers the mapped status updates (e.g., reply `1` marks status as Completed/Demo Done, reply `2` marks as no-show and schedules reschedule follow-up).
+- Check that an unclear staff reply gets a clarification response asking for a value between 1 and 6.
+- Ensure that no Telegram messages are sent and no repeated WhatsApp spam occurs by respecting the cooldown.
+- Verify runtime health remains stable and no event loop leak occurs.

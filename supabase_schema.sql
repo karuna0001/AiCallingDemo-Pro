@@ -482,3 +482,13 @@ ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS error_code TEXT NOT NULL DEFA
 ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS idempotency_key TEXT NOT NULL DEFAULT '';
 ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS cooldown_until TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_idempotency ON whatsapp_logs(idempotency_key);
+
+-- ── Phase 11: Appointment Demo Completion Follow-up ─────────────────────────
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS demo_status_requested boolean DEFAULT false;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS demo_status_requested_at timestamptz;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS demo_status_request_count integer DEFAULT 0;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS demo_status_updated_by text;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS demo_status_updated_at timestamptz;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS demo_result text;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS demo_result_notes text;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS demo_status_reply_message_id text;

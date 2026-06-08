@@ -336,6 +336,9 @@ async def get_all_settings() -> dict:
         "AUTH_ENABLED", "ADMIN_API_KEY", "WEBHOOK_VERIFY_TOKEN",
         "COST_GEMINI_VOICE_PER_MINUTE", "COST_SIP_PER_MINUTE", "COST_RECORDING_PER_MINUTE",
         "COST_WHATSAPP_TEMPLATE", "COST_WHATSAPP_FREE_TEXT", "COST_CURRENCY",
+        "DEMO_COMPLETION_CHECK_ENABLED", "DEMO_COMPLETION_CHECK_DELAY_MINUTES",
+        "DEMO_COMPLETION_STAFF_TEMPLATE", "DEMO_COMPLETION_USE_TEMPLATE",
+        "DEMO_COMPLETION_MAX_REQUESTS", "DEMO_COMPLETION_REQUEST_COOLDOWN_MINUTES",
     ]
     out = {}
     for k in known_keys:
@@ -1132,6 +1135,33 @@ async def update_appointment_notifications(appointment_id: str, updates: dict) -
     return len(result.data or []) > 0
 
 
+async def update_appointment_demo_fields(appointment_id: str, updates: dict) -> bool:
+    allowed = {
+        "demo_status_requested",
+        "demo_status_requested_at",
+        "demo_status_request_count",
+        "demo_status_updated_by",
+        "demo_status_updated_at",
+        "demo_result",
+        "demo_result_notes",
+        "demo_status_reply_message_id",
+        "status",
+        "completed_at",
+        "no_show_at",
+        "rescheduled_at",
+    }
+    clean = {k: v for k, v in (updates or {}).items() if k in allowed}
+    if not clean:
+        return False
+    db = await _adb()
+    try:
+        result = await db.table("appointments").update(clean).eq("id", appointment_id).execute()
+        return len(result.data or []) > 0
+    except Exception as exc:
+        logger.warning("update_appointment_demo_fields error: %s", exc)
+        return False
+
+
 async def get_due_reminder_appointments(window_minutes: int) -> list:
     """Return booked appointments within the next ``window_minutes`` whose
     reminder flags are not yet all satisfied.
@@ -1423,6 +1453,11 @@ CRM_PIPELINE_STAGE_ALIASES = {
     "wrong_number": "lost",
     "invalid_number": "lost",
     "do_not_contact": "lost",
+    "demo_no_show": "callback_requested",
+    "rescheduled": "callback_requested",
+    "demo_reschedule_requested": "callback_requested",
+    "reschedule_requested": "callback_requested",
+    "need_followup": "callback_requested",
 }
 CRM_PIPELINE_NEXT_ACTIONS = {
     "callback_requested": "call_customer",
