@@ -155,3 +155,8 @@ Run this checklist on the deployed branch before merging into the stable product
 - Navigate to the Automation Queue tab on the dashboard, click Refresh, and confirm it loads and populates successfully or displays a clear empty state if no items exist.
 - Verify logs contain `automation_queue_load_started` and `automation_queue_load_success` / `automation_queue_load_failed` when loading.
 - Verify logs contain `automation_queue_health_checked` when requesting health status.
+
+## 34. Runtime WhatsApp Health Display
+- Open `GET /api/whatsapp/health` and verify `enabled` is `true`.
+- Open `GET /api/runtime/health` and verify `whatsapp_enabled` is `true` (and shows accurate provider, templates count, and status ok).
+- Boot the application and verify that the startup log `app_started` displays `whatsapp_enabled=True` when Meta configuration is present.
