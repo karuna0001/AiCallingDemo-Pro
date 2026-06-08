@@ -489,7 +489,6 @@ async def evaluate_no_response_followups() -> dict:
         await log_error("followup", "no_response_sequence_started", f"phone={phone}; action_id={action_id}; count={count + 1}", "info")
         scheduled += 1
     try:
-        from db import get_setting
         demo_check_enabled = (await get_setting("DEMO_COMPLETION_CHECK_ENABLED", "true")).lower() in ("true", "1", "yes", "on")
     except Exception:
         demo_check_enabled = True
@@ -1880,7 +1879,6 @@ async def api_request_demo_status(appointment_id: str):
     )
 
     try:
-        from db import get_setting
         use_template = (await get_setting("DEMO_COMPLETION_USE_TEMPLATE", "true")).lower() in ("true", "1", "yes", "on")
     except Exception:
         use_template = True
