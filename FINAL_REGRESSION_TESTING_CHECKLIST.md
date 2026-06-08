@@ -141,3 +141,10 @@ Run this checklist on the deployed branch before merging into the stable product
 - Temporarily block the `/api/automation/rules` API (or mock a failure) and confirm the UI displays a readable error message instead of a blank page or `[object Object]`.
 - Verify backend logs contain "automation_rules_load_started", "automation_rules_load_success", and "automation_rules_load_failed" when appropriate.
 - Test a rule in the Test sub-tab and confirm test execution/dry-run outputs render cleanly.
+
+## 32. Event Loop and File Descriptor Leak Checks
+- Open `/api/runtime/health` and verify `open_fds_count` is returned.
+- Wait 5 minutes and confirm `open_fds_count` does not keep increasing indefinitely with every scheduler loop execution.
+- Wait 30 minutes and confirm the app still responds immediately to `/api/live`.
+- Confirm scheduler background jobs run regularly without logging `OSError: [Errno 24] Too many open files`.
+- Verify background logs contain `background_event_loop_started`, `background_job_started`, and `background_job_completed`.
