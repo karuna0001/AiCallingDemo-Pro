@@ -2018,10 +2018,11 @@ async def api_set_demo_result(appointment_id: str, req: DemoResultRequest):
 
     appt_updates = {
         "demo_result": result_key,
-        "demo_result_notes": req.notes,
         "demo_status_updated_by": "dashboard_admin",
         "demo_status_updated_at": now_iso
     }
+    if req.notes:
+        appt_updates["notes"] = req.notes
 
     crm_updates = {}
     if result_key == "completed":

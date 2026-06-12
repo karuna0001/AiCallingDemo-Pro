@@ -1145,6 +1145,7 @@ async def update_appointment_demo_fields(appointment_id: str, updates: dict) -> 
         "demo_result",
         "demo_result_notes",
         "demo_status_reply_message_id",
+        "notes",
         "status",
         "completed_at",
         "no_show_at",
@@ -1159,6 +1160,12 @@ async def update_appointment_demo_fields(appointment_id: str, updates: dict) -> 
         return len(result.data or []) > 0
     except Exception as exc:
         logger.warning("update_appointment_demo_fields error: %s", exc)
+        await log_error(
+            "appointments",
+            "appointment_demo_fields_update_failed",
+            f"appointment_id={appointment_id}; fields={sorted(clean.keys())}; error={str(exc)[:1000]}",
+            "error",
+        )
         return False
 
 
