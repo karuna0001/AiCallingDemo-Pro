@@ -4828,13 +4828,38 @@ TERMINAL_LEAD_SLUGS = {"not_interested", "wrong_number", "do_not_contact", "conv
 
 
 def _lead_opted_out(lead: dict) -> bool:
-    status = _status_slug(lead.get("crm_status") or lead.get("journey_stage") or "")
-    return bool(lead.get("stop_automation")) or status in TERMINAL_LEAD_SLUGS
+    statuses = {
+        _status_slug(lead.get("crm_status") or ""),
+        _status_slug(lead.get("journey_stage") or ""),
+    }
+    return bool(lead.get("stop_automation")) or bool(statuses & TERMINAL_LEAD_SLUGS)
+
+
+def _broadcast_segment(campaign: dict) -> dict:
+    segment = campaign.get("segment") or campaign.get("segment_json") or {}
+    if isinstance(segment, str):
+        segment = _json_dict(segment)
+    return segment if isinstance(segment, dict) else {}
+
+
+def _broadcast_segment_is_empty(segment: dict) -> bool:
+    return not any(str(v or "").strip() for v in (segment or {}).values())
+
+
+def _broadcast_segment_keys(segment: dict) -> set:
+    return {str(k) for k, v in (segment or {}).items() if str(v or "").strip()}
 
 
 def _segment_match(lead: dict, segment: dict) -> bool:
     if not segment:
         return True
+    phone_filter = (segment.get("phone_number") or "").strip()
+    if phone_filter:
+        try:
+            if normalize_phone(lead.get("phone_number") or "") != normalize_phone(phone_filter):
+                return False
+        except Exception:
+            return False
     for key in ("crm_status", "source", "journey_stage", "assigned_to", "service_type"):
         value = segment.get(key)
         if value and str(lead.get(key) or "").lower() != str(value).lower():
@@ -4856,9 +4881,7 @@ async def _broadcast_campaign(campaign_id: str) -> Optional[dict]:
 
 
 async def _broadcast_preview_contacts(campaign: dict, limit: int = 200) -> list:
-    segment = campaign.get("segment") or campaign.get("segment_json") or {}
-    if isinstance(segment, str):
-        segment = _json_dict(segment)
+    segment = _broadcast_segment(campaign)
     contacts = await get_crm_contacts()
     seen = set()
     preview = []
@@ -4875,6 +4898,11 @@ async def _broadcast_preview_contacts(campaign: dict, limit: int = 200) -> list:
         if len(preview) >= limit:
             break
     return preview
+
+
+async def _broadcast_test_mode_enabled() -> bool:
+    raw = await get_setting("BROADCAST_TEST_MODE", os.getenv("BROADCAST_TEST_MODE", "true"))
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @app.get("/api/broadcast/campaigns")
@@ -4940,19 +4968,26 @@ async def api_start_broadcast_campaign(campaign_id: str, req: BroadcastStartRequ
         raise HTTPException(404, "Broadcast campaign not found")
     if (campaign.get("status") or "") == "paused":
         raise HTTPException(400, "Campaign is paused")
-    segment = campaign.get("segment") or {}
-    if isinstance(segment, str):
-        segment = _json_dict(segment)
+    segment = _broadcast_segment(campaign)
     confirm = str(req.confirm or "").strip()
-    if segment:
-        if confirm not in {"START_BROADCAST", "CONFIRM_BROADCAST"}:
-            raise HTTPException(400, {"message": "Broadcast start requires backend confirmation.", "required_confirm": "START_BROADCAST"})
-    elif confirm != "SEND_TO_ALL":
-        raise HTTPException(400, {"message": "This broadcast has no segment filter and would target all eligible contacts. Type SEND_TO_ALL to confirm.", "required_confirm": "SEND_TO_ALL"})
-    contacts = await _broadcast_preview_contacts(campaign, limit=1000)
+    if _broadcast_segment_is_empty(segment):
+        raise HTTPException(400, {"message": "Broadcast start blocked: segment is empty. Add a safe segment filter before starting."})
+    test_mode = await _broadcast_test_mode_enabled()
+    active_keys = _broadcast_segment_keys(segment)
+    if test_mode and active_keys != {"phone_number"}:
+        raise HTTPException(400, {"message": "Broadcast test mode is enabled. Only a phone_number segment is allowed.", "required_segment": {"phone_number": "+919150151775"}})
+    if not test_mode and "phone_number" in active_keys:
+        raise HTTPException(400, {"message": "Broadcast start blocked: phone_number targeting is allowed only when BROADCAST_TEST_MODE=true."})
+    if confirm not in {"START_BROADCAST", "CONFIRM_BROADCAST"}:
+        raise HTTPException(400, {"message": "Broadcast start requires backend confirmation.", "required_confirm": "START_BROADCAST"})
+    max_per_run = int(await get_setting("BROADCAST_MAX_SEND_PER_RUN", "50") or 50)
+    contacts = await _broadcast_preview_contacts(campaign, limit=max_per_run + 1)
     if not contacts:
         raise HTTPException(400, "No eligible broadcast recipients after opt-out and segment filters.")
-    max_per_run = int(await get_setting("BROADCAST_MAX_SEND_PER_RUN", "50") or 50)
+    if test_mode and len(contacts) > 1:
+        raise HTTPException(400, {"message": "Broadcast test mode is enabled. Recipient count must be exactly 1.", "recipient_count": len(contacts)})
+    if len(contacts) > max_per_run:
+        raise HTTPException(400, {"message": "Broadcast start blocked: recipient count exceeds BROADCAST_MAX_SEND_PER_RUN.", "recipient_count": len(contacts), "max_allowed": max_per_run})
     template_name = campaign.get("template_name") or await resolve_wa_template(campaign.get("template_purpose") or "")
     if not template_name:
         raise HTTPException(400, "Broadcast template is not configured")
