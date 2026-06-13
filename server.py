@@ -4890,17 +4890,44 @@ async def _broadcast_campaign(campaign_id: str) -> Optional[dict]:
 async def _broadcast_preview_contacts(campaign: dict, limit: int = 200) -> list:
     segment = _broadcast_segment(campaign)
     contacts = await get_crm_contacts()
-    seen = set()
-    preview = []
+    leads_by_phone: dict[str, list[dict]] = {}
+    terminal_phones: set[str] = set()
+
     for lead in contacts:
-        phone = lead.get("phone_number") or ""
-        if not phone or phone in seen:
+        raw_phone = lead.get("phone_number") or lead.get("phone") or ""
+        if not raw_phone:
             continue
-        seen.add(phone)
+        try:
+            phone = normalize_phone(raw_phone)
+        except Exception:
+            continue
+        if not phone:
+            continue
+        leads_by_phone.setdefault(phone, []).append(lead)
         if _lead_opted_out(lead):
+            terminal_phones.add(phone)
+
+    preview = []
+    for phone, leads in leads_by_phone.items():
+        matching_leads = [lead for lead in leads if _segment_match(lead, segment)]
+        if not matching_leads:
             continue
-        if not _segment_match(lead, segment):
+
+        if phone in terminal_phones:
+            if len(leads) > 1:
+                await log_error(
+                    "broadcast",
+                    "broadcast_duplicate_phone_skipped_terminal",
+                    (
+                        f"phone={phone}; rows={len(leads)}; "
+                        f"segment={json.dumps(segment, default=str)}"
+                    ),
+                    "warning",
+                )
             continue
+
+        lead = dict(matching_leads[0])
+        lead["phone_number"] = phone
         preview.append(lead)
         if len(preview) >= limit:
             break
