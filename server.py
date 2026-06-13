@@ -4850,6 +4850,13 @@ def _broadcast_segment_keys(segment: dict) -> set:
     return {str(k) for k, v in (segment or {}).items() if str(v or "").strip()}
 
 
+def _broadcast_segment_for_storage(segment: Optional[dict]) -> dict:
+    clean = _broadcast_segment({"segment": segment or {}})
+    if clean.get("phone_number"):
+        clean["phone_number"] = normalize_phone(str(clean.get("phone_number") or ""))
+    return clean
+
+
 def _segment_match(lead: dict, segment: dict) -> bool:
     if not segment:
         return True
@@ -4905,6 +4912,48 @@ async def _broadcast_test_mode_enabled() -> bool:
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+async def _broadcast_preview_result(campaign: dict, limit: int = 200) -> dict:
+    segment = _broadcast_segment(campaign)
+    active_keys = sorted(_broadcast_segment_keys(segment))
+    test_mode = await _broadcast_test_mode_enabled()
+    if test_mode and set(active_keys) != {"phone_number"}:
+        return {
+            "blocked": True,
+            "error": "Broadcast test mode is enabled. Preview requires exactly a phone_number segment.",
+            "segment": segment,
+            "active_segment_keys": active_keys,
+            "test_mode": test_mode,
+            "count": 0,
+            "recipients": [],
+        }
+    recipients = await _broadcast_preview_contacts(campaign, limit=limit)
+    if test_mode and len(recipients) > 1:
+        await log_error(
+            "broadcast",
+            "broadcast_preview_test_mode_too_many_recipients",
+            f"campaign_id={campaign.get('id')}; segment={json.dumps(segment, default=str)}; count={len(recipients)}",
+            "error",
+        )
+        return {
+            "blocked": True,
+            "error": "Broadcast test mode preview returned more than one recipient. Start is blocked.",
+            "segment": segment,
+            "active_segment_keys": active_keys,
+            "test_mode": test_mode,
+            "count": len(recipients),
+            "recipients": recipients[:1],
+        }
+    return {
+        "blocked": False,
+        "error": "",
+        "segment": segment,
+        "active_segment_keys": active_keys,
+        "test_mode": test_mode,
+        "count": len(recipients),
+        "recipients": recipients,
+    }
+
+
 @app.get("/api/broadcast/campaigns")
 async def api_broadcast_campaigns():
     try:
@@ -4922,12 +4971,16 @@ async def api_create_broadcast_campaign(req: BroadcastCampaignRequest):
     template = await resolve_wa_template(req.template_purpose)
     if not template:
         raise HTTPException(400, "Approved WhatsApp template purpose is not configured")
+    try:
+        segment = _broadcast_segment_for_storage(req.segment)
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid broadcast segment: {exc}") from exc
     row = {
         "id": str(uuid.uuid4()),
         "name": name,
         "template_purpose": req.template_purpose,
         "template_name": template,
-        "segment": req.segment or {},
+        "segment": segment,
         "status": "draft",
         "scheduled_at": req.scheduled_at,
         "sent_count": 0,
@@ -4948,8 +5001,8 @@ async def api_preview_broadcast_campaign(campaign_id: str):
     campaign = await _broadcast_campaign(campaign_id)
     if not campaign:
         raise HTTPException(404, "Broadcast campaign not found")
-    contacts = await _broadcast_preview_contacts(campaign, limit=200)
-    return {"campaign_id": campaign_id, "count": len(contacts), "recipients": contacts[:50]}
+    preview = await _broadcast_preview_result(campaign, limit=200)
+    return {"campaign_id": campaign_id, **preview, "recipients": preview["recipients"][:50]}
 
 
 async def _campaign_recipient_exists(campaign_id: str, phone: str) -> bool:
@@ -4968,20 +5021,23 @@ async def api_start_broadcast_campaign(campaign_id: str, req: BroadcastStartRequ
         raise HTTPException(404, "Broadcast campaign not found")
     if (campaign.get("status") or "") == "paused":
         raise HTTPException(400, "Campaign is paused")
-    segment = _broadcast_segment(campaign)
+    max_per_run = int(await get_setting("BROADCAST_MAX_SEND_PER_RUN", "50") or 50)
+    preview = await _broadcast_preview_result(campaign, limit=max_per_run + 1)
+    segment = preview["segment"]
     confirm = str(req.confirm or "").strip()
     if _broadcast_segment_is_empty(segment):
         raise HTTPException(400, {"message": "Broadcast start blocked: segment is empty. Add a safe segment filter before starting."})
-    test_mode = await _broadcast_test_mode_enabled()
-    active_keys = _broadcast_segment_keys(segment)
+    test_mode = preview["test_mode"]
+    active_keys = set(preview["active_segment_keys"])
+    if preview["blocked"]:
+        raise HTTPException(400, {"message": preview["error"], "segment": preview["segment"], "active_segment_keys": preview["active_segment_keys"]})
     if test_mode and active_keys != {"phone_number"}:
         raise HTTPException(400, {"message": "Broadcast test mode is enabled. Only a phone_number segment is allowed.", "required_segment": {"phone_number": "+919150151775"}})
     if not test_mode and "phone_number" in active_keys:
         raise HTTPException(400, {"message": "Broadcast start blocked: phone_number targeting is allowed only when BROADCAST_TEST_MODE=true."})
     if confirm not in {"START_BROADCAST", "CONFIRM_BROADCAST"}:
         raise HTTPException(400, {"message": "Broadcast start requires backend confirmation.", "required_confirm": "START_BROADCAST"})
-    max_per_run = int(await get_setting("BROADCAST_MAX_SEND_PER_RUN", "50") or 50)
-    contacts = await _broadcast_preview_contacts(campaign, limit=max_per_run + 1)
+    contacts = preview["recipients"]
     if not contacts:
         raise HTTPException(400, "No eligible broadcast recipients after opt-out and segment filters.")
     if test_mode and len(contacts) > 1:
