@@ -3421,13 +3421,24 @@ async def api_test_automation(req: AutomationTestRequest):
             raise HTTPException(400, str(e))
         rules = await get_automation_rules()
         rule = find_automation_rule(rules, req.event_type, req.source)
+        if not rule:
+            from whatsapp import _find_disabled_automation_rule
+            rule = _find_disabled_automation_rule(rules, req.event_type, req.source)
+        matched_rule_key = f"{rule.get('event_type', '')}:{rule.get('source', 'all')}" if rule else ""
+        selected_template = rule.get("whatsapp_template", "") if rule else ""
+        planned_action = rule.get("action") if rule else "no_matching_rule"
         if req.dry_run:
             return {
                 "dry_run": True,
                 "event_type": req.event_type,
                 "source": req.source,
+                "requested_event_type": req.event_type,
+                "requested_source": req.source,
+                "matched_rule_key": matched_rule_key,
                 "matched_rule": rule,
-                "planned_action": rule.get("action") if rule else "no_matching_rule",
+                "planned_action": planned_action,
+                "selected_template": selected_template,
+                "whatsapp_template": selected_template,
                 "whatsapp_enabled": await get_wa_health(),
             }
         contact = {"phone": phone, "lead_name": req.lead_name or "Demo Contact", "source": req.source or ""}

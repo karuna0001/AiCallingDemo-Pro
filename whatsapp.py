@@ -949,6 +949,8 @@ def _is_enabled_rule(rule: dict) -> bool:
 
 
 def _find_disabled_automation_rule(rules: list, event_type: str, source: Optional[str] = None) -> Optional[dict]:
+    requested_event_exists = any(r.get("event_type") == event_type for r in rules)
+
     if source:
         for r in rules:
             if r.get("event_type") == event_type and r.get("source") == source and not _is_enabled_rule(r):
@@ -956,6 +958,10 @@ def _find_disabled_automation_rule(rules: list, event_type: str, source: Optiona
     for r in rules:
         if r.get("event_type") == event_type and r.get("source") == "all" and not _is_enabled_rule(r):
             return r
+
+    if requested_event_exists:
+        return None
+
     if event_type != "new_lead":
         for r in rules:
             if r.get("event_type") == "new_lead" and r.get("source") == "all" and not _is_enabled_rule(r):
@@ -967,7 +973,9 @@ def _find_disabled_automation_rule(rules: list, event_type: str, source: Optiona
 
 
 def find_automation_rule(rules: list, event_type: str, source: Optional[str] = None) -> Optional[dict]:
-    """Priority: exact event+source > event+all > new_lead+all > None."""
+    """Priority: exact event+source > event+all > safe fallback > None."""
+    requested_event_exists = any(r.get("event_type") == event_type for r in rules)
+
     # 1. Exact match
     if source:
         for r in rules:
@@ -977,7 +985,13 @@ def find_automation_rule(rules: list, event_type: str, source: Optional[str] = N
     for r in rules:
         if r.get("event_type") == event_type and r.get("source") == "all" and _is_enabled_rule(r):
             return r
-    # 3. new_lead + source=all as generic fallback
+
+    # If the requested event has configured rules, do not silently execute a
+    # different event's automation. Let callers surface disabled/no-match state.
+    if requested_event_exists:
+        return None
+
+    # 3. new_lead + source=all as generic fallback for unknown event types
     if event_type != "new_lead":
         for r in rules:
             if r.get("event_type") == "new_lead" and r.get("source") == "all" and _is_enabled_rule(r):
