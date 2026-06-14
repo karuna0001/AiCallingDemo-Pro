@@ -239,6 +239,7 @@ SESSION_COOKIE_NAME = "aicalling_admin_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
 PUBLIC_API_ROUTES = {
     ("GET", "/api/health"),
+    ("GET", "/api/live"),
     ("POST", "/api/auth/login"),
     ("GET", "/api/auth/me"),
     ("POST", "/api/auth/logout"),
