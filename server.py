@@ -1839,6 +1839,7 @@ async def api_appointment_debug(appointment_id: str):
 class DemoResultRequest(BaseModel):
     result: str
     notes: Optional[str] = None
+    next_followup_at: Optional[str] = None
 
 
 @app.post("/api/appointments/{appointment_id}/request-demo-status")
@@ -2023,7 +2024,7 @@ async def api_set_demo_result(appointment_id: str, req: DemoResultRequest):
         "demo_status_updated_at": now_iso
     }
     if req.notes:
-        appt_updates["notes"] = req.notes
+        appt_updates["demo_result_notes"] = req.notes
 
     crm_updates = {}
     if result_key == "completed":
@@ -2069,6 +2070,8 @@ async def api_set_demo_result(appointment_id: str, req: DemoResultRequest):
             "journey_stage": "callback_requested",
             "next_best_action": "follow_up_customer"
         }
+    if req.next_followup_at:
+        crm_updates["next_followup_at"] = req.next_followup_at
 
     ok = await update_appointment_demo_fields(appointment_id, appt_updates)
     if not ok:
@@ -2076,7 +2079,22 @@ async def api_set_demo_result(appointment_id: str, req: DemoResultRequest):
 
     cust_phone = appt.get("phone") or appt.get("phone_number") or ""
     if cust_phone and crm_updates:
-        await update_lead_journey(cust_phone, crm_updates)
+        try:
+            crm_ok = await update_lead_journey(cust_phone, crm_updates)
+            if not crm_ok:
+                await log_error(
+                    "appointments",
+                    "demo_result_crm_update_failed",
+                    f"appointment_id={appointment_id}; phone={cust_phone}; result={result_key}; fields={sorted(crm_updates.keys())}",
+                    "warning",
+                )
+        except Exception as exc:
+            await log_error(
+                "appointments",
+                "demo_result_crm_update_failed",
+                f"appointment_id={appointment_id}; phone={cust_phone}; result={result_key}; error={str(exc)[:500]}",
+                "warning",
+            )
 
     await log_error("appointments", "demo_status_updated", f"Manually set appt {appointment_id} result to {result_key}", "info")
     return {"success": True}
