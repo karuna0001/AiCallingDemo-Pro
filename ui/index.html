@@ -65,6 +65,7 @@ button.warn:hover{background:rgba(245,158,11,0.1);border-color:var(--warn);}
 .badge.warnc{border-color:rgba(245,158,11,0.3);background:rgba(245,158,11,0.1);color:#fbbf24;}
 .ok{color:var(--accent)}
 .err{color:var(--danger)}
+#login-error:empty{display:none}
 .warnc{color:var(--warn)}
 table{width:100%;border-collapse:separate;border-spacing:0;margin-top:16px;}
 th{color:var(--text2);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;padding:12px 16px;background:var(--bg);border-bottom:1px solid var(--border);border-top:1px solid var(--border);position:sticky;top:0;z-index:10;white-space:nowrap;}
@@ -85,8 +86,119 @@ body.authenticated .auth-only{display:block}
 body.authenticated header.auth-only{display:block}
 body.authenticated main.auth-only{display:block}
 body.authenticated #login-view{display:none}
-#login-view{min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at top right, rgba(99,102,241,0.1), transparent 40%), radial-gradient(circle at bottom left, rgba(16,185,129,0.05), transparent 40%);}
-.login-card{width:min(440px,100%);padding:40px;box-shadow:0 25px 50px -12px rgba(0,0,0,0.5);}
+#login-view{
+  min-height:100vh;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:24px;
+  background:linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
+  position:relative;
+  overflow:hidden;
+}
+#login-view::before{
+  content:'';
+  position:absolute;
+  top:0;
+  left:0;
+  right:0;
+  bottom:0;
+  background:
+    radial-gradient(circle at 20% 30%, rgba(99,102,241,0.4), transparent 40%),
+    radial-gradient(circle at 80% 70%, rgba(16,185,129,0.3), transparent 40%),
+    radial-gradient(circle at 50% 50%, rgba(139,92,246,0.2), transparent 60%);
+  animation:gradient-shift 15s ease infinite;
+}
+@keyframes gradient-shift{
+  0%,100%{transform:scale(1) rotate(0deg)}
+  50%{transform:scale(1.1) rotate(5deg)}
+}
+.login-card{
+  position:relative;
+  z-index:1;
+  width:min(460px,100%);
+  padding:48px 40px;
+  background:rgba(20,22,26,0.95);
+  backdrop-filter:blur(20px);
+  border:1px solid rgba(255,255,255,0.1);
+  border-radius:24px;
+  box-shadow:
+    0 20px 60px -15px rgba(0,0,0,0.6),
+    0 0 0 1px rgba(255,255,255,0.05),
+    inset 0 1px 0 0 rgba(255,255,255,0.1);
+}
+.login-card h1{
+  font-size:32px;
+  font-weight:700;
+  background:linear-gradient(135deg, #667eea 0%, #f093fb 100%);
+  -webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;
+  background-clip:text;
+  margin-bottom:8px;
+  letter-spacing:-0.03em;
+}
+.login-card .subtitle{
+  color:#9ca3af;
+  font-size:15px;
+  line-height:1.6;
+  margin-bottom:32px;
+}
+.login-card label{
+  display:block;
+  margin:20px 0 8px;
+  color:#d1d5db;
+  font-weight:600;
+  font-size:14px;
+  letter-spacing:0.01em;
+}
+.login-card input{
+  width:100%;
+  background:rgba(11,13,16,0.6);
+  color:#f3f4f6;
+  border:1px solid rgba(255,255,255,0.1);
+  border-radius:12px;
+  padding:14px 16px;
+  outline:none;
+  font-family:var(--sans);
+  font-size:15px;
+  transition:all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.login-card input:focus{
+  border-color:#667eea;
+  background:rgba(11,13,16,0.8);
+  box-shadow:0 0 0 4px rgba(102,126,234,0.15), 0 8px 16px -4px rgba(102,126,234,0.3);
+  transform:translateY(-1px);
+}
+.login-card input::placeholder{
+  color:#6b7280;
+}
+.login-card button.primary{
+  width:100%;
+  margin-top:28px;
+  padding:14px 24px;
+  font-size:16px;
+  font-weight:600;
+  background:linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  border:none;
+  border-radius:12px;
+  color:#fff;
+  cursor:pointer;
+  transition:all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow:0 4px 16px -2px rgba(102,126,234,0.4);
+  letter-spacing:0.02em;
+}
+.login-card button.primary:hover{
+  background:linear-gradient(135deg, #5568d3 0%, #6a3f8f 100%);
+  box-shadow:0 8px 24px -4px rgba(102,126,234,0.6);
+  transform:translateY(-2px);
+}
+.login-card button.primary:active{
+  transform:translateY(0);
+}
+@media(max-width:600px){
+  .login-card{padding:36px 28px}
+  .login-card h1{font-size:28px}
+}
 .topbar{display:flex;align-items:center;justify-content:space-between;gap:16px}
 .modal-backdrop{position:fixed;inset:0;background:rgba(11,13,16,0.8);backdrop-filter:blur(4px);z-index:100;display:none;align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto;animation:fadein 0.2s ease;}
 .modal-backdrop.open{display:flex}
@@ -162,7 +274,20 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
 </style>
 </head>
 <body>
-<div id="login-view"><div class="card login-card"><h1>Admin Login</h1><p class="muted" style="margin:8px 0 16px">Sign in to access calling, CRM, reports, settings, and recordings.</p><form id="login-form"><label>Username</label><input id="login-username" autocomplete="username"><label>Password</label><input id="login-password" type="password" autocomplete="current-password"><button class="primary" type="submit" style="margin-top:14px;width:100%">Login</button><p id="login-error" class="err" style="margin-top:12px"></p></form></div></div>
+<div id="login-view">
+  <div class="login-card">
+    <h1>OutboundAI CRM</h1>
+    <p class="subtitle">AI Calling & WhatsApp Automation Dashboard</p>
+    <form id="login-form">
+      <label>Username</label>
+      <input id="login-username" autocomplete="username" placeholder="Enter your username">
+      <label>Password</label>
+      <input id="login-password" type="password" autocomplete="current-password" placeholder="Enter your password">
+      <button class="primary" type="submit">Login</button>
+      <p id="login-error" class="err" style="margin-top:16px;text-align:center"></p>
+    </form>
+  </div>
+</div>
 <header class="auth-only"><div class="topbar"><h1>OutboundAI <small>production outbound voice dashboard</small></h1><button onclick="logout()">Logout</button></div><nav id="tabs"></nav></header>
 <main class="auth-only">
 <section id="stats" class="panel active"><div id="dashboard-summary" class="grid cols-4"></div><div class="grid cols-4" style="margin-top:16px"><div class="card"><div>Total Calls</div><div id="k-total" class="kpi">0</div></div><div class="card"><div>Booked</div><div id="k-booked" class="kpi">0</div></div><div class="card"><div>Not Interested</div><div id="k-ni" class="kpi">0</div></div><div class="card"><div>Booking Rate</div><div id="k-rate" class="kpi">0%</div></div></div><p id="stats-error" class="err" style="margin-top:10px"></p><div class="card" style="margin-top:16px"><b>Live Config</b><div id="live-config" class="row" style="margin-top:10px"></div></div><div class="grid cols-3" style="margin-top:16px"><div class="card"><canvas id="chart-outcomes"></canvas></div><div class="card"><canvas id="chart-timeline"></canvas></div><div class="card"><canvas id="chart-duration"></canvas></div></div></section>
@@ -633,7 +758,7 @@ function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').
 function table(rows,cols,actionFn){if(!rows||!rows.length)return'<p class="muted">No data.</p>';const c=cols||(rows[0]?Object.keys(rows[0]):[]);return`<table><thead><tr>${c.map(h=>`<th>${esc(h)}</th>`).join('')}${actionFn?'<th>Actions</th>':''}</tr></thead><tbody>${rows.map(r=>`<tr>${c.map(h=>`<td>${esc(r[h]??'')}</td>`).join('')}${actionFn?`<td class="row-actions">${actionFn(r)}</td>`:''}</tr>`).join('')}</tbody></table>`}
 function toast(msg,type='ok'){const d=document.createElement('div');d.className='toast '+(type==='err'?'err':'ok');d.textContent=msg;document.body.appendChild(d);setTimeout(()=>d.remove(),3500)}
 function showErr(id,msg){const el=$(id);if(el){el.textContent=msg;el.className='err'}}
-function showLogin(msg=''){const el=$('login-error');if(el)el.textContent=msg;document.body.classList.remove('authenticated')}
+function showLogin(msg=''){const el=$('login-error');if(el){el.textContent=msg;const t=String(msg).trim();el.style.display=(t===''||t==='{}')?'none':''}document.body.classList.remove('authenticated')}
 function showDashboard(){document.body.classList.add('authenticated');try{loadStats()}catch(e){}try{loadCalls()}catch(e){}try{loadAppointments()}catch(e){}try{loadLogs()}catch(e){}try{loadAgentProfiles()}catch(e){}}
 async function checkAuth(){try{const r=await api('/api/auth/me');if(r.authenticated){showDashboard()}else{showLogin(r.error||'')}}catch(e){showLogin(e.message||'')}}
 const tabs=[['stats','📊 Stats'],['single','📞 Single Call'],['batch','📋 Batch Call'],['batch-monitor','📡 Batch Monitor'],['campaigns','🚀 Campaigns'],['scheduled','📅 Scheduled Calls'],['agents','🤖 Agents'],['prompt','✏️ AI Prompt'],['kb','📚 Knowledge Base'],['automation','⚡ Automation'],['whatsapp','💬 WhatsApp'],['appointments','📅 Appointments'],['calls','📝 Call Logs'],['crm','👥 CRM'],['kanban','Pipeline'],['reports','Reports'],['costs','Costs'],['broadcast','Broadcast'],['handoffs','Handoffs'],['settings','⚙️ Settings'],['logs','📋 Logs'],['setup','🔧 Setup']];
