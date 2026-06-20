@@ -5,37 +5,110 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>OutboundAI — Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script>
+(() => {
+  const saved = localStorage.getItem('outboundai-theme') || 'system';
+  const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  document.documentElement.dataset.theme = saved === 'system' ? (dark ? 'dark' : 'light') : saved;
+  document.documentElement.dataset.themeMode = saved;
+})();
+</script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 :root{
-  --bg:#0b0d10;
-  --card:#14161a;
-  --border:#2a2d36;
-  --accent:#10b981;
-  --accent2:#3b82f6;
-  --primary:#6366f1;
-  --primary-hover:#4f46e5;
-  --danger:#ef4444;
-  --danger-hover:#dc2828;
-  --warn:#f59e0b;
-  --muted:#6b7280;
-  --text:#f3f4f6;
-  --text2:#9ca3af;
+  color-scheme:light;
+  --background:#eef3fb;
+  --foreground:#182033;
+  --card:rgba(255,255,255,0.74);
+  --card-foreground:#182033;
+  --popover:rgba(255,255,255,0.9);
+  --popover-foreground:#182033;
+  --primary:#2563eb;
+  --primary-hover:#1d4ed8;
+  --primary-foreground:#ffffff;
+  --secondary:rgba(226,232,240,0.74);
+  --secondary-foreground:#26344f;
+  --muted:#eef3f8;
+  --muted-foreground:#64748b;
+  --accent:#0ea5e9;
+  --accent-foreground:#ffffff;
+  --accent2:#6366f1;
+  --destructive:#dc2626;
+  --destructive-foreground:#ffffff;
+  --danger:#dc2626;
+  --danger-hover:#b91c1c;
+  --warn:#d97706;
+  --border:rgba(148,163,184,0.34);
+  --input:rgba(255,255,255,0.78);
+  --ring:rgba(37,99,235,0.28);
+  --sidebar:rgba(255,255,255,0.68);
+  --sidebar-foreground:#1e293b;
+  --sidebar-border:rgba(148,163,184,0.3);
+  --glass-background:rgba(255,255,255,0.62);
+  --glass-border:rgba(255,255,255,0.72);
+  --glass-shadow:0 24px 70px -34px rgba(15,23,42,0.42),0 8px 28px -22px rgba(15,23,42,0.32),inset 0 1px 0 rgba(255,255,255,0.72);
+  --table-head:rgba(248,250,252,0.88);
+  --table-row:rgba(255,255,255,0.72);
+  --table-row-hover:rgba(226,236,250,0.82);
+  --bg:var(--background);
+  --text:var(--foreground);
+  --text2:var(--muted-foreground);
   --mono:'Courier New',monospace;
   --sans:'Inter',system-ui,sans-serif;
-  --r:10px;
+  --r:16px;
 }
-body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;line-height:1.5;font-size:14px;overflow-x:hidden;}
-header{padding:16px 32px;border-bottom:1px solid var(--border);background:var(--card);position:sticky;top:0;z-index:50;box-shadow:0 1px 3px 0 rgb(0 0 0 / 0.1);}
+html[data-theme="dark"]{
+  color-scheme:dark;
+  --background:#101622;
+  --foreground:#eef4ff;
+  --card:rgba(22,29,43,0.72);
+  --card-foreground:#eef4ff;
+  --popover:rgba(24,31,45,0.92);
+  --popover-foreground:#eef4ff;
+  --primary:#6aa7ff;
+  --primary-hover:#8bb9ff;
+  --primary-foreground:#07111f;
+  --secondary:rgba(40,51,70,0.72);
+  --secondary-foreground:#dbe7f8;
+  --muted:#1b2638;
+  --muted-foreground:#9fb0c7;
+  --accent:#8b9cff;
+  --accent-foreground:#07111f;
+  --accent2:#38bdf8;
+  --destructive:#f87171;
+  --destructive-foreground:#120406;
+  --danger:#f87171;
+  --danger-hover:#ef4444;
+  --warn:#fbbf24;
+  --border:rgba(226,232,240,0.14);
+  --input:rgba(16,22,34,0.74);
+  --ring:rgba(106,167,255,0.32);
+  --sidebar:rgba(17,24,39,0.68);
+  --sidebar-foreground:#eef4ff;
+  --sidebar-border:rgba(226,232,240,0.12);
+  --glass-background:rgba(21,29,43,0.58);
+  --glass-border:rgba(255,255,255,0.14);
+  --glass-shadow:0 26px 78px -34px rgba(0,0,0,0.86),0 10px 30px -24px rgba(0,0,0,0.78),inset 0 1px 0 rgba(255,255,255,0.08);
+  --table-head:rgba(15,23,42,0.86);
+  --table-row:rgba(22,29,43,0.68);
+  --table-row-hover:rgba(37,50,72,0.78);
+  --bg:var(--background);
+  --text:var(--foreground);
+  --text2:var(--muted-foreground);
+}
+body{background:var(--background);color:var(--foreground);font-family:var(--sans);min-height:100vh;line-height:1.5;font-size:14px;overflow-x:hidden;}
+body::before{content:'';position:fixed;inset:0;z-index:-2;background:linear-gradient(135deg,rgba(255,255,255,0.72),rgba(228,238,252,0.9) 38%,rgba(232,238,255,0.78)),radial-gradient(circle at 10% 10%,rgba(96,165,250,0.26),transparent 34%),radial-gradient(circle at 86% 18%,rgba(129,140,248,0.22),transparent 30%),radial-gradient(circle at 68% 92%,rgba(14,165,233,0.16),transparent 34%);}
+html[data-theme="dark"] body::before{background:linear-gradient(135deg,#0b111d,#121a28 42%,#182235),radial-gradient(circle at 12% 8%,rgba(59,130,246,0.22),transparent 32%),radial-gradient(circle at 85% 15%,rgba(99,102,241,0.18),transparent 28%),radial-gradient(circle at 70% 90%,rgba(14,165,233,0.13),transparent 34%);}
+header{padding:16px 32px;border-bottom:1px solid var(--glass-border);background:var(--glass-background);backdrop-filter:blur(24px) saturate(145%);-webkit-backdrop-filter:blur(24px) saturate(145%);position:sticky;top:0;z-index:50;box-shadow:var(--glass-shadow);}
 h1{font-size:22px;font-weight:700;letter-spacing:-0.02em;}
 h2{font-size:18px;font-weight:600;margin-bottom:12px;letter-spacing:-0.01em;display:flex;align-items:center;gap:8px;}
 h3{font-size:16px;font-weight:600;}
 small,.muted{color:var(--text2);font-weight:400;}
 nav{display:flex;gap:12px;flex-wrap:wrap;margin-top:20px}
-.tab{background:transparent;color:var(--text2);padding:8px 14px;border-radius:6px;cursor:pointer;border:none;font-weight:500;font-size:14px;transition:all 0.2s;}
-.tab:hover{color:var(--text);background:rgba(255,255,255,0.05);}
-.tab.active{background:rgba(99,102,241,0.1);color:var(--primary);border:1px solid rgba(99,102,241,0.2);}
+.tab{background:transparent;color:var(--text2);padding:8px 14px;border-radius:999px;cursor:pointer;border:1px solid transparent;font-weight:500;font-size:14px;transition:all 0.2s;}
+.tab:hover{color:var(--text);background:var(--secondary);}
+.tab.active{background:color-mix(in srgb,var(--primary) 14%,transparent);color:var(--primary);border:1px solid color-mix(in srgb,var(--primary) 26%,transparent);}
 main{padding:32px;max-width:1600px;margin:auto}
 .panel{display:none;animation:fadein 0.3s ease;}
 .panel.active{display:block}
@@ -43,23 +116,31 @@ main{padding:32px;max-width:1600px;margin:auto}
 .cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}
 .cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}
 .cols-4{grid-template-columns:repeat(4,minmax(0,1fr))}
-.card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:24px;box-shadow:0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);transition:transform 0.2s, box-shadow 0.2s;}
+.card,.glass-card{background:var(--card);color:var(--card-foreground);border:1px solid var(--glass-border);border-radius:var(--r);padding:24px;box-shadow:var(--glass-shadow);backdrop-filter:blur(22px) saturate(145%);-webkit-backdrop-filter:blur(22px) saturate(145%);transition:transform 0.2s, box-shadow 0.2s,border-color 0.2s;}
+.glass-panel{background:var(--glass-background);border:1px solid var(--glass-border);box-shadow:var(--glass-shadow);backdrop-filter:blur(22px) saturate(145%);-webkit-backdrop-filter:blur(22px) saturate(145%);border-radius:20px;}
+.glass-sidebar{background:var(--sidebar);color:var(--sidebar-foreground);border-color:var(--sidebar-border);}
+.glass-topbar{background:var(--glass-background);border-color:var(--glass-border);box-shadow:var(--glass-shadow);backdrop-filter:blur(24px) saturate(145%);-webkit-backdrop-filter:blur(24px) saturate(145%);}
+.glass-button{background:linear-gradient(180deg,color-mix(in srgb,var(--secondary) 86%,white),var(--secondary));border:1px solid var(--glass-border);box-shadow:inset 0 1px 0 rgba(255,255,255,0.35),0 10px 24px -18px rgba(15,23,42,0.55);}
+.liquid-gradient-bg{background:linear-gradient(135deg,color-mix(in srgb,var(--background) 82%,white),color-mix(in srgb,var(--primary) 9%,var(--background)) 46%,color-mix(in srgb,var(--accent2) 10%,var(--background)));}
+.apple-focus-ring:focus{outline:none;box-shadow:0 0 0 4px var(--ring);}
+.soft-divider{border-color:var(--border);}
 .kpi{font-size:36px;color:var(--text);font-weight:700;letter-spacing:-0.03em;}
 .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
 label{display:block;margin:12px 0 6px;color:var(--text2);font-weight:500;font-size:13px;}
-input,select,textarea{width:100%;background:#0b0d10;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px 14px;outline:none;font-family:var(--sans);font-size:14px;transition:border-color 0.2s, box-shadow 0.2s;}
-input:focus,select:focus,textarea:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(99,102,241,0.2);}
+input,select,textarea{width:100%;background:var(--input);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 14px;outline:none;font-family:var(--sans);font-size:14px;transition:border-color 0.2s, box-shadow 0.2s, background 0.2s;}
+input:focus,select:focus,textarea:focus{border-color:var(--primary);box-shadow:0 0 0 4px var(--ring);}
+input::placeholder,textarea::placeholder{color:color-mix(in srgb,var(--muted-foreground) 72%,transparent);}
 textarea{min-height:120px;resize:vertical;}
-button{background:#1f2229;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 16px;cursor:pointer;font-weight:500;font-family:var(--sans);font-size:14px;transition:all 0.2s;display:inline-flex;align-items:center;justify-content:center;gap:6px;}
-button:hover{background:#2a2d36;}
+button{background:var(--secondary);color:var(--secondary-foreground);border:1px solid var(--border);border-radius:10px;padding:8px 16px;cursor:pointer;font-weight:500;font-family:var(--sans);font-size:14px;transition:all 0.2s;display:inline-flex;align-items:center;justify-content:center;gap:6px;}
+button:hover{background:color-mix(in srgb,var(--secondary) 78%,var(--primary));transform:translateY(-1px);}
 button:focus{outline:2px solid var(--primary);outline-offset:2px;}
-button.primary{background:var(--primary);color:white;border:1px solid var(--primary-hover);}
-button.primary:hover{background:var(--primary-hover);box-shadow:0 4px 12px rgba(99,102,241,0.3);}
+button.primary{background:linear-gradient(180deg,color-mix(in srgb,var(--primary) 84%,white),var(--primary-hover));color:var(--primary-foreground);border:1px solid color-mix(in srgb,var(--primary) 75%,black);box-shadow:0 12px 28px -18px var(--primary);}
+button.primary:hover{background:linear-gradient(180deg,var(--primary),var(--primary-hover));box-shadow:0 16px 34px -18px var(--primary);}
 button.danger{background:transparent;color:var(--danger);border:1px solid rgba(239,68,68,0.3);}
 button.danger:hover{background:rgba(239,68,68,0.1);border-color:var(--danger);}
 button.warn{background:transparent;color:var(--warn);border:1px solid rgba(245,158,11,0.3);}
 button.warn:hover{background:rgba(245,158,11,0.1);border-color:var(--warn);}
-.badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;background:#1f2229;border:1px solid var(--border);font-size:12px;font-weight:500;}
+.badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;background:var(--secondary);border:1px solid var(--border);font-size:12px;font-weight:500;}
 .badge.ok{border-color:rgba(16,185,129,0.3);background:rgba(16,185,129,0.1);color:#34d399;}
 .badge.err{border-color:rgba(239,68,68,0.3);background:rgba(239,68,68,0.1);color:#f87171;}
 .badge.warnc{border-color:rgba(245,158,11,0.3);background:rgba(245,158,11,0.1);color:#fbbf24;}
@@ -68,18 +149,20 @@ button.warn:hover{background:rgba(245,158,11,0.1);border-color:var(--warn);}
 #login-error:empty{display:none}
 .warnc{color:var(--warn)}
 table{width:100%;border-collapse:separate;border-spacing:0;margin-top:16px;}
-th{color:var(--text2);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;padding:12px 16px;background:var(--bg);border-bottom:1px solid var(--border);border-top:1px solid var(--border);position:sticky;top:0;z-index:10;white-space:nowrap;}
+th{color:var(--text2);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;padding:12px 16px;background:var(--table-head);backdrop-filter:blur(12px);border-bottom:1px solid var(--border);border-top:1px solid var(--border);position:sticky;top:0;z-index:10;white-space:nowrap;}
 th:first-child{border-top-left-radius:8px;border-left:1px solid var(--border);}
 th:last-child{border-top-right-radius:8px;border-right:1px solid var(--border);}
-td{border-bottom:1px solid var(--border);padding:14px 16px;text-align:left;vertical-align:middle;color:var(--text);background:var(--card);transition:background 0.2s;}
+td{border-bottom:1px solid var(--border);padding:14px 16px;text-align:left;vertical-align:middle;color:var(--text);background:var(--table-row);transition:background 0.2s;}
 tr:last-child td:first-child{border-bottom-left-radius:8px;}
 tr:last-child td:last-child{border-bottom-right-radius:8px;}
-tr:hover td{background:#1a1c22;}
-canvas{max-height:310px}
+tr:hover td{background:var(--table-row-hover);}
+canvas{display:block;max-height:310px}
+.chart-card{min-height:340px}
+.chart-card canvas{width:100%!important;height:280px!important}
 .progress{height:8px;background:var(--border);border-radius:999px;overflow:hidden;margin-top:16px;}
 .bar{height:100%;background:var(--primary);width:0;transition:width 0.3s ease;}
 .hidden{display:none}
-.logbox{font-family:var(--mono);white-space:pre-wrap;max-height:520px;overflow:auto;background:#0b0d10;padding:16px;border:1px solid var(--border);border-radius:var(--r);font-size:13px;}
+.logbox{font-family:var(--mono);white-space:pre-wrap;max-height:520px;overflow:auto;background:var(--input);padding:16px;border:1px solid var(--border);border-radius:var(--r);font-size:13px;}
 @media(max-width:900px){.cols-2,.cols-3,.cols-4{grid-template-columns:1fr}}
 .auth-only{display:none}
 body.authenticated .auth-only{display:block}
@@ -92,7 +175,7 @@ body.authenticated #login-view{display:none}
   align-items:center;
   justify-content:center;
   padding:24px;
-  background:linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
+  background:var(--background);
   position:relative;
   overflow:hidden;
 }
@@ -104,9 +187,9 @@ body.authenticated #login-view{display:none}
   right:0;
   bottom:0;
   background:
-    radial-gradient(circle at 20% 30%, rgba(99,102,241,0.4), transparent 40%),
-    radial-gradient(circle at 80% 70%, rgba(16,185,129,0.3), transparent 40%),
-    radial-gradient(circle at 50% 50%, rgba(139,92,246,0.2), transparent 60%);
+    radial-gradient(circle at 18% 24%, color-mix(in srgb,var(--primary) 24%,transparent), transparent 36%),
+    radial-gradient(circle at 82% 68%, color-mix(in srgb,var(--accent) 18%,transparent), transparent 34%),
+    radial-gradient(circle at 50% 48%, color-mix(in srgb,var(--accent2) 14%,transparent), transparent 56%);
   animation:gradient-shift 15s ease infinite;
 }
 @keyframes gradient-shift{
@@ -118,19 +201,17 @@ body.authenticated #login-view{display:none}
   z-index:1;
   width:min(460px,100%);
   padding:48px 40px;
-  background:rgba(20,22,26,0.95);
+  background:var(--glass-background);
   backdrop-filter:blur(20px);
-  border:1px solid rgba(255,255,255,0.1);
+  border:1px solid var(--glass-border);
   border-radius:24px;
   box-shadow:
-    0 20px 60px -15px rgba(0,0,0,0.6),
-    0 0 0 1px rgba(255,255,255,0.05),
-    inset 0 1px 0 0 rgba(255,255,255,0.1);
+    var(--glass-shadow);
 }
 .login-card h1{
   font-size:32px;
   font-weight:700;
-  background:linear-gradient(135deg, #667eea 0%, #f093fb 100%);
+  background:linear-gradient(135deg, var(--primary) 0%, var(--accent2) 100%);
   -webkit-background-clip:text;
   -webkit-text-fill-color:transparent;
   background-clip:text;
@@ -138,7 +219,7 @@ body.authenticated #login-view{display:none}
   letter-spacing:-0.03em;
 }
 .login-card .subtitle{
-  color:#9ca3af;
+  color:var(--text2);
   font-size:15px;
   line-height:1.6;
   margin-bottom:32px;
@@ -146,16 +227,16 @@ body.authenticated #login-view{display:none}
 .login-card label{
   display:block;
   margin:20px 0 8px;
-  color:#d1d5db;
+  color:var(--text);
   font-weight:600;
   font-size:14px;
   letter-spacing:0.01em;
 }
 .login-card input{
   width:100%;
-  background:rgba(11,13,16,0.6);
-  color:#f3f4f6;
-  border:1px solid rgba(255,255,255,0.1);
+  background:var(--input);
+  color:var(--text);
+  border:1px solid var(--border);
   border-radius:12px;
   padding:14px 16px;
   outline:none;
@@ -164,13 +245,13 @@ body.authenticated #login-view{display:none}
   transition:all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .login-card input:focus{
-  border-color:#667eea;
-  background:rgba(11,13,16,0.8);
-  box-shadow:0 0 0 4px rgba(102,126,234,0.15), 0 8px 16px -4px rgba(102,126,234,0.3);
+  border-color:var(--primary);
+  background:var(--input);
+  box-shadow:0 0 0 4px var(--ring), 0 8px 16px -8px var(--primary);
   transform:translateY(-1px);
 }
 .login-card input::placeholder{
-  color:#6b7280;
+  color:var(--text2);
 }
 .login-card button.primary{
   width:100%;
@@ -178,18 +259,18 @@ body.authenticated #login-view{display:none}
   padding:14px 24px;
   font-size:16px;
   font-weight:600;
-  background:linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background:linear-gradient(135deg, var(--primary) 0%, var(--accent2) 100%);
   border:none;
   border-radius:12px;
   color:#fff;
   cursor:pointer;
   transition:all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  box-shadow:0 4px 16px -2px rgba(102,126,234,0.4);
+  box-shadow:0 14px 28px -18px var(--primary);
   letter-spacing:0.02em;
 }
 .login-card button.primary:hover{
-  background:linear-gradient(135deg, #5568d3 0%, #6a3f8f 100%);
-  box-shadow:0 8px 24px -4px rgba(102,126,234,0.6);
+  background:linear-gradient(135deg, var(--primary-hover) 0%, var(--accent2) 100%);
+  box-shadow:0 18px 34px -18px var(--primary);
   transform:translateY(-2px);
 }
 .login-card button.primary:active{
@@ -200,11 +281,16 @@ body.authenticated #login-view{display:none}
   .login-card h1{font-size:28px}
 }
 .topbar{display:flex;align-items:center;justify-content:space-between;gap:16px}
-.modal-backdrop{position:fixed;inset:0;background:rgba(11,13,16,0.8);backdrop-filter:blur(4px);z-index:100;display:none;align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto;animation:fadein 0.2s ease;}
+.topbar-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.theme-toggle{display:inline-flex;align-items:center;gap:4px;padding:4px;background:var(--secondary);border:1px solid var(--border);border-radius:999px}
+.theme-toggle button{padding:5px 10px;border-radius:999px;border:0;background:transparent;color:var(--text2);font-size:12px}
+.theme-toggle button:hover{transform:none;color:var(--text)}
+.theme-toggle button.active{background:var(--glass-background);color:var(--primary);box-shadow:inset 0 1px 0 rgba(255,255,255,0.45),0 8px 20px -16px rgba(15,23,42,0.6)}
+.modal-backdrop{position:fixed;inset:0;background:rgba(8,13,22,0.48);backdrop-filter:blur(10px);z-index:100;display:none;align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto;animation:fadein 0.2s ease;}
 .modal-backdrop.open{display:flex}
-.modal-panel{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:32px;width:min(900px,100%);max-height:calc(100vh - 80px);overflow:auto;position:relative;box-shadow:0 25px 50px -12px rgba(0,0,0,0.5);animation:slideup 0.3s cubic-bezier(0.16, 1, 0.3, 1);}
+.modal-panel{background:var(--popover);color:var(--popover-foreground);border:1px solid var(--glass-border);border-radius:20px;padding:32px;width:min(900px,100%);max-height:calc(100vh - 80px);overflow:auto;position:relative;box-shadow:var(--glass-shadow);backdrop-filter:blur(24px) saturate(145%);-webkit-backdrop-filter:blur(24px) saturate(145%);animation:slideup 0.3s cubic-bezier(0.16, 1, 0.3, 1);}
 .modal-close{position:absolute;top:16px;right:16px;background:transparent;border:none;border-radius:6px;width:32px;height:32px;padding:0;cursor:pointer;color:var(--text2);z-index:2;display:grid;place-items:center;transition:background 0.2s, color 0.2s;}
-.modal-close:hover{background:rgba(255,255,255,0.05);color:var(--text);}
+.modal-close:hover{background:var(--secondary);color:var(--text);}
 @keyframes slideup{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
 .row-actions{display:flex;gap:6px;flex-wrap:wrap}
 .row-actions button,.row-actions select{padding:6px 10px;font-size:12px;}
@@ -213,34 +299,34 @@ tr.lead-row{cursor:pointer}
 tr.lead-row:hover{background:rgba(255,255,255,0.02)}
 .lead-tabs{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0 8px;border-bottom:1px solid var(--border);padding-bottom:12px}
 .lead-tab, .kb-tab-btn{padding:8px 14px;border:1px solid transparent;background:transparent;color:var(--text2);border-radius:6px;cursor:pointer;font-size:14px;font-weight:500;transition:all 0.2s;}
-.lead-tab:hover, .kb-tab-btn:hover{color:var(--text);background:rgba(255,255,255,0.03);}
+.lead-tab:hover, .kb-tab-btn:hover{color:var(--text);background:var(--secondary);}
 .lead-tab.active, .kb-tab-btn.active{background:rgba(99,102,241,0.1);color:var(--primary);border:1px solid rgba(99,102,241,0.2);}
 .lead-section{display:none}
 .lead-section.active{display:block}
 .locked-hint{color:var(--warn);font-size:12px;margin-top:4px}
-.toast{position:fixed;bottom:32px;right:32px;padding:14px 24px;border-radius:8px;font-weight:500;font-size:14px;z-index:9999;animation:toast-in .3s cubic-bezier(0.16, 1, 0.3, 1) forwards;background:var(--card);color:var(--text);border:1px solid var(--border);box-shadow:0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -2px rgba(0,0,0,0.05);}
+.toast{position:fixed;bottom:32px;right:32px;padding:14px 24px;border-radius:12px;font-weight:500;font-size:14px;z-index:9999;animation:toast-in .3s cubic-bezier(0.16, 1, 0.3, 1) forwards;background:var(--popover);color:var(--text);border:1px solid var(--glass-border);box-shadow:var(--glass-shadow);backdrop-filter:blur(18px);}
 .toast.err{border-left:4px solid var(--danger);}
 .toast:not(.err){border-left:4px solid var(--primary);}
 @keyframes toast-in{from{opacity:0;transform:translateY(20px) scale(0.95)}to{opacity:1;transform:none scale(1)}}
 @keyframes fadein{from{opacity:0;}to{opacity:1;}}
-.modal-actions{position:sticky;bottom:-32px;background:var(--card);padding:16px 0 0;margin-top:24px;border-top:1px solid var(--border);display:flex;gap:10px;flex-wrap:wrap;z-index:10;}
+.modal-actions{position:sticky;bottom:-32px;background:var(--popover);padding:16px 0 0;margin-top:24px;border-top:1px solid var(--border);display:flex;gap:10px;flex-wrap:wrap;z-index:10;}
 .wa-inbox-shell{display:grid;grid-template-columns:340px minmax(0,1fr);gap:0;height:calc(100vh - 220px);min-height:600px;border:1px solid var(--border);border-radius:12px;overflow:hidden;box-shadow:0 10px 25px -5px rgba(0,0,0,0.2);}
 .wa-conv-pane,.wa-chat-panel,.wa-chat-active{min-height:0}
-.wa-conv-pane{background:var(--bg);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;}
+.wa-conv-pane{background:var(--sidebar);border-right:1px solid var(--sidebar-border);display:flex;flex-direction:column;overflow:hidden;}
 .wa-conv-tools{padding:16px;border-bottom:1px solid var(--border);background:var(--card);}
-.wa-conv-tools input{margin-bottom:12px;border-radius:20px;padding:8px 16px;background:var(--bg);}
+.wa-conv-tools input{margin-bottom:12px;border-radius:20px;padding:8px 16px;background:var(--input);}
 .wa-conv-tools .tab{font-size:12px;padding:4px 12px;border-radius:999px;}
 .wa-conv-footer{padding:12px;border-top:1px solid var(--border);background:var(--card);}
 .wa-conv-list{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;}
 .wa-chat-panel{background:var(--card);display:flex;flex-direction:column;min-width:0;overflow:hidden;}
 .wa-chat-active{flex:1 1 auto;flex-direction:column;height:100%;overflow:hidden;}
 .wa-chat-header{padding:16px 24px;border-bottom:1px solid var(--border);background:var(--card);display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;}
-.wa-messages{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:24px;display:flex;flex-direction:column;gap:16px;background:#0b0d10;}
+.wa-messages{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:24px;display:flex;flex-direction:column;gap:16px;background:color-mix(in srgb,var(--background) 82%,var(--primary));}
 .wa-reply-box{padding:16px 24px;border-top:1px solid var(--border);background:var(--card);}
 .wa-reply-box textarea{background:var(--bg);border-radius:8px;}
 .wa-msg{padding:12px 16px;border-radius:16px;font-size:14px;max-width:85%;line-height:1.4;box-shadow:0 1px 2px rgba(0,0,0,0.1);display:inline-block;}
 .wa-msg.outbound{background:var(--primary);color:#fff;border-bottom-right-radius:4px;align-self:flex-end;}
-.wa-msg.inbound{background:#1f2229;color:var(--text);border-bottom-left-radius:4px;align-self:flex-start;border:1px solid var(--border);}
+.wa-msg.inbound{background:var(--secondary);color:var(--text);border-bottom-left-radius:4px;align-self:flex-start;border:1px solid var(--border);}
 .wa-msg.system{background:transparent;color:var(--text2);font-size:12px;align-self:center;text-align:center;box-shadow:none;border-radius:0;}
 .crm-shell{grid-template-columns:minmax(0,1fr) 360px;align-items:start}
 .crm-main{min-width:0}
@@ -249,7 +335,7 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
 .crm-pagination{justify-content:space-between;margin:12px 0}
 .crm-pagination select{width:auto;min-width:84px;padding:7px 10px}
 .crm-pagination button{padding:7px 12px}
-.crm-table-wrap{width:100%;overflow:auto;border:1px solid var(--border);border-radius:8px;background:var(--card);max-height:68vh;overscroll-behavior:contain}
+.crm-table-wrap{width:100%;overflow:auto;border:1px solid var(--glass-border);border-radius:14px;background:var(--card);max-height:68vh;overscroll-behavior:contain;box-shadow:var(--glass-shadow)}
 .crm-table-wrap table{margin-top:0;min-width:1180px}
 .crm-table-wrap th{top:0}
 .crm-table-wrap th,.crm-table-wrap td{padding:10px 12px}
@@ -257,7 +343,7 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
 .crm-table-wrap .lead-name{font-weight:600;min-width:150px}
 .crm-table-wrap .nowrap{white-space:nowrap}
 .lead-status-quick{min-width:150px;padding:7px 10px;font-size:13px}
-.crm-badge{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:3px 9px;font-size:12px;font-weight:600;border:1px solid var(--border);background:#1f2229;color:var(--text2)}
+.crm-badge{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:3px 9px;font-size:12px;font-weight:600;border:1px solid var(--border);background:var(--secondary);color:var(--text2)}
 .crm-badge.hot{border-color:rgba(245,158,11,0.35);background:rgba(245,158,11,0.12);color:#fbbf24}
 .crm-badge.won,.crm-badge.booked{border-color:rgba(16,185,129,0.35);background:rgba(16,185,129,0.12);color:#34d399}
 .kanban-column{min-height:180px;transition:border-color .2s,background .2s}
@@ -267,8 +353,8 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
 .crm-badge.lost,.crm-badge.not-interested{border-color:rgba(239,68,68,0.35);background:rgba(239,68,68,0.12);color:#f87171}
 ::-webkit-scrollbar{width:8px;height:8px;}
 ::-webkit-scrollbar-track{background:transparent;}
-::-webkit-scrollbar-thumb{background:#374151;border-radius:4px;}
-::-webkit-scrollbar-thumb:hover{background:#4b5563;}
+::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--muted-foreground) 38%,transparent);border-radius:4px;}
+::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,var(--muted-foreground) 56%,transparent);}
 @media(max-width:1200px){main{padding:20px}.crm-shell{grid-template-columns:1fr}.crm-detail-card{position:static;max-height:none}.crm-table-wrap{max-height:62vh}.crm-toolbar button,.crm-pagination button{padding:7px 10px;font-size:13px}}
 @media(max-width:900px){.wa-inbox-shell{grid-template-columns:1fr;height:calc(100vh - 170px);min-height:560px}.wa-conv-pane{height:220px;border-right:0;border-bottom:1px solid var(--border)}.wa-chat-panel{min-height:0}.wa-messages{padding:16px}}
 </style>
@@ -288,9 +374,9 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
     </form>
   </div>
 </div>
-<header class="auth-only"><div class="topbar"><h1>OutboundAI <small>production outbound voice dashboard</small></h1><button onclick="logout()">Logout</button></div><nav id="tabs"></nav></header>
+<header class="auth-only glass-topbar"><div class="topbar"><h1>OutboundAI <small>production outbound voice dashboard</small></h1><div class="topbar-actions"><div class="theme-toggle" aria-label="Theme"><button type="button" data-theme-choice="light" onclick="setThemeMode('light')">Light</button><button type="button" data-theme-choice="dark" onclick="setThemeMode('dark')">Dark</button><button type="button" data-theme-choice="system" onclick="setThemeMode('system')">System</button></div><button onclick="logout()">Logout</button></div></div><nav id="tabs"></nav></header>
 <main class="auth-only">
-<section id="stats" class="panel active"><div id="dashboard-summary" class="grid cols-4"></div><div class="grid cols-4" style="margin-top:16px"><div class="card"><div>Total Calls</div><div id="k-total" class="kpi">0</div></div><div class="card"><div>Booked</div><div id="k-booked" class="kpi">0</div></div><div class="card"><div>Not Interested</div><div id="k-ni" class="kpi">0</div></div><div class="card"><div>Booking Rate</div><div id="k-rate" class="kpi">0%</div></div></div><p id="stats-error" class="err" style="margin-top:10px"></p><div class="card" style="margin-top:16px"><b>Live Config</b><div id="live-config" class="row" style="margin-top:10px"></div></div><div class="grid cols-3" style="margin-top:16px"><div class="card"><canvas id="chart-outcomes"></canvas></div><div class="card"><canvas id="chart-timeline"></canvas></div><div class="card"><canvas id="chart-duration"></canvas></div></div></section>
+<section id="stats" class="panel active"><div id="dashboard-summary" class="grid cols-4"></div><div class="grid cols-4" style="margin-top:16px"><div class="card"><div>Total Calls</div><div id="k-total" class="kpi">0</div></div><div class="card"><div>Booked</div><div id="k-booked" class="kpi">0</div></div><div class="card"><div>Not Interested</div><div id="k-ni" class="kpi">0</div></div><div class="card"><div>Booking Rate</div><div id="k-rate" class="kpi">0%</div></div></div><p id="stats-error" class="err" style="margin-top:10px"></p><div class="card" style="margin-top:16px"><b>Live Config</b><div id="live-config" class="row" style="margin-top:10px"></div></div><div class="grid cols-3" style="margin-top:16px"><div class="card chart-card"><canvas id="chart-outcomes"></canvas></div><div class="card chart-card"><canvas id="chart-timeline"></canvas></div><div class="card chart-card"><canvas id="chart-duration"></canvas></div></div></section>
 <section id="single" class="panel"><div class="card"><h2>📞 Single Call</h2><form id="call-form" class="grid cols-2"><div><label>Phone (E.164)</label><input id="f-phone" required placeholder="+919876543210"></div><div><label>Agent Profile</label><select id="f-agent-profile"></select></div><div><label>Customer Name</label><input id="f-lead" value="Rupa" placeholder="Durai"></div><div><label>Business / Company Name</label><input id="f-business" value="Ladder Hub" placeholder="ABC Interiors"></div><div><label>Service Type</label><input id="f-service" value="AI Voice Calling" placeholder="AI Voice Calling"></div><div><label>Source</label><input id="f-source" value="facebook" placeholder="manual / Facebook / Google Sheets"></div><div><label>Requirement / Notes</label><textarea id="f-notes" placeholder="What the customer asked for"></textarea></div><div><label><input id="f-custom-on" type="checkbox" style="width:auto"> Custom prompt</label></div><div class="cols-2" style="grid-column:1/-1"><textarea id="f-prompt" class="hidden"></textarea></div><button class="primary" type="submit">Dispatch Call</button></form><p id="call-msg" class="muted"></p></div></section>
 <section id="batch" class="panel"><div class="card"><h2>📋 Batch Call</h2><div class="grid cols-2"><div><label>Agent Profile</label><select id="bc-agent-profile"></select></div><div><label>Delay seconds</label><input id="bc-delay" type="number" value="3"></div><div><label>CSV File</label><input id="bc-file" type="file" accept=".csv,text/csv"></div><div><label>CSV Text</label><textarea id="bc-text" placeholder="phone,lead_name,business_name,service_type"></textarea></div></div><div class="row"><button onclick="parseBatch()">Parse CSV</button><button class="primary" onclick="startBatch()">Start Batch</button></div><div class="progress"><div id="bc-bar" class="bar"></div></div><div id="bc-preview"></div></div></section>
 <section id="campaigns" class="panel"><div class="card"><h2>🚀 Campaigns</h2><div class="grid cols-3"><div><label>Name</label><input id="camp-name"></div><div><label>Schedule</label><select id="camp-schedule"><option>once</option><option>daily</option><option>weekdays</option></select></div><div><label>Time</label><input id="camp-time" type="time" value="09:00"></div><div><label>Delay</label><input id="camp-delay" type="number" value="3"></div><div><label>Agent Profile</label><select id="camp-agent-profile"></select></div><div><label>CSV File</label><input id="camp-file" type="file" accept=".csv,text/csv"></div><div style="grid-column:1/-1"><label>Contacts CSV/Text</label><textarea id="camp-text" placeholder="phone,lead_name,business_name,service_type"></textarea></div><div style="grid-column:1/-1"><label><input id="camp-custom-on" type="checkbox" style="width:auto"> Custom prompt</label><textarea id="camp-prompt" class="hidden"></textarea></div></div><button class="primary" onclick="createCampaign()">Create Campaign</button><div id="campaign-list"></div></div></section>
@@ -304,7 +390,7 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
     <select id="pm-type" style="min-width:220px" onchange="loadPromptType()"></select>
     <span id="pm-saved-badge" style="display:none;background:#00ff88;color:#000;border-radius:12px;padding:2px 10px;font-size:0.8rem;font-weight:700">Saved</span>
   </div>
-  <div id="pm-risky-warn" style="display:none;background:#2d1b1b;color:#f87171;border:1px solid #f87171;border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:0.9rem">
+  <div id="pm-risky-warn" style="display:none;background:color-mix(in srgb,var(--danger) 12%,var(--card));color:var(--danger);border:1px solid color-mix(in srgb,var(--danger) 55%,transparent);border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:0.9rem">
     ⚠️ This prompt may conflict with fixed greeting mode. Avoid: SPEAK FIRST, Do NOT wait for the lead, Open with:, The moment the call connects.
   </div>
   <textarea id="pm-text" style="min-height:420px;width:100%;box-sizing:border-box" oninput="checkRiskyPhrases()"></textarea>
@@ -318,7 +404,7 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
 </div>
 </section>
 <section id="appointments" class="panel"><div class="card"><h2>📅 Appointments</h2><div class="row"><input id="appt-search" placeholder="Search name or phone"><input id="appt-date" type="date"><select id="appt-status"><option value="">All statuses</option><option value="booked">Booked</option><option value="completed">Completed</option><option value="no_show">No Show</option><option value="cancelled">Cancelled</option><option value="rescheduled">Rescheduled</option></select><button onclick="loadAppointments()">Filter</button></div><div id="appt-list" style="margin-top:16px;overflow-x:auto"></div></div><div class="card" style="margin-top:16px"><h2>Appointment Settings</h2><div class="grid cols-3"><div><label>Default demo duration</label><input id="appt-demo-duration" type="number" min="1" value="30"></div><div><label>Buffer minutes</label><input id="appt-buffer" type="number" min="0" value="15"></div><div><label>Slot interval</label><input id="appt-slot-interval" type="number" min="0" placeholder="duration + buffer"></div><div><label>Working timezone</label><input id="appt-timezone" value="Asia/Kolkata"></div><div><label>Minimum notice time</label><input id="appt-min-notice" type="number" min="0" value="30"></div><div><label>Max booking days ahead</label><input id="appt-max-days" type="number" min="1" value="30"></div></div><div class="row" style="margin-top:12px"><button class="primary" onclick="saveAppointmentSettings()">Save Appointment Settings</button><button onclick="loadAppointmentSettings()">Refresh</button><button onclick="loadCalendarHealth()">Calendar Health</button></div><div id="calendar-health-box" class="row" style="margin-top:10px"></div></div><div class="card" style="margin-top:16px"><h2>Staff Management</h2><div class="grid cols-3"><input id="staff-name" placeholder="Name"><input id="staff-email" placeholder="Email"><input id="staff-whatsapp" placeholder="WhatsApp number"><input id="staff-role" placeholder="Role" value="sales"><input id="staff-calendar" placeholder="Calendar email"><input id="staff-google-calendar" placeholder="Google Calendar ID"><input id="staff-days" placeholder="Working days: mon,tue,wed,thu,fri,sat"><input id="staff-timezone" placeholder="Timezone" value="Asia/Kolkata"><input id="staff-start" type="time" value="09:00"><input id="staff-end" type="time" value="18:00"><input id="staff-order" type="number" value="0" placeholder="Round-robin order"><label><input id="staff-active" type="checkbox" checked style="width:auto"> Active</label><label><input id="staff-calendar-connected" type="checkbox" style="width:auto"> Calendar connected</label><label><input id="staff-meet-enabled" type="checkbox" style="width:auto"> Google Meet</label><textarea id="staff-notes" placeholder="Staff notes"></textarea></div><div class="row" style="margin-top:12px"><button class="primary" onclick="saveAppointmentStaff()">Save Staff</button><button onclick="resetAppointmentStaffForm()">New Staff</button></div><input id="staff-id" type="hidden"><div id="appt-staff-list" style="margin-top:12px"></div></div></section>
-<section id="batch-monitor" class="panel"><div class="card"><h2>📡 Batch Call Monitor</h2><div id="bm-status-bar" class="row" style="gap:10px;flex-wrap:wrap;margin-bottom:12px"></div><div id="bm-stats" class="grid cols-4" style="margin-bottom:12px"></div><div id="bm-window-warn" style="display:none;padding:10px;background:#2d1b1b;border:1px solid #f87171;border-radius:8px;margin-bottom:10px;color:#f87171"></div><div class="row" style="gap:8px"><button id="bm-pause-btn" class="warn" onclick="batchAction('paused')">⏸ Pause</button><button id="bm-resume-btn" class="primary" onclick="batchAction('running')">▶ Resume</button><button id="bm-stop-btn" class="danger" onclick="batchAction('stopped')">⏹ Stop</button><button onclick="refreshBatchMonitor()">🔄 Refresh</button></div><div id="bm-items" style="margin-top:12px"></div></div></section>
+<section id="batch-monitor" class="panel"><div class="card"><h2>📡 Batch Call Monitor</h2><div id="bm-status-bar" class="row" style="gap:10px;flex-wrap:wrap;margin-bottom:12px"></div><div id="bm-stats" class="grid cols-4" style="margin-bottom:12px"></div><div id="bm-window-warn" style="display:none;padding:10px;background:color-mix(in srgb,var(--danger) 12%,var(--card));border:1px solid color-mix(in srgb,var(--danger) 55%,transparent);border-radius:8px;margin-bottom:10px;color:var(--danger)"></div><div class="row" style="gap:8px"><button id="bm-pause-btn" class="warn" onclick="batchAction('paused')">⏸ Pause</button><button id="bm-resume-btn" class="primary" onclick="batchAction('running')">▶ Resume</button><button id="bm-stop-btn" class="danger" onclick="batchAction('stopped')">⏹ Stop</button><button onclick="refreshBatchMonitor()">🔄 Refresh</button></div><div id="bm-items" style="margin-top:12px"></div></div></section>
 <section id="scheduled" class="panel"><div class="card"><h2>📅 Scheduled Calls</h2><div id="sched-window-bar" style="padding:8px 14px;border-radius:8px;margin-bottom:12px;font-weight:600"></div><div class="row" style="gap:8px;margin-bottom:12px"><button class="primary" onclick="startDueTodayCalls()">🔥 Start Due Today Calls</button><button onclick="loadScheduledCalls()">🔄 Refresh</button></div><div class="grid cols-3" id="sched-counts" style="margin-bottom:12px"></div><h3 style="margin-top:8px">Due Today</h3><div id="sched-due-today"></div><h3 style="margin-top:8px">Overdue</h3><div id="sched-overdue"></div><h3 style="margin-top:8px">Upcoming Today</h3><div id="sched-upcoming"></div></div></section>
 <section id="calls" class="panel"><div class="card"><h2>📝 Call Logs</h2><div class="row"><button class="primary" onclick="exportCalls('xlsx')">Export Excel</button><button onclick="exportCalls('csv')">Export CSV</button></div><div id="calls-list"></div><div class="row"><button onclick="loadCalls(callPage-1)">Prev</button><span id="call-page"></span><button onclick="loadCalls(callPage+1)">Next</button></div></div></section>
 <section id="crm" class="panel"><div class="grid crm-shell"><div class="card crm-main"><h2>👥 CRM</h2><div id="crm-summary" class="grid cols-4"></div><div id="crm-quick-filters" class="row" style="margin:10px 0;gap:8px;flex-wrap:wrap"></div><h3>Upload Leads</h3><div class="row"><input id="lead-upload-file" type="file" accept=".csv,.xlsx"><button class="primary" onclick="uploadLeads()">Upload</button><button onclick="location.href='/api/crm/sample-leads.csv'">Download Sample CSV</button></div><p id="lead-upload-result" class="muted"></p><h3>Manual Add Lead</h3><div class="grid cols-3"><input id="lead-name" placeholder="Lead Name"><input id="lead-phone" placeholder="Phone Number"><input id="lead-email" placeholder="Email"><input id="lead-city" placeholder="City"><input id="lead-location" placeholder="Location"><input id="lead-requirement" placeholder="Requirement"><input id="lead-budget" placeholder="Budget"><input id="lead-source" placeholder="Source"><input id="lead-business" placeholder="Business Name"><input id="lead-campaign" placeholder="Campaign Name"><input id="lead-service" placeholder="Service Type"><textarea id="lead-notes" placeholder="Notes"></textarea></div><button class="primary" onclick="addManualLead()">Add Lead</button><h3>Filters</h3><div class="grid cols-3"><input id="crm-q" placeholder="Search name or phone"><select id="crm-status-filter"></select><select id="crm-outcome-filter"><option value="">All outcomes</option></select><input id="crm-source-filter" placeholder="Source"><input id="crm-business-filter" placeholder="Business Name"><input id="crm-campaign-filter" placeholder="Campaign Name"><input id="crm-city-filter" placeholder="City"><label><input id="crm-due-today" type="checkbox" style="width:auto"> Due today</label></div><div class="row crm-toolbar"><button onclick="loadCRM(1)">Apply Filter</button><button onclick="resetCRMFilters()">Reset</button><button onclick="exportCrmLeads('xlsx')">Download Filtered Leads Excel</button><button onclick="exportCrmLeads('csv')">Download Filtered Leads CSV</button></div><div class="row crm-toolbar"><button class="primary" onclick="callSelectedLeads()">Start Calling Selected Leads</button><button onclick="markSelectedStatus('Hot Lead')">Mark Selected as Hot Lead</button><button onclick="markSelectedStatus('Not Interested')">Mark Selected as Not Interested</button></div><div id="crm-pagination-top"></div><div id="crm-list"></div><div id="crm-pagination-bottom"></div><hr style="border-color:var(--border);margin:18px 0"><h3>Status Manager</h3><div class="grid cols-3"><input id="new-status-name" placeholder="Status name"><input id="new-status-color" type="color" value="#00ff88"><button onclick="addLeadStatusUI()">Add Status</button></div><div id="status-list"></div></div><div class="card crm-detail-card"><h2>Lead Detail</h2><div id="crm-detail" class="muted">Select a contact.</div></div></div></section>
@@ -334,7 +420,7 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
   <h2>📚 Knowledge Base / Company Details</h2>
   <p class="muted" style="margin-bottom:10px">AI voice agent uses this information to answer customer questions about your business.</p>
   <div class="row" style="gap:8px;margin-bottom:14px;flex-wrap:wrap">
-    <button onclick="kbLoadSample()" style="border:1.5px dashed #555;background:transparent;color:#aaa">📋 Load Sample Data</button>
+    <button onclick="kbLoadSample()" style="border:1.5px dashed var(--border);background:transparent;color:var(--text2)">📋 Load Sample Data</button>
     <button onclick="kbRefreshPreview()">🔍 Preview AI Context</button>
     <button onclick="kbExportJson()">Export JSON</button>
     <button onclick="kbImportJson()">Import JSON</button>
@@ -353,7 +439,7 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
     <button class="kb-tab-btn" onclick="kbSwitchTab('transfer')">👤 Transfer</button>
     <button class="kb-tab-btn" onclick="kbSwitchTab('preview')">👁 AI Preview</button>
   </div>
-  <style>.kb-tab-btn{background:#1a1a2e;border:1px solid #333;color:#ccc;border-radius:6px;padding:5px 12px;cursor:pointer;font-size:0.85rem}.kb-tab-btn.active{background:#7c6af7;border-color:#7c6af7;color:#fff}.kb-panel{display:none}.kb-panel.active{display:block}</style>
+  <style>.kb-tab-btn{background:var(--secondary);border:1px solid var(--border);color:var(--text2);border-radius:999px;padding:5px 12px;cursor:pointer;font-size:0.85rem}.kb-tab-btn.active{background:color-mix(in srgb,var(--primary) 16%,transparent);border-color:color-mix(in srgb,var(--primary) 35%,transparent);color:var(--primary)}.kb-panel{display:none}.kb-panel.active{display:block}</style>
 
   <!-- Company Profile -->
   <div class="kb-panel active" id="kbp-company">
@@ -500,7 +586,7 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
       <div style="display:flex;gap:6px;flex:1"><input id="kb-search-q" placeholder="Test search: e.g. What is your price?" style="flex:1"><button onclick="kbTestSearch()">🔍 Test Search</button></div>
     </div>
     <div id="kb-search-results" style="margin-bottom:10px"></div>
-    <pre id="kb-preview-text" style="background:#0d0d1a;border:1px solid #333;border-radius:6px;padding:12px;white-space:pre-wrap;font-size:0.8rem;color:#ccc;max-height:500px;overflow:auto">Click "Refresh Preview" to see AI context</pre>
+    <pre id="kb-preview-text" style="background:var(--input);border:1px solid var(--border);border-radius:10px;padding:12px;white-space:pre-wrap;font-size:0.8rem;color:var(--text);max-height:500px;overflow:auto">Click "Refresh Preview" to see AI context</pre>
     <p id="kb-preview-chars" class="muted" style="margin-top:4px"></p>
   </div>
 </div>
@@ -557,7 +643,7 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
       <div><label>Mode</label><select id="auto-test-dryrun"><option value="true">Dry Run (no action)</option><option value="false">Execute (real action)</option></select></div>
     </div>
     <div class="row" style="margin-top:10px;gap:8px"><button class="primary" onclick="runAutoTest()">🧪 Test Rule</button></div>
-    <pre id="auto-test-result" style="background:#0d0d1a;border:1px solid #333;border-radius:6px;padding:12px;margin-top:10px;white-space:pre-wrap;font-size:0.85rem;color:#ccc;min-height:60px"></pre>
+    <pre id="auto-test-result" style="background:var(--input);border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:10px;white-space:pre-wrap;font-size:0.85rem;color:var(--text);min-height:60px"></pre>
   </div>
 </div>
 </section>
@@ -600,7 +686,7 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
       </div>
       <div id="wa-chat-active" class="wa-chat-active" style="display:none">
         <!-- Header -->
-        <div id="wa-chat-header" class="wa-chat-header" style="padding:12px 16px;border-bottom:1px solid var(--border);background:#111;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+        <div id="wa-chat-header" class="wa-chat-header" style="padding:12px 16px;border-bottom:1px solid var(--border);background:var(--card);display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
           <div>
             <div id="wa-chat-name" style="font-weight:700;font-size:1rem"></div>
             <div id="wa-chat-phone" style="font-size:0.8rem;color:var(--text2)"></div>
@@ -610,8 +696,8 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
             <button id="wa-ai-toggle-btn" style="font-size:0.78rem;padding:4px 10px" onclick="waToggleAI()">🤖 AI: ON</button>
             <button style="font-size:0.78rem;padding:4px 10px" onclick="waOpenCRM()">👤 CRM</button>
             <button style="font-size:0.78rem;padding:4px 10px" onclick="waTakeover()">🙋 Take Over</button>
-            <button style="font-size:0.78rem;padding:4px 10px;background:#2a160b;color:#ffd8b0;border-color:#c47a2c" onclick="waDeleteConversation()">Clear Chat</button>
-            <button style="font-size:0.78rem;padding:4px 10px;background:#2a0b0b;color:#ffd0d0;border-color:#ff4d4d" onclick="waCloseConv()">✕ Close</button>
+            <button style="font-size:0.78rem;padding:4px 10px" class="warn" onclick="waDeleteConversation()">Clear Chat</button>
+            <button style="font-size:0.78rem;padding:4px 10px" class="danger" onclick="waCloseConv()">✕ Close</button>
           </div>
           <div style="width:100%;display:flex;gap:6px;align-items:center">
             <label style="font-size:0.78rem;color:var(--text2)">Assign:</label>
@@ -623,7 +709,7 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
         <div id="wa-messages" class="wa-messages"></div>
         <!-- Reply box -->
         <div class="wa-reply-box">
-          <div id="wa-window-warning" style="display:none;background:#2d2208;color:#ffe3aa;border:1px solid #ffaa00;border-radius:6px;padding:8px 12px;font-size:0.82rem;margin-bottom:8px">
+          <div id="wa-window-warning" style="display:none;background:color-mix(in srgb,var(--warn) 14%,var(--card));color:var(--warn);border:1px solid color-mix(in srgb,var(--warn) 55%,transparent);border-radius:6px;padding:8px 12px;font-size:0.82rem;margin-bottom:8px">
             ⚠️ 24-hour customer service window may be closed. Use a template instead.
           </div>
           <textarea id="wa-reply-input" rows="2" placeholder="Type a message..." style="width:100%;margin-bottom:8px;resize:vertical"></textarea>
@@ -638,7 +724,7 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
 </div>
 
 <!-- Template modal -->
-<div id="wa-template-modal" style="display:none;position:fixed;inset:0;background:#000c;z-index:200;align-items:center;justify-content:center">
+<div id="wa-template-modal" style="display:none;position:fixed;inset:0;background:rgba(8,13,22,0.55);backdrop-filter:blur(10px);z-index:200;align-items:center;justify-content:center">
   <div class="card" style="width:min(420px,95vw);padding:20px">
     <h3 style="margin-bottom:12px">📋 Send Template</h3>
     <label>Template Name</label>
@@ -714,7 +800,7 @@ tr.lead-row:hover{background:rgba(255,255,255,0.02)}
       <div><label>Parameters (comma-separated)</label><input id="wa-send-params" placeholder="Customer Name, Interior Design, Ladder Hub"></div>
     </div>
     <div class="row" style="margin-top:12px;gap:8px"><button class="primary" onclick="sendWaTest()">📤 Send WhatsApp</button></div>
-    <pre id="wa-send-result" style="background:#0d0d1a;border:1px solid #333;border-radius:6px;padding:12px;margin-top:10px;white-space:pre-wrap;font-size:0.85rem;color:#ccc;min-height:60px"></pre>
+    <pre id="wa-send-result" style="background:var(--input);border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:10px;white-space:pre-wrap;font-size:0.85rem;color:var(--text);min-height:60px"></pre>
   </div>
 </div>
 
@@ -754,6 +840,55 @@ const api=(p,o)=>fetch(p,o).then(async r=>{let j=await r.json().catch(()=>({}));
 const apiPost=(p,b)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
 const apiDel=p=>fetch(p,{method:'DELETE'});
 let charts={},batchContacts=[],campContacts=[],callPage=1,logsPaused=false,leadStatuses=[],crmContacts=[],crmPage=1,crmPageSize=50,crmTotal=0,crmHasNext=false;
+const themeMedia=window.matchMedia('(prefers-color-scheme: dark)');
+function activeThemeFor(mode){return mode==='system'?(themeMedia.matches?'dark':'light'):mode}
+function setThemeMode(mode){
+  const next=['light','dark','system'].includes(mode)?mode:'system';
+  localStorage.setItem('outboundai-theme',next);
+  document.documentElement.dataset.themeMode=next;
+  document.documentElement.dataset.theme=activeThemeFor(next);
+  syncThemeToggle();
+  refreshChartTheme();
+}
+function syncThemeToggle(){
+  const mode=document.documentElement.dataset.themeMode||localStorage.getItem('outboundai-theme')||'system';
+  document.querySelectorAll('[data-theme-choice]').forEach(btn=>btn.classList.toggle('active',btn.dataset.themeChoice===mode));
+}
+themeMedia.addEventListener('change',()=>{if((document.documentElement.dataset.themeMode||'system')==='system')setThemeMode('system')});
+function cssVar(name){return getComputedStyle(document.documentElement).getPropertyValue(name).trim()}
+function withAlpha(color,alpha){
+  if(/^#([0-9a-f]{6})$/i.test(color)){
+    const n=Math.round(alpha*255).toString(16).padStart(2,'0');
+    return color+n;
+  }
+  if(color.startsWith('rgb('))return color.replace('rgb(','rgba(').replace(')',`,${alpha})`);
+  return color;
+}
+function getThemeChartColors(){
+  const dark=document.documentElement.dataset.theme==='dark';
+  return {
+    text:cssVar('--foreground')||(dark?'#eef4ff':'#182033'),
+    muted:cssVar('--muted-foreground')||(dark?'#9fb0c7':'#64748b'),
+    grid:dark?'rgba(226,232,240,0.16)':'rgba(100,116,139,0.22)',
+    tooltipBg:cssVar('--popover')||(dark?'rgba(24,31,45,0.96)':'rgba(255,255,255,0.96)'),
+    tooltipText:cssVar('--popover-foreground')||(dark?'#eef4ff':'#182033'),
+    primary:cssVar('--primary')||(dark?'#6aa7ff':'#2563eb'),
+    accent:cssVar('--accent')||(dark?'#8b9cff':'#0ea5e9'),
+    accent2:cssVar('--accent2')||(dark?'#38bdf8':'#6366f1'),
+    warn:cssVar('--warn')||(dark?'#fbbf24':'#d97706'),
+    danger:cssVar('--danger')||(dark?'#f87171':'#dc2626')
+  };
+}
+function updateChartThemeColors(){
+  const c=getThemeChartColors();
+  if(window.Chart){
+    Chart.defaults.color=c.muted;
+    Chart.defaults.borderColor=c.grid;
+    Chart.defaults.font.family=getComputedStyle(document.documentElement).getPropertyValue('--sans').trim()||'Inter, system-ui, sans-serif';
+  }
+  Object.values(charts).forEach(chart=>{if(chart){chart.options=_chartOptions(chart.config.type);chart.update()}});
+}
+function refreshChartTheme(){try{updateChartThemeColors();if(document.body.classList.contains('authenticated'))loadStats()}catch(e){}}
 function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function table(rows,cols,actionFn){if(!rows||!rows.length)return'<p class="muted">No data.</p>';const c=cols||(rows[0]?Object.keys(rows[0]):[]);return`<table><thead><tr>${c.map(h=>`<th>${esc(h)}</th>`).join('')}${actionFn?'<th>Actions</th>':''}</tr></thead><tbody>${rows.map(r=>`<tr>${c.map(h=>`<td>${esc(r[h]??'')}</td>`).join('')}${actionFn?`<td class="row-actions">${actionFn(r)}</td>`:''}</tr>`).join('')}</tbody></table>`}
 function toast(msg,type='ok'){const d=document.createElement('div');d.className='toast '+(type==='err'?'err':'ok');d.textContent=msg;document.body.appendChild(d);setTimeout(()=>d.remove(),3500)}
@@ -766,10 +901,39 @@ function scheduleLogsRefresh(){setInterval(()=>{if(!logsPaused&&document.body.cl
 async function loadLeadStatuses(){try{const r=await api('/api/crm/statuses');leadStatuses=Array.isArray(r)?r:[]}catch(e){leadStatuses=[]}}
 async function logout(){await fetch('/api/auth/logout',{method:'POST'});showLogin('')}
 function switchTab(name){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id===name));if(name==='stats')loadStats();if(name==='campaigns'){loadCampaigns();_startCampaignProgressPoll()}if(name==='batch-monitor')refreshBatchMonitor();if(name==='scheduled')loadScheduledCalls();if(name==='agents')loadAgentProfiles();if(name==='prompt'){initPromptManager();}if(name==='kb')initKB();if(name==='automation')initAutomation();if(name==='whatsapp')initWhatsApp();if(name==='appointments')loadAppointments();if(name==='calls')loadCalls();if(name==='crm')loadCRM();if(name==='kanban')loadKanban();if(name==='reports')loadReports();if(name==='costs')loadCosts();if(name==='broadcast')loadBroadcastCampaigns();if(name==='handoffs')loadHandoffs();if(name==='settings'){loadSettings();loadOutboundSchedule();}if(name==='logs')loadLogs()}
-function _mkChart(id,type,data,options={}){if(charts[id])charts[id].destroy();charts[id]=new Chart($(id),{type,data,options:{responsive:true,plugins:{legend:{labels:{color:'#ddd'}}},scales:type==='doughnut'?{}:{x:{ticks:{color:'#aaa'},grid:{color:'#222'}},y:{ticks:{color:'#aaa'},grid:{color:'#222'}}},...options}})}
-function _renderCharts(d){const outcomes=d.outcomes||{};_mkChart('chart-outcomes','doughnut',{labels:Object.keys(outcomes),datasets:[{data:Object.values(outcomes),backgroundColor:['#00ff88','#00ccff','#ffaa00','#ff4d4d','#888']}]});_mkChart('chart-timeline','line',{labels:(d.timeline||[]).map(x=>x.date.slice(5)),datasets:[{label:'Calls',data:(d.timeline||[]).map(x=>x.count),borderColor:'#00ccff',backgroundColor:'#00ccff33'}]});const dur=d.duration_by_outcome||{};_mkChart('chart-duration','bar',{labels:Object.keys(dur),datasets:[{label:'Avg sec',data:Object.values(dur),backgroundColor:'#00ff88'}]})}
+function _chartOptions(type){
+  const c=getThemeChartColors();
+  const common={
+    responsive:true,
+    maintainAspectRatio:false,
+    plugins:{
+      legend:{display:true,labels:{color:c.muted,boxWidth:12,boxHeight:12,padding:14}},
+      tooltip:{backgroundColor:c.tooltipBg,titleColor:c.tooltipText,bodyColor:c.tooltipText,borderColor:c.grid,borderWidth:1}
+    }
+  };
+  if(type==='doughnut')return {...common,cutout:'58%'};
+  return {...common,scales:{x:{ticks:{color:c.muted},grid:{color:c.grid,drawBorder:false}},y:{beginAtZero:true,ticks:{color:c.muted},grid:{color:c.grid,drawBorder:false}}}};
+}
+function _mkChart(id,type,data,options={}){if(charts[id])charts[id].destroy();charts[id]=new Chart($(id),{type,data,options:{..._chartOptions(type),...options}})}
+function localDemoStats(){
+  // UI-only fallback for local/no-data chart rendering. Real API data always takes priority.
+  return {
+    __demoStats:true,total_calls:42,booked:9,not_interested:5,booking_rate_percent:21,
+    outcomes:{completed:14,busy:6,callback_scheduled:8,success:9,demo_booked:5},
+    timeline:[{date:'2026-06-14',count:4},{date:'2026-06-15',count:7},{date:'2026-06-16',count:6},{date:'2026-06-17',count:10},{date:'2026-06-18',count:8},{date:'2026-06-19',count:13},{date:'2026-06-20',count:11}],
+    duration_by_outcome:{completed:132,busy:38,callback_scheduled:84,success:118,demo_booked:156}
+  };
+}
+function hasStatsChartData(d){
+  const outcomeTotal=Object.values(d?.outcomes||{}).reduce((sum,v)=>sum+(Number(v)||0),0);
+  const timelineTotal=(d?.timeline||[]).reduce((sum,x)=>sum+(Number(x?.count)||0),0);
+  const durationTotal=Object.values(d?.duration_by_outcome||{}).reduce((sum,v)=>sum+(Number(v)||0),0);
+  return outcomeTotal>0||timelineTotal>0||durationTotal>0;
+}
+function statsForCharts(d){return hasStatsChartData(d)?d:localDemoStats()}
+function _renderCharts(d){updateChartThemeColors();d=statsForCharts(d);const outcomes=d.outcomes||{},c=getThemeChartColors();_mkChart('chart-outcomes','doughnut',{labels:Object.keys(outcomes),datasets:[{data:Object.values(outcomes),backgroundColor:[c.primary,c.accent,c.warn,c.danger,c.accent2],borderColor:withAlpha(c.tooltipBg,0.9),borderWidth:2,hoverOffset:8}]});_mkChart('chart-timeline','line',{labels:(d.timeline||[]).map(x=>x.date.slice(5)),datasets:[{label:'Calls',data:(d.timeline||[]).map(x=>x.count),borderColor:c.accent,backgroundColor:withAlpha(c.accent,0.2),pointBackgroundColor:c.accent,pointBorderColor:c.tooltipBg,pointRadius:3,tension:0.35,fill:true}]});const dur=d.duration_by_outcome||{};_mkChart('chart-duration','bar',{labels:Object.keys(dur),datasets:[{label:'Avg sec',data:Object.values(dur),backgroundColor:withAlpha(c.primary,0.82),borderColor:c.primary,borderWidth:1,borderRadius:8}]})}
 function loadCharts(d){try{_renderCharts(d)}catch(e){$('stats-error').textContent='Charts unavailable: '+e.message}}
-async function loadStats(){loadHealthConfig();try{const d=await api('/api/stats');$('stats-error').textContent='';$('k-total').textContent=d.total_calls||0;$('k-booked').textContent=d.booked||0;$('k-ni').textContent=d.not_interested||0;$('k-rate').textContent=(d.booking_rate_percent||0)+'%';loadCharts(d)}catch(e){$('stats-error').textContent='Stats unavailable: '+e.message}}
+async function loadStats(){loadHealthConfig();try{let d=await api('/api/stats');const usingDemo=!hasStatsChartData(d);if(usingDemo)d={...localDemoStats(),...d,outcomes:localDemoStats().outcomes,timeline:localDemoStats().timeline,duration_by_outcome:localDemoStats().duration_by_outcome};$('stats-error').className=usingDemo?'muted':'err';$('stats-error').textContent=usingDemo?'Showing local demo chart data because no stats chart data is available.':'';$('k-total').textContent=d.total_calls||0;$('k-booked').textContent=d.booked||0;$('k-ni').textContent=d.not_interested||0;$('k-rate').textContent=(d.booking_rate_percent||0)+'%';loadCharts(d)}catch(e){const d=localDemoStats();$('stats-error').className='muted';$('stats-error').textContent='Showing local demo chart data because stats API is unavailable.';$('k-total').textContent=d.total_calls;$('k-booked').textContent=d.booked;$('k-ni').textContent=d.not_interested;$('k-rate').textContent=d.booking_rate_percent+'%';loadCharts(d)}}
 async function loadDashboardSummary(){try{const s=await api('/api/dashboard/summary');const items=[['Today Calls',s.today_calls],['Today WhatsApp',(+s.today_whatsapp_inbound||0)+(+s.today_whatsapp_outbound||0)],['Today Leads',s.today_leads],['Appointments Today',s.appointments_today],['Pending Follow-ups',s.pending_followups],['Due Calls',s.due_calls],['No Response',s.no_response_leads],['Converted',s.converted_leads]];$('dashboard-summary').innerHTML=items.map(([k,v])=>`<div class="card"><div>${esc(k)}</div><div class="kpi">${esc(v??0)}</div></div>`).join('')}catch(e){}}
 const _oldLoadStats=loadStats;loadStats=async function(){await _oldLoadStats();loadDashboardSummary()};
 async function loadHealthConfig(){try{const h=await api('/api/health');const badge=(label,ok,good='configured',bad='missing')=>`<span class="badge ${ok?'ok':'err'}">${label}: ${ok?good:bad}</span>`;const supabaseText=h.supabase_error==='Invalid API key'?'invalid':'configured';const promptMode=h.prompt_mode||'default';const promptCount=Array.isArray(h.active_prompt_types)?h.active_prompt_types.length:0;const promptLabel=promptMode==='call_type'&&promptCount?`${promptMode} (${promptCount})`:promptMode;const promptOk=(promptMode==='call_type'||promptMode==='agent_profile')&&!h.default_prompt_used;$('live-config').innerHTML=[badge('LIVEKIT_URL',h.livekit_configured),badge('GOOGLE_API_KEY',h.gemini_configured),`<span class="badge ${h.supabase_configured?'ok':'err'}">SUPABASE_SERVICE_KEY: ${h.supabase_configured?supabaseText:(h.supabase_error==='Invalid API key'?'invalid':'missing')}</span>`,badge('OUTBOUND_TRUNK_ID',h.trunk_configured),badge('GEMINI_MODEL',h.gemini_model_configured),badge('GEMINI_TTS_VOICE',h.gemini_tts_voice_configured),`<span class="badge ${promptOk?'ok':'warnc'}">Prompt: ${esc(promptLabel)}</span>`,badge('S3/R2 Storage',h.s3_configured),`<span class="badge ${h.recording_auto_delete_enabled?'ok':'warnc'}">Recording Retention: ${h.recording_auto_delete_enabled?'ON':'OFF'}</span>`,`<span class="badge">Retention Days: ${esc(h.recording_retention_days||7)}</span>`].join('')}catch(e){$('live-config').innerHTML='<span class="err">Unable to load config status</span>'}}
@@ -1308,7 +1472,7 @@ function followupSummary(c){const nextAt=c.next_action_at_display||formatFollowu
 async function addLeadTag(phone){const tag=prompt('Tag name');if(!tag)return;await api('/api/crm/contacts/'+encodeURIComponent(phone)+'/tags',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag})});toast('Tag added');closeModal();openLeadModal(encodeURIComponent(phone))}
 async function removeLeadTag(phone){const tag=prompt('Tag to remove');if(!tag)return;await api('/api/crm/contacts/'+encodeURIComponent(phone)+'/tags/'+encodeURIComponent(tag),{method:'DELETE'});toast('Tag removed');closeModal();openLeadModal(encodeURIComponent(phone))}
 async function editLeadCustomFields(phone){const raw=prompt('Custom fields JSON, e.g. {"budget":"1 lakh","priority":"High"}','{}');if(!raw)return;let fields={};try{fields=JSON.parse(raw)}catch(e){toast('Invalid JSON','err');return}await api('/api/crm/contacts/'+encodeURIComponent(phone)+'/custom-fields',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({fields})});toast('Custom fields saved');closeModal();openLeadModal(encodeURIComponent(phone))}
-function init(){loadRuntimeTimezones();tabs.forEach(([id,label])=>{let b=document.createElement('button');b.className='tab'+(id==='stats'?' active':'');b.dataset.tab=id;b.textContent=label;b.onclick=()=>switchTab(id);$('tabs').appendChild(b)});$('agent-voice').innerHTML=voiceOptions();
+function init(){syncThemeToggle();loadRuntimeTimezones();tabs.forEach(([id,label])=>{let b=document.createElement('button');b.className='tab'+(id==='stats'?' active':'');b.dataset.tab=id;b.textContent=label;b.onclick=()=>switchTab(id);$('tabs').appendChild(b)});$('agent-voice').innerHTML=voiceOptions();
 $('login-form').onsubmit=async e=>{e.preventDefault();$('login-error').textContent='';try{await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('login-username').value,password:$('login-password').value})});$('login-password').value='';showDashboard()}catch(err){showLogin(err.message||'Login failed')}};
 $('call-form').onsubmit=async e=>{e.preventDefault();try{const customerName=$('f-lead').value.trim(),businessName=$('f-business').value.trim(),serviceType=$('f-service').value.trim(),notes=$('f-notes').value.trim();const body={phone:$('f-phone').value.trim(),lead_name:customerName,customer_name:customerName,name:customerName,business_name:businessName,company_name:businessName,service_type:serviceType,source:$('f-source').value.trim(),notes:notes,requirement:notes,call_type:'voice_call',agent_profile_id:$('f-agent-profile').value||null,system_prompt:$('f-custom-on').checked?$('f-prompt').value:null};const r=await api('/api/call',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('call-msg').textContent='Dispatched: '+r.room;toast('Call dispatched')}catch(e){showErr('call-msg',e.message)}};
 if($('f-custom-on'))$('f-custom-on').onchange=e=>$('f-prompt').classList.toggle('hidden',!e.target.checked);
